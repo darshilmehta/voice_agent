@@ -56,6 +56,12 @@ def _apple_silicon(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(models, "APPLE_SILICON", True)
 
 
+@pytest.fixture(autouse=True)
+def _ml_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Health checks behave as if the optional ``ml`` group were installed (CI syncs without it)."""
+    monkeypatch.setattr(models, "missing_modules", lambda names: [])
+
+
 @pytest.fixture
 def load_local(tmp_path: Path) -> Callable[..., Settings]:
     """Load config/local.config.json with the project root moved to tmp_path, plus env overrides."""
