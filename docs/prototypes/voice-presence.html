@@ -5,8 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Voice Presence</title>
 <!--
-  Prototype for docs/DESIGN.md §3.8: an orb that breathes with the agent's voice and a halo that ripples
-  with the user's. Self-contained (no libraries). Serve the project root so the demo clips load:
+  Prototype for docs/DESIGN.md §3.8 (v2): a particle field of short strokes, in the spirit of the
+  antigravity.google hero, combined with a breathing core. Voices drive the rings: the agent widens and
+  cools them and sends waves outward; the user tightens and warms them and pulls waves inward.
+  Self-contained (WebGL2, no libraries). Serve the project root so the demo clips load:
 
       python3 -m http.server 8765 --bind 127.0.0.1      (from the project root)
       open http://localhost:8765/docs/prototypes/voice-presence.html
@@ -16,29 +18,29 @@
 -->
 <style>
   :root {
-    --bg: #08080b;
-    --text: #ecebf2;
-    --muted: #8e8c99;
-    --dim: #4d4b57;
-    --chip: rgb(255 255 255 / 6%);
-    --chip-border: rgb(255 255 255 / 10%);
-    --user: #ffa070;
-    --agent: #8fb4ff;
-    --focus: #8fb4ff;
-    color-scheme: dark;
+    --bg: #fbfbfa;
+    --text: #18181b;
+    --muted: #71717a;
+    --dim: #c9c9d1;
+    --chip: rgb(0 0 0 / 3.5%);
+    --chip-border: rgb(0 0 0 / 8%);
+    --user: #e2582f;
+    --agent: #3b5bdb;
+    --focus: #3b5bdb;
+    color-scheme: light;
   }
-  @media (prefers-color-scheme: light) {
+  @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #f5f5f3;
-      --text: #1b1b20;
-      --muted: #6d6b75;
-      --dim: #b9b7c0;
-      --chip: rgb(0 0 0 / 4%);
-      --chip-border: rgb(0 0 0 / 8%);
-      --user: #d4602d;
-      --agent: #3557d6;
-      --focus: #3557d6;
-      color-scheme: light;
+      --bg: #0a0a0d;
+      --text: #ededf2;
+      --muted: #8e8c99;
+      --dim: #4b4a55;
+      --chip: rgb(255 255 255 / 6%);
+      --chip-border: rgb(255 255 255 / 10%);
+      --user: #ff9a6b;
+      --agent: #8fb0ff;
+      --focus: #8fb0ff;
+      color-scheme: dark;
     }
   }
   * { box-sizing: border-box; }
@@ -52,9 +54,9 @@
   .chip { padding: 4px 11px; border-radius: 999px; background: var(--chip); border: 1px solid var(--chip-border);
     color: var(--muted); font-size: 12.5px; white-space: nowrap; backdrop-filter: blur(8px); }
   .chip b { color: var(--text); font-weight: 600; }
-  .captions { position: fixed; left: 50%; transform: translateX(-50%); top: calc(42% + 31vmin);
+  .captions { position: fixed; left: 50%; transform: translateX(-50%); top: calc(42% + 33vmin);
     width: min(680px, calc(100% - 32px)); text-align: center; z-index: 2; }
-  .caption { margin: 0; font-size: clamp(17px, 2.3vw, 22px); line-height: 1.45; font-weight: 500; letter-spacing: -0.005em;
+  .caption { margin: 0; font-size: clamp(17px, 2.3vw, 22px); line-height: 1.45; font-weight: 500; letter-spacing: -0.01em;
     min-height: 1.45em; text-wrap: balance; }
   .caption .w { transition: color 120ms linear; color: var(--dim); }
   .caption .w.on { color: var(--text); }
@@ -73,7 +75,8 @@
   .round { width: 64px; height: 64px; border-radius: 50%; border: 1px solid var(--chip-border); background: var(--chip);
     display: grid; place-items: center; backdrop-filter: blur(10px); transition: background 150ms, border-color 150ms, transform 150ms; }
   .round:hover { transform: translateY(-1px); }
-  .round[aria-pressed="true"] { background: color-mix(in srgb, var(--user) 22%, transparent); border-color: var(--user); color: var(--user); }
+  .round.primary { background: var(--text); color: var(--bg); border-color: var(--text); }
+  .round[aria-pressed="true"] { background: color-mix(in srgb, var(--user) 18%, transparent); border-color: var(--user); color: var(--user); }
   .round.small { width: 44px; height: 44px; }
   .round svg { width: 24px; height: 24px; }
   .round.small svg { width: 18px; height: 18px; }
@@ -84,13 +87,10 @@
   .demo button { padding: 6px 11px; border-radius: 999px; background: var(--chip); border: 1px solid var(--chip-border);
     font-size: 12.5px; color: var(--muted); backdrop-filter: blur(8px); }
   .demo button:hover { color: var(--text); }
-  .demo button[aria-pressed="true"] { color: var(--agent); border-color: var(--agent); }
   @media (max-width: 640px) {
     .demo { left: 16px; right: 16px; bottom: auto; top: 56px; align-items: flex-start; }
     .demo .row { justify-content: flex-start; max-width: none; }
-    .captions { top: calc(42% + 30vmin); }
   }
-  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -112,7 +112,7 @@
   <button class="round small" id="stop" title="Stop" aria-label="Stop">
     <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2.5"/></svg>
   </button>
-  <button class="round" id="mic" aria-pressed="false" title="Use your microphone" aria-label="Microphone">
+  <button class="round primary" id="mic" aria-pressed="false" title="Use your microphone" aria-label="Microphone">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
       <rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>
   </button>
@@ -421,115 +421,189 @@ function measure(an, m, dt, t) {
   }
 }
 
-// ------------------------------------------------------------------ rendering
+// ------------------------------------------------------------------ rendering: particle field (WebGL2, instanced)
+// Three kinds of instances, one draw call:
+//   0  ambient strokes across the page; they swirl into rings around the pointer
+//   1  presence rings around the centre: the voice field (A.ripples → waves out, U.ripples → waves in)
+//   2  the core: a small glowing heart that breathes with the agent
 let canvas = $("orb");
-const gl = canvas.getContext("webgl", { antialias: false, premultipliedAlpha: false });
+const gl = canvas.getContext("webgl2", { antialias: true, premultipliedAlpha: false });
 
-const VERT = "attribute vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }";
-const FRAG = `
+const VERT = `#version 300 es
 precision highp float;
-uniform vec2 uRes, uCenter;
-uniform float uScale, uTime, uClock, uMotion, uAgent, uUser, uAgentTone, uUserTone, uThink, uDuck, uDark;
-uniform vec4 uRipA, uRipU;
+layout(location = 0) in vec2 aCorner;
+layout(location = 1) in vec4 aInst;   // kind, a, b, seed
+uniform vec2 uRes, uCenter, uPointer;
+uniform float uScale, uTime, uClock, uRot, uMotion, uAgent, uUser, uAgentTone, uThink, uDuck, uDark, uPointerOn;
+uniform vec4 uWaveOut, uWaveIn;
+out vec2 vLocal;
+out float vAspect, vKind;
+out vec4 vColor;
 
-float hash(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
-float noise(vec2 p){
-  vec2 i = floor(p), f = fract(p), u = f * f * (3.0 - 2.0 * f);
-  return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), u.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), u.x), u.y);
+const float TAU = 6.2831853;
+const float QUAD = 1.35;  // overdraw so the capsule edge antialiases inside the quad
+
+vec3 spectrum(float p) {
+  p = fract(p) * 5.0;
+  vec3 c0 = vec3(0.26, 0.52, 0.96), c1 = vec3(0.47, 0.37, 0.95), c2 = vec3(0.80, 0.34, 0.80),
+       c3 = vec3(0.95, 0.41, 0.36), c4 = vec3(0.98, 0.66, 0.25);
+  if (p < 1.0) return mix(c0, c1, p);
+  if (p < 2.0) return mix(c1, c2, p - 1.0);
+  if (p < 3.0) return mix(c2, c3, p - 2.0);
+  if (p < 4.0) return mix(c3, c4, p - 3.0);
+  return mix(c4, c0, p - 4.0);
 }
-float fbm(vec2 p){ float v = 0.0, a = 0.5; for (int i = 0; i < 4; i++){ v += a * noise(p); p = p * 2.03 + vec2(17.1, 9.2); a *= 0.5; } return v; }
-float ripple(float r, float R, float start){
-  float t = uClock - start;
-  if (t < 0.0 || t > 1.4) return 0.0;
-  float w = 0.006 + t * 0.012;
-  return exp(-pow((r - (R + t * 0.3)) / w, 2.0)) * (1.0 - t / 1.4);
+vec3 cool(float p) { return mix(vec3(0.22, 0.47, 0.98), vec3(0.56, 0.39, 0.98), 0.5 + 0.5 * sin(p * TAU)); }
+vec3 warm(float p) { return mix(vec3(0.96, 0.42, 0.33), vec3(0.99, 0.66, 0.26), 0.5 + 0.5 * sin(p * TAU)); }
+
+float wave(float r, float start, float r0, float speed, float dir) {
+  float age = uClock - start;
+  if (age < 0.0 || age > 1.3) return 0.0;
+  return exp(-pow((r - (r0 + dir * age * speed)) / 0.035, 2.0)) * (1.0 - age / 1.3);
+}
+float waves(float r, vec4 s, float r0, float speed, float dir) {
+  return wave(r, s.x, r0, speed, dir) + wave(r, s.y, r0, speed, dir) + wave(r, s.z, r0, speed, dir) + wave(r, s.w, r0, speed, dir);
 }
 
-void main(){
-  vec2 uv = (gl_FragCoord.xy - uCenter) / uScale;
-  float r = length(uv), ang = atan(uv.y, uv.x);
-  float t = uTime;
+void main() {
+  float kind = aInst.x, seed = aInst.w, t = uTime;
+  float energy = clamp(uAgent + uUser, 0.0, 1.0);
+  float fade = mix(1.0, 0.85, uDark);
+  vec2 pos;
+  float ang, len, wid, alpha;
+  vec3 col;
 
-  // radius: idle breathing + agent swell; contracts slightly while the user talks, shrinks when ducked
-  float R0 = 0.2 + 0.01 * sin(t * 1.26) * uMotion + 0.06 * uAgent - 0.018 * uUser - 0.035 * uDuck;
-  float n = fbm(vec2(cos(ang), sin(ang)) * 1.5 + vec2(t * 0.22, -t * 0.17));
-  float R = R0 + (0.008 + 0.03 * uAgent + 0.018 * uThink) * (n - 0.5) * 2.0 * mix(0.35, 1.0, uMotion);
-  float d = r - R, aa = 1.5 / uScale;
-  float body = 1.0 - smoothstep(-aa, aa, d);
+  if (kind < 0.5) {
+    vec2 p = aInst.yz + uMotion * 0.005 * vec2(sin(t * 0.31 + seed * TAU), cos(t * 0.27 + seed * 9.1));
+    vec2 toP = p - (uPointer - uCenter) / uScale;
+    float dp = length(toP);
+    float near = uPointerOn * exp(-pow(dp / 0.17, 2.0));
+    float pa = atan(toP.y, toP.x);
+    ang = mix(seed * TAU, pa, near);
+    pos = p + vec2(cos(pa), sin(pa)) * near * 0.01 * sin(dp * 55.0 - uClock * 5.0) * uMotion;
+    len = 0.0032 + 0.0065 * near;
+    wid = 0.0011 + 0.0004 * near;
+    col = mix(mix(vec3(0.6), vec3(0.5), uDark), spectrum(pa / TAU + 0.55), near);
+    alpha = (0.18 + 0.62 * near) * fade;
+  } else if (kind < 1.5) {
+    float r0 = aInst.y, th = aInst.z + uRot;
+    float Rb = 0.25 + 0.012 * sin(t * 1.26) * uMotion + 0.06 * uAgent - 0.05 * uUser * (1.0 - uAgent) - 0.04 * uDuck;
+    float W = 0.028 + 0.07 * uAgent + 0.032 * uUser;
+    float wo = waves(r0, uWaveOut, 0.13, 0.42, 1.0) * uMotion;
+    float wi = waves(r0, uWaveIn, 0.5, 0.34, -1.0) * uMotion;
+    float r = r0 + 0.024 * wo - 0.02 * wi + 0.004 * sin(th * 9.0 + t * 1.1 + seed * TAU) * uMotion;
+    float band = exp(-pow((r0 - Rb) / W, 2.0));
+    alpha = (0.07 + band * (0.3 + 0.42 * energy) + 0.45 * (wo + wi)) * (1.0 - 0.45 * uDuck) * fade;
+    len = 0.0045 + band * (0.008 + 0.016 * uAgent + 0.01 * uUser) + 0.01 * (wo + wi);
+    wid = 0.0016 + 0.0008 * band;
+    ang = th + 0.7 * uThink;
+    float p = th / TAU;
+    col = spectrum(p);
+    col = mix(col, cool(p), clamp(uAgent * 1.3, 0.0, 1.0) * 0.6);
+    col = mix(col, warm(p), clamp(uUser * 1.3, 0.0, 1.0) * 0.75);
+    col *= 0.9 + 0.25 * uAgentTone * uAgent;
+    pos = vec2(cos(th), sin(th)) * r;
+  } else {
+    float cr = 0.07 + 0.006 * sin(t * 1.26) * uMotion + 0.04 * uAgent - 0.012 * uUser - 0.02 * uDuck;
+    pos = vec2(0.0);
+    ang = 0.0;
+    len = cr;
+    wid = cr;
+    col = mix(vec3(0.33, 0.47, 0.98), vec3(0.58, 0.40, 0.98), 0.5 + 0.5 * sin(t * 0.4));
+    col = mix(col, vec3(0.98, 0.55, 0.36), clamp(uUser * 1.2, 0.0, 1.0) * 0.35);
+    alpha = (0.55 + 0.4 * uAgent + 0.2 * uThink) * (1.0 - 0.45 * uDuck);
+  }
 
-  // inside: two-tone flowing gradient, faster and brighter with the agent's voice
-  vec2 p = uv * 4.0;
-  float speed = 0.12 + 0.55 * uAgent + 0.35 * uThink;
-  float f1 = fbm(p + vec2(t * speed, -t * speed * 0.7));
-  float f2 = fbm(p * 1.6 - vec2(t * 0.18, t * 0.11) + f1);
-  vec3 deep = vec3(0.16, 0.24, 0.95), cyan = vec3(0.30, 0.84, 1.0), violet = vec3(0.70, 0.52, 1.0);
-  vec3 cA = mix(deep, cyan, smoothstep(0.18, 0.68, f1));
-  cA = mix(cA, violet, smoothstep(0.42, 0.8, f2) * 0.6);
-  cA *= 0.82 + 0.3 * uAgent + 0.22 * uAgent * uAgentTone;
-  cA += uThink * 0.18 * (0.5 + 0.5 * sin(ang * 2.0 - t * 2.4)) * vec3(0.7, 0.8, 1.0);
-  // glassy lighting: soft key light top-left, luminous core, bright rim
-  vec2 q = uv / max(R, 0.001);
-  float key = clamp(dot(q, normalize(vec2(-0.45, 0.6))), -1.0, 1.0);
-  cA *= 0.88 + 0.2 * key;
-  cA += vec3(0.85, 0.92, 1.0) * pow(max(0.0, 1.0 - length(q - vec2(-0.32, 0.38)) * 1.4), 3.0) * 0.28;
-  cA += vec3(0.4, 0.6, 1.0) * (1.0 - smoothstep(0.0, 0.75, length(q))) * (0.08 + 0.12 * uAgent);
-  cA += smoothstep(R - 0.035, R, r) * vec3(0.6, 0.8, 1.0) * 0.35;
-  cA *= 1.0 - 0.38 * uDuck;
-
-  vec3 cU = mix(vec3(1.0, 0.48, 0.32), vec3(1.0, 0.76, 0.42), uUserTone);
-  vec3 col = mix(vec3(0.962, 0.962, 0.952), vec3(0.031, 0.031, 0.043), uDark);
-  float outside = max(d, 0.0);
-
-  float glowA = exp(-outside * (10.0 - 4.0 * uAgent)) * (0.1 + 0.45 * uAgent + 0.08 * uThink) * (1.0 - 0.5 * uDuck);
-  col = mix(col, mix(cyan, deep, 0.4), clamp(glowA, 0.0, 1.0) * mix(0.65, 1.0, uDark));
-
-  // user: a soft warm aura with a thin bright edge, never a solid ring
-  float ring = exp(-pow((r - (R + 0.03 + 0.04 * uUser)) / (0.006 + 0.012 * uUser), 2.0));
-  float aura = exp(-outside * (9.0 - 3.0 * uUser));
-  float halo = clamp((ring * 0.45 + aura * 0.42) * uUser, 0.0, 0.75);
-  col = mix(col, cU, halo * (1.0 - body));
-
-  float ra = ripple(r, R, uRipA.x) + ripple(r, R, uRipA.y) + ripple(r, R, uRipA.z) + ripple(r, R, uRipA.w);
-  float ru = ripple(r, R, uRipU.x) + ripple(r, R, uRipU.y) + ripple(r, R, uRipU.z) + ripple(r, R, uRipU.w);
-  col = mix(col, cyan, clamp(ra * 0.28, 0.0, 1.0) * (1.0 - body));
-  col = mix(col, cU, clamp(ru * 0.35, 0.0, 1.0) * (1.0 - body));
-
-  col = mix(col, cA, body);
-  col += (hash(gl_FragCoord.xy + fract(uClock)) - 0.5) / 255.0;  // dither: no banding in soft gradients
-  gl_FragColor = vec4(col, 1.0);
+  vec2 dir = vec2(cos(ang), sin(ang)), nrm = vec2(-dir.y, dir.x);
+  vec2 world = pos + dir * aCorner.x * len * QUAD + nrm * aCorner.y * wid * QUAD;
+  gl_Position = vec4((uCenter + world * uScale) / uRes * 2.0 - 1.0, 0.0, 1.0);
+  vLocal = vec2(aCorner.x * len, aCorner.y * wid) * QUAD / wid;
+  vAspect = len / wid;
+  vColor = vec4(col, clamp(alpha, 0.0, 1.0));
+  vKind = kind;
 }`;
 
-let prog = null;
-const U_NAMES = ["uRes", "uCenter", "uScale", "uTime", "uClock", "uMotion", "uAgent", "uUser", "uAgentTone",
-  "uUserTone", "uThink", "uDuck", "uDark", "uRipA", "uRipU"];
+const FRAG = `#version 300 es
+precision highp float;
+in vec2 vLocal;
+in float vAspect, vKind;
+in vec4 vColor;
+out vec4 outColor;
+void main() {
+  if (vKind > 1.5) {
+    float d = length(vLocal);
+    float a = pow(clamp(1.0 - d, 0.0, 1.0), 1.8);
+    outColor = vec4(mix(vColor.rgb, vec3(1.0), 0.35 * (1.0 - d) * (1.0 - d)), vColor.a * a);
+    return;
+  }
+  float e = max(vAspect - 1.0, 0.0);
+  float d = length(vec2(vLocal.x - clamp(vLocal.x, -e, e), vLocal.y));  // capsule SDF, 1 = edge
+  float aa = fwidth(d) + 1e-4;
+  outColor = vec4(vColor.rgb, vColor.a * (1.0 - smoothstep(1.0 - aa, 1.0 + aa, d)));
+}`;
+
+const TAU = Math.PI * 2;
+
+/** Instance data: [kind, a, b, seed] per stroke. */
+function buildInstances() {
+  const out = [];
+  const step = 0.05;
+  for (let y = -1.25; y <= 1.25; y += step) {
+    for (let x = -1.7; x <= 1.7; x += step) {
+      const px = x + (Math.random() - 0.5) * step * 0.9, py = y + (Math.random() - 0.5) * step * 0.9;
+      if (Math.hypot(px, py) < 0.52) continue;  // keep the presence area for the rings
+      out.push(0, px, py, Math.random());
+    }
+  }
+  for (let r = 0.11; r <= 0.46; r += 0.0125) {
+    const n = Math.floor((TAU * r) / 0.0115), off = Math.random() * TAU;
+    for (let i = 0; i < n; i++) {
+      out.push(1, r + (Math.random() - 0.5) * 0.003, off + (i / n) * TAU + (Math.random() - 0.5) * 0.01, Math.random());
+    }
+  }
+  out.push(2, 0, 0, 0);
+  return new Float32Array(out);
+}
+const INSTANCES = buildInstances();
+const COUNT = INSTANCES.length / 4;
+
+const U_NAMES = ["uRes", "uCenter", "uPointer", "uScale", "uTime", "uClock", "uRot", "uMotion", "uAgent", "uUser",
+  "uAgentTone", "uThink", "uDuck", "uDark", "uPointerOn", "uWaveOut", "uWaveIn"];
 const loc = {};
 
 function initGL() {
   if (!gl) return false;
   const sh = (type, src) => {
     const s = gl.createShader(type);
-    gl.shaderSource(s, src); gl.compileShader(s);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
     if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
     return s;
   };
   try {
-    prog = gl.createProgram();
+    const prog = gl.createProgram();
     gl.attachShader(prog, sh(gl.VERTEX_SHADER, VERT));
     gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FRAG));
     gl.linkProgram(prog);
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    for (const n of U_NAMES) loc[n] = gl.getUniformLocation(prog, n);
   } catch (e) {
-    console.warn("WebGL orb unavailable, using 2D fallback:", e);
+    console.warn("WebGL2 particles unavailable, using 2D fallback:", e);
     return false;
   }
-  gl.useProgram(prog);
-  const b = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
-  const ap = gl.getAttribLocation(prog, "p");
-  gl.enableVertexAttribArray(ap);
-  gl.vertexAttribPointer(ap, 2, gl.FLOAT, false, 0, 0);
-  for (const n of U_NAMES) loc[n] = gl.getUniformLocation(prog, n);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, INSTANCES, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(1, 1);
+  gl.enable(gl.BLEND);
   return true;
 }
 const webgl = initGL();
@@ -549,7 +623,17 @@ function resize() {
 addEventListener("resize", resize);
 resize();
 
-let last = now(), motionTime = 0;
+// pointer: the ambient field swirls around it, then settles when it stops moving
+const pointer = { x: -1e4, y: -1e4, movedAt: -10, on: 0 };
+addEventListener("pointermove", (e) => {
+  if (e.pointerType !== "mouse") return;
+  const dpr = canvas.width / innerWidth;
+  pointer.x = e.clientX * dpr;
+  pointer.y = (innerHeight - e.clientY) * dpr;
+  pointer.movedAt = now();
+});
+
+let last = now(), motionTime = 0, rot = 0;
 function frame() {
   const t = now(), dt = Math.min(0.1, t - last);
   last = t;
@@ -560,8 +644,9 @@ function frame() {
   S.duck += (S.duckTarget - S.duck) * (1 - Math.exp(-dt / 0.08));
   const motion = reduceMotion.matches ? 0 : 1;
   motionTime += dt * motion;
+  rot += dt * (0.015 + 0.55 * S.think) * motion;
+  pointer.on += ((t - pointer.movedAt < 1.2 ? 1 : 0) - pointer.on) * (1 - Math.exp(-dt / 0.4));
 
-  // captions follow playback position
   if (S.agentSrc && S.agentLine) {
     const words = S.agentLine.text.split(/\s+/).length;
     renderCaption(S.agentLine, Math.ceil(clamp((t - S.agentStart) / S.agentDur, 0, 1) * words));
@@ -570,40 +655,52 @@ function frame() {
     renderCaption(S.userLine, Math.ceil(clamp((t - S.userStart) / S.userDur, 0, 1) * words));
   }
 
-  const w = canvas.width, h = canvas.height, scale = Math.min(w, h), cx = w / 2, cy = h * 0.58;
+  // 0.8: the field stays airy and clear of the captions below it
+  const w = canvas.width, h = canvas.height, scale = Math.min(w, h) * 0.8, cx = w / 2, cy = h * 0.58;
+  const dark = darkScheme.matches;
   if (webgl) {
     gl.viewport(0, 0, w, h);
+    if (dark) { gl.clearColor(0.039, 0.039, 0.051, 1); gl.blendFunc(gl.SRC_ALPHA, gl.ONE); }
+    else { gl.clearColor(0.984, 0.984, 0.98, 1); gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA); }
+    gl.clear(gl.COLOR_BUFFER_BIT);
     gl.uniform2f(loc.uRes, w, h);
     gl.uniform2f(loc.uCenter, cx, cy);
+    gl.uniform2f(loc.uPointer, pointer.x, pointer.y);
     gl.uniform1f(loc.uScale, scale);
     gl.uniform1f(loc.uTime, motionTime % 1000);
     gl.uniform1f(loc.uClock, t % 1000);
+    gl.uniform1f(loc.uRot, rot % TAU);
     gl.uniform1f(loc.uMotion, motion);
     gl.uniform1f(loc.uAgent, A.env);
     gl.uniform1f(loc.uUser, U.env);
     gl.uniform1f(loc.uAgentTone, A.tone);
-    gl.uniform1f(loc.uUserTone, U.tone);
     gl.uniform1f(loc.uThink, S.think);
     gl.uniform1f(loc.uDuck, S.duck);
-    gl.uniform1f(loc.uDark, darkScheme.matches ? 1 : 0);
-    gl.uniform4fv(loc.uRipA, A.ripples.map((x) => x % 1000));
-    gl.uniform4fv(loc.uRipU, U.ripples.map((x) => x % 1000));
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.uniform1f(loc.uDark, dark ? 1 : 0);
+    gl.uniform1f(loc.uPointerOn, pointer.on * motion);
+    gl.uniform4fv(loc.uWaveOut, A.ripples.map((x) => x % 1000));
+    gl.uniform4fv(loc.uWaveIn, U.ripples.map((x) => x % 1000));
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, COUNT);
   } else {
-    // 2D fallback: same signals, simpler drawing
-    const c = ctx2d, R = scale * (0.2 + 0.06 * A.env - 0.018 * U.env - 0.035 * S.duck);
-    c.fillStyle = darkScheme.matches ? "#08080b" : "#f5f5f3";
+    // 2D fallback: the rings only, same signals
+    const c = ctx2d;
+    c.fillStyle = dark ? "#0a0a0d" : "#fbfbfa";
     c.fillRect(0, 0, w, h);
-    const y = h - cy;
-    if (U.env > 0.02) {
-      c.beginPath(); c.arc(cx, y, R + scale * (0.045 + 0.05 * U.env), 0, Math.PI * 2);
-      c.strokeStyle = `rgba(255,140,90,${U.env})`; c.lineWidth = scale * 0.012; c.stroke();
+    const Rb = 0.25 + 0.085 * A.env - 0.06 * U.env - 0.04 * S.duck, W = 0.028 + 0.11 * A.env + 0.045 * U.env;
+    for (let i = 0; i < COUNT; i += 3) {
+      if (INSTANCES[i * 4] !== 1) continue;
+      const r0 = INSTANCES[i * 4 + 1], th = INSTANCES[i * 4 + 2] + rot;
+      const band = Math.exp(-(((r0 - Rb) / W) ** 2));
+      const a = 0.07 + band * (0.32 + 0.6 * clamp(A.env + U.env, 0, 1));
+      const hue = U.env > A.env ? 20 : 225;
+      c.strokeStyle = `hsla(${hue}, 80%, 58%, ${a})`;
+      c.lineWidth = scale * 0.003;
+      const x = cx + Math.cos(th) * r0 * scale, y = h - cy - Math.sin(th) * r0 * scale, l = scale * (0.004 + band * 0.012);
+      c.beginPath();
+      c.moveTo(x - Math.cos(th) * l, y + Math.sin(th) * l);
+      c.lineTo(x + Math.cos(th) * l, y - Math.sin(th) * l);
+      c.stroke();
     }
-    const g = c.createRadialGradient(cx - R * 0.3, y - R * 0.3, R * 0.1, cx, y, R);
-    g.addColorStop(0, "#5fd0ff"); g.addColorStop(1, "#1b2bd6");
-    c.globalAlpha = 1 - 0.38 * S.duck;
-    c.beginPath(); c.arc(cx, y, R, 0, Math.PI * 2); c.fillStyle = g; c.fill();
-    c.globalAlpha = 1;
   }
   requestAnimationFrame(frame);
 }
