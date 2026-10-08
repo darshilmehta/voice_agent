@@ -11,6 +11,7 @@ dependencies = [
   "httpx>=0.28",
   "aiosqlite>=0.22.1",
   "alembic>=1.20.0",
+  "qdrant-client>=1.12",
   "sqlalchemy[asyncio]>=2.1.4",
 ]
 
@@ -19,6 +20,18 @@ dev = [
   "pytest>=9.0",
   "pytest-asyncio>=1.4.0",
   "ruff>=0.16",
+]
+# Local models for ingestion and retrieval (docs/DESIGN.md §3.1-3.2). Optional: `uv sync --group ml`.
+# The app, /health and CI run without it; code imports these lazily and reports their absence.
+ml = [
+  "docling>=2.50",
+  "flagembedding>=1.3",
+  "onnxruntime>=1.30.0",
+  "opencv-python-headless>=5.0.0.93",  # see override-dependencies below
+  "rapidocr>=3.9.1,<3.10",  # 3.10 dropped PP_OCRV6_LANGS, which docling needs (§9.4)
+  "sentence-transformers>=3.3",
+  "torch>=2.14.1",
+  "transformers>=4.45",  # older releases make uv backtrack to a 2021 version that needs Rust (§9.3)
 ]
 
 [tool.uv]
@@ -32,6 +45,9 @@ pythonpath = ["."]
 addopts = "-q"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+  "integration: needs the real models (ml group) and a running Qdrant; skipped unless RUN_INTEGRATION=1",
+]
 filterwarnings = [
   # FastAPI's TestClient still uses httpx; harmless for tests
   "ignore:Using `httpx` with `starlette.testclient` is deprecated",

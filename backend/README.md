@@ -8,6 +8,12 @@ FastAPI service: configuration, provider registry, health, projects/chats/transc
 uv sync
 ```
 
+Ingestion and retrieval run local models (Docling, BGE-M3, bge-reranker-v2-m3) from the optional `ml` dependency group. Without it the app starts and `/health` marks those providers `degraded`:
+
+```bash
+uv sync --group ml
+```
+
 ```bash
 uv run python -m app
 ```
@@ -58,7 +64,15 @@ uv run pytest
 uv run ruff check . && uv run ruff format --check .
 ```
 
-Tests never touch the real Ollama, Qdrant, model files or database: HTTP is mocked and the project root is moved to a temp directory, so every test gets a fresh, migrated SQLite database.
+Tests never touch the real Ollama, Qdrant, model files or database: HTTP is mocked and the project root is moved to a temp directory, so every test gets a fresh, migrated SQLite database. Tests that need the `ml` group skip without it.
+
+Integration tests (real models, Docling and a running Qdrant; a temporary collection is created and dropped) are opt-in:
+
+```bash
+RUN_INTEGRATION=1 uv run --group ml pytest tests/integration
+```
+
+They read models from `MODELS_ROOT` (default `../data/models`) and the smoke-test PDF from `SMOKE_DOCS` (default `../data/smoke/docs`, written by `scripts/smoke/05_docling.py`); Qdrant from `QDRANT_URL` (default `http://127.0.0.1:6333`). Timings and ranks print in the summary.
 
 ## Layout
 
@@ -82,8 +96,15 @@ app/
   providers/
     base.py          Provider, PlaceholderProvider, health model, local_snapshot()
     registry.py      capability → provider resolution, Container
-    llm.py retrieval.py storage.py ingestion.py speech.py runtime.py web_search.py
+    models.py        local-model health, lazy ML imports (ml group), ModelUnavailableError
+    ingestion.py     DoclingParser: ParsedDocument (pages, items, tables + cells), chunking with provenance
+    retrieval.py     BgeM3Embedder (dense + sparse), BgeReranker, QdrantStore (hybrid RRF search)
+    llm.py storage.py speech.py runtime.py web_search.py
+  services/
+    ingestion.py     ingest_file: parse → chunk → embed → upsert (no DB writes)
+    retrieval.py     hybrid search → rerank → top N + confidence signal
 tests/
+  integration/       opt-in, real models + Qdrant (RUN_INTEGRATION=1)
 ```
 
 Each capability has a base class (for example `LLMClient`, `VectorStore`); its methods are added in the phase that builds it. A capability module becomes a package once it grows.
