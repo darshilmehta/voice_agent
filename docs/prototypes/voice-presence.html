@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Presence</title>
+<!--
+  Prototype for docs/DESIGN.md §3.8: an orb that breathes with the agent's voice and a halo that ripples
+  with the user's. Self-contained (no libraries). Serve the project root so the demo clips load:
+
+      python3 -m http.server 8765 --bind 127.0.0.1      (from the project root)
+      open http://localhost:8765/docs/prototypes/voice-presence.html
+
+  Demo clips come from data/smoke/audio/ (generated locally, not in git). Without them the demos fall
+  back to a synthetic voice-like signal. The microphone works either way.
+-->
+<style>
+  :root {
+    --bg: #08080b;
+    --text: #ecebf2;
+    --muted: #8e8c99;
+    --dim: #4d4b57;
+    --chip: rgb(255 255 255 / 6%);
+    --chip-border: rgb(255 255 255 / 10%);
+    --user: #ffa070;
+    --agent: #8fb4ff;
+    --focus: #8fb4ff;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f5f5f3;
+      --text: #1b1b20;
+      --muted: #6d6b75;
+      --dim: #b9b7c0;
+      --chip: rgb(0 0 0 / 4%);
+      --chip-border: rgb(0 0 0 / 8%);
+      --user: #d4602d;
+      --agent: #3557d6;
+      --focus: #3557d6;
+      color-scheme: light;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 15px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Noto Sans Devanagari", sans-serif;
+    -webkit-font-smoothing: antialiased; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  .top { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center;
+    gap: 12px; padding: 16px; z-index: 2; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip { padding: 4px 11px; border-radius: 999px; background: var(--chip); border: 1px solid var(--chip-border);
+    color: var(--muted); font-size: 12.5px; white-space: nowrap; backdrop-filter: blur(8px); }
+  .chip b { color: var(--text); font-weight: 600; }
+  .captions { position: fixed; left: 50%; transform: translateX(-50%); top: calc(42% + 31vmin);
+    width: min(680px, calc(100% - 32px)); text-align: center; z-index: 2; }
+  .caption { margin: 0; font-size: clamp(17px, 2.3vw, 22px); line-height: 1.45; font-weight: 500; letter-spacing: -0.005em;
+    min-height: 1.45em; text-wrap: balance; }
+  .caption .w { transition: color 120ms linear; color: var(--dim); }
+  .caption .w.on { color: var(--text); }
+  .caption.user .w.on { color: var(--user); }
+  .caption .cut { color: var(--dim); }
+  .cite { margin-top: 10px; min-height: 26px; }
+  .cite .chip { color: var(--agent); border-color: color-mix(in srgb, var(--agent) 30%, transparent);
+    opacity: 0; transition: opacity 300ms ease; }
+  .cite .chip.show { opacity: 1; }
+  .state { position: fixed; left: 50%; transform: translateX(-50%); bottom: 112px; margin: 0; z-index: 2;
+    color: var(--muted); font-size: 13.5px; letter-spacing: 0.02em; white-space: nowrap; }
+  .controls { position: fixed; left: 50%; transform: translateX(-50%); bottom: 32px; display: flex; gap: 18px;
+    align-items: center; z-index: 2; }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+  .round { width: 64px; height: 64px; border-radius: 50%; border: 1px solid var(--chip-border); background: var(--chip);
+    display: grid; place-items: center; backdrop-filter: blur(10px); transition: background 150ms, border-color 150ms, transform 150ms; }
+  .round:hover { transform: translateY(-1px); }
+  .round[aria-pressed="true"] { background: color-mix(in srgb, var(--user) 22%, transparent); border-color: var(--user); color: var(--user); }
+  .round.small { width: 44px; height: 44px; }
+  .round svg { width: 24px; height: 24px; }
+  .round.small svg { width: 18px; height: 18px; }
+  .demo { position: fixed; right: 16px; bottom: 20px; z-index: 3; display: flex; flex-direction: column; gap: 6px;
+    align-items: flex-end; }
+  .demo .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+  .demo .row { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; max-width: 300px; }
+  .demo button { padding: 6px 11px; border-radius: 999px; background: var(--chip); border: 1px solid var(--chip-border);
+    font-size: 12.5px; color: var(--muted); backdrop-filter: blur(8px); }
+  .demo button:hover { color: var(--text); }
+  .demo button[aria-pressed="true"] { color: var(--agent); border-color: var(--agent); }
+  @media (max-width: 640px) {
+    .demo { left: 16px; right: 16px; bottom: auto; top: 56px; align-items: flex-start; }
+    .demo .row { justify-content: flex-start; max-width: none; }
+    .captions { top: calc(42% + 30vmin); }
+  }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+</style>
+</head>
+<body>
+<canvas id="orb" aria-hidden="true"></canvas>
+
+<header class="top">
+  <div class="chips"><span class="chip">annual_report.pdf</span><span class="chip">contract.pdf</span></div>
+  <span class="chip" id="lang"><b>EN</b> · HI</span>
+</header>
+
+<section class="captions" aria-live="polite">
+  <p class="caption" id="caption"></p>
+  <div class="cite" id="cite"></div>
+</section>
+
+<p class="state" id="state" role="status">Ready · tap the mic or try a demo</p>
+
+<div class="controls">
+  <button class="round small" id="stop" title="Stop" aria-label="Stop">
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2.5"/></svg>
+  </button>
+  <button class="round" id="mic" aria-pressed="false" title="Use your microphone" aria-label="Microphone">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+      <rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>
+  </button>
+  <button class="round small" id="think" aria-pressed="false" title="Thinking" aria-label="Thinking">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+      <path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/></svg>
+  </button>
+</div>
+
+<aside class="demo" aria-label="Prototype demos">
+  <span class="label">Prototype demos</span>
+  <div class="row">
+    <button id="d-agent">Agent speaks</button>
+    <button id="d-hindi" lang="hi">हिन्दी</button>
+    <button id="d-barge">Interruption</button>
+  </div>
+</aside>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
+const darkScheme = matchMedia("(prefers-color-scheme: dark)");
+
+// ------------------------------------------------------------------ demo content
+const LINES = {
+  agent_en_0: { who: "agent", lang: "en", cite: "Annual report · p.46",
+    text: "FY24 revenue from operations was ₹4,210 crore, up 34% from the previous year, led mainly by the enterprise segment." },
+  agent_en_1: { who: "agent", lang: "en", cite: "Annual report · p.47",
+    text: "Got it. The EBITDA margin was 18.2%, up from 16.9% the year before." },
+  agent_hi_0: { who: "agent", lang: "hi", cite: "Annual report · p.46",
+    text: "वित्त वर्ष 2024 में कंपनी का राजस्व 34% बढ़कर ₹4,210 करोड़ हो गया।" },
+  say_en_1: { who: "user", lang: "en", text: "No wait, I meant the EBITDA margin, not the revenue." },
+};
+const CLIP_BASE = new URL("../../data/smoke/audio/", location.href);
+
+// ------------------------------------------------------------------ audio graph
+let ctx = null, agentGain, agentAn, userAn, micStream = null, micSrc = null;
+const buffers = {};
+
+function ensureAudio() {
+  if (ctx) return ctx;
+  ctx = new AudioContext();
+  agentGain = ctx.createGain();
+  agentAn = ctx.createAnalyser();
+  userAn = ctx.createAnalyser();
+  for (const an of [agentAn, userAn]) { an.fftSize = 1024; an.smoothingTimeConstant = 0.3; }
+  agentGain.connect(agentAn);
+  agentAn.connect(ctx.destination);
+  return ctx;
+}
+
+/** Voice-like stand-in when the demo clips aren't available: harmonics with syllable-rate envelopes. */
+function syntheticVoice(seconds, f0) {
+  const sr = ctx.sampleRate, n = Math.floor(seconds * sr), buf = ctx.createBuffer(1, n, sr), d = buf.getChannelData(0);
+  let phase = 0, syl = 0, sylLen = 0, sylAmp = 0;
+  for (let i = 0; i < n; i++) {
+    const t = i / sr;
+    if (syl <= 0) { sylLen = (0.12 + Math.random() * 0.18) * sr; syl = sylLen; sylAmp = Math.random() < 0.12 ? 0 : 0.5 + Math.random() * 0.5; }
+    const env = Math.sin(Math.PI * (1 - syl / sylLen)) ** 1.5 * sylAmp; syl--;
+    const f = f0 * (1 + 0.06 * Math.sin(t * 2.1) + 0.03 * Math.sin(t * 7.3));
+    phase += (2 * Math.PI * f) / sr;
+    let s = 0; for (let h = 1; h <= 6; h++) s += Math.sin(phase * h) / (h * 1.3);
+    d[i] = s * env * 0.18 * Math.min(1, t * 4, (seconds - t) * 4);
+  }
+  return buf;
+}
+
+async function loadClip(name) {
+  if (buffers[name]) return buffers[name];
+  try {
+    const res = await fetch(new URL(`${name}.wav`, CLIP_BASE));
+    if (!res.ok) throw new Error(res.statusText);
+    buffers[name] = await ctx.decodeAudioData(await res.arrayBuffer());
+  } catch {
+    const words = LINES[name].text.split(/\s+/).length;
+    buffers[name] = syntheticVoice(Math.max(2.5, words * 0.36), LINES[name].who === "agent" ? 190 : 140);
+  }
+  return buffers[name];
+}
+
+// ------------------------------------------------------------------ conversation state (demo-level)
+const S = {
+  agentSrc: null, agentLine: null, agentStart: 0, agentDur: 0, heardWords: null,
+  userSrc: null, userLine: null, userStart: 0, userDur: 0,
+  mic: false, think: 0, thinkTarget: 0, duck: 0, duckTarget: 0, duckedAt: 0, run: 0,
+};
+const now = () => performance.now() / 1000;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function setState(text) { $("state").textContent = text; }
+
+function refreshState() {
+  if (S.duckTarget > 0 && S.agentSrc) return setState("Interrupted · listening");
+  if (S.agentSrc) return setState("Speaking");
+  if (S.thinkTarget > 0) return setState("Thinking…");
+  if (S.userSrc || S.mic) return setState("Listening…");
+  setState("Ready · tap the mic or try a demo");
+}
+
+function renderCaption(line, shownWords, cut = false) {
+  const el = $("caption");
+  el.className = `caption ${line.who}`;
+  el.lang = line.lang;
+  const words = line.text.split(/\s+/);
+  el.replaceChildren(...words.flatMap((w, i) => {
+    if (cut && i >= shownWords) return [];
+    const span = document.createElement("span");
+    span.className = `w${i < shownWords ? " on" : ""}`;
+    span.textContent = w;
+    return [span, document.createTextNode(" ")];
+  }));
+  if (cut) { const c = document.createElement("span"); c.className = "cut"; c.textContent = "…"; el.append(c); }
+}
+
+function showCite(text) {
+  const box = $("cite");
+  box.replaceChildren();
+  if (!text) return;
+  const chip = document.createElement("span");
+  chip.className = "chip";
+  chip.textContent = text;
+  box.append(chip);
+  requestAnimationFrame(() => chip.classList.add("show"));
+}
+
+function playAgent(name) {
+  const line = LINES[name], buf = buffers[name];
+  stopAgent(false);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(agentGain);
+  agentGain.gain.cancelScheduledValues(ctx.currentTime);
+  agentGain.gain.setValueAtTime(1, ctx.currentTime);
+  Object.assign(S, { agentSrc: src, agentLine: line, agentStart: now(), agentDur: buf.duration, heardWords: null, duckTarget: 0 });
+  $("lang").innerHTML = line.lang === "hi" ? "EN · <b>HI</b>" : "<b>EN</b> · HI";
+  showCite(null);
+  src.onended = () => {
+    if (S.agentSrc !== src) return;
+    S.agentSrc = null;
+    renderCaption(line, Infinity);
+    showCite(line.cite);
+    refreshState();
+  };
+  src.start();
+  refreshState();
+  return new Promise((r) => src.addEventListener("ended", r));
+}
+
+function stopAgent(interrupted) {
+  const src = S.agentSrc;
+  if (!src) return;
+  S.agentSrc = null;
+  if (interrupted) {
+    const words = S.agentLine.text.split(/\s+/).length;
+    S.heardWords = Math.floor(clamp((now() - S.agentStart) / S.agentDur, 0, 1) * words);
+    renderCaption(S.agentLine, S.heardWords, true);  // keep only what the user actually heard
+  }
+  agentGain.gain.setTargetAtTime(0, ctx.currentTime, 0.02);
+  try { src.stop(ctx.currentTime + 0.08); } catch {}
+}
+
+/** Duck on the first sign of user speech; stop once it lasts; restore on a short sound (§3.3). */
+function bargeInLogic(userEnv) {
+  if (!S.agentSrc) { S.duckedAt = 0; S.duckTarget = 0; return; }
+  const t = now();
+  if (userEnv > 0.3) {
+    if (!S.duckedAt) {
+      S.duckedAt = t; S.duckTarget = 1;
+      agentGain.gain.setTargetAtTime(0.15, ctx.currentTime, 0.03);
+      refreshState();
+    } else if (t - S.duckedAt > 0.3) {
+      stopAgent(true); S.duckedAt = 0;
+      setTimeout(() => { S.duckTarget = 0; }, 250);
+      refreshState();
+    }
+  } else if (S.duckedAt && t - S.duckedAt > 0.35) {
+    S.duckedAt = 0; S.duckTarget = 0;
+    agentGain.gain.setTargetAtTime(1, ctx.currentTime, 0.08);
+    refreshState();
+  }
+}
+
+function playUser(name) {
+  const line = LINES[name], buf = buffers[name];
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(userAn);
+  src.connect(ctx.destination);
+  Object.assign(S, { userSrc: src, userLine: line, userStart: now(), userDur: buf.duration });
+  src.start();
+  refreshState();
+  return new Promise((r) => (src.onended = () => { S.userSrc = null; renderCaption(line, Infinity); refreshState(); r(); }));
+}
+
+function stopAll() {
+  S.run++;
+  stopAgent(false);
+  if (S.userSrc) { try { S.userSrc.stop(); } catch {} S.userSrc = null; }
+  S.thinkTarget = 0; S.duckTarget = 0; S.duckedAt = 0;
+  $("think").setAttribute("aria-pressed", "false");
+  $("caption").replaceChildren(); showCite(null);
+  refreshState();
+}
+
+async function prepare(...names) {
+  ensureAudio();
+  await ctx.resume();
+  await Promise.all(names.map(loadClip));
+}
+
+async function demoAgent(name) {
+  stopAll();
+  const run = S.run;
+  await prepare(name);
+  if (run !== S.run) return;
+  S.thinkTarget = 1; refreshState();
+  await sleep(900);
+  if (run !== S.run) return;
+  S.thinkTarget = 0;
+  playAgent(name);
+}
+
+async function demoBargeIn() {
+  stopAll();
+  const run = S.run;
+  await prepare("agent_en_0", "say_en_1", "agent_en_1");
+  if (run !== S.run) return;
+  playAgent("agent_en_0");
+  await sleep(3400);
+  if (run !== S.run) return;
+  await playUser("say_en_1");
+  if (run !== S.run) return;
+  S.thinkTarget = 1; refreshState();
+  await sleep(1300);
+  if (run !== S.run) return;
+  S.thinkTarget = 0;
+  playAgent("agent_en_1");
+}
+
+async function toggleMic() {
+  ensureAudio();
+  await ctx.resume();
+  if (S.mic) {
+    micStream.getTracks().forEach((t) => t.stop());
+    micSrc.disconnect();
+    S.mic = false;
+  } else {
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch (e) {
+      setState(`Microphone unavailable: ${e.name}`);
+      return;
+    }
+    micSrc = ctx.createMediaStreamSource(micStream);
+    micSrc.connect(userAn);
+    S.mic = true;
+  }
+  $("mic").setAttribute("aria-pressed", String(S.mic));
+  refreshState();
+}
+
+$("mic").onclick = toggleMic;
+$("stop").onclick = stopAll;
+$("think").onclick = () => {
+  S.thinkTarget = S.thinkTarget ? 0 : 1;
+  $("think").setAttribute("aria-pressed", String(!!S.thinkTarget));
+  refreshState();
+};
+$("d-agent").onclick = () => demoAgent("agent_en_0");
+$("d-hindi").onclick = () => demoAgent("agent_hi_0");
+$("d-barge").onclick = demoBargeIn;
+
+// ------------------------------------------------------------------ voice analysis
+function meter() {
+  return { buf: new Float32Array(1024), freq: new Uint8Array(512), env: 0, tone: 0, slow: 0, lastOnset: 0,
+    ripples: [-100, -100, -100, -100], ri: 0 };
+}
+const A = meter(), U = meter();
+
+/** Loudness envelope (fast attack, slow release), spectral brightness, and onsets that spawn ripples. */
+function measure(an, m, dt, t) {
+  let level = 0, tone = 0;
+  if (an) {
+    an.getFloatTimeDomainData(m.buf);
+    let sum = 0;
+    for (let i = 0; i < m.buf.length; i++) sum += m.buf[i] * m.buf[i];
+    const db = 20 * Math.log10(Math.sqrt(sum / m.buf.length) + 1e-9);
+    level = clamp((db + 58) / 40, 0, 1);
+    an.getByteFrequencyData(m.freq);
+    let num = 0, den = 0;
+    const binHz = ctx.sampleRate / 2 / m.freq.length;
+    for (let i = 1; i < m.freq.length; i++) { num += i * binHz * m.freq[i]; den += m.freq[i]; }
+    tone = den ? clamp((num / den - 400) / 2600, 0, 1) : 0;
+  }
+  const k = level > m.env ? 1 - Math.exp(-dt / 0.04) : 1 - Math.exp(-dt / 0.25);
+  m.env += (level - m.env) * k;
+  m.tone += (tone - m.tone) * (1 - Math.exp(-dt / 0.15));
+  m.slow += (level - m.slow) * (1 - Math.exp(-dt / 0.3));
+  if (!reduceMotion.matches && level > 0.35 && level - m.slow > 0.16 && t - m.lastOnset > 0.35) {
+    m.lastOnset = t;
+    m.ripples[m.ri++ % 4] = t;
+  }
+}
+
+// ------------------------------------------------------------------ rendering
+let canvas = $("orb");
+const gl = canvas.getContext("webgl", { antialias: false, premultipliedAlpha: false });
+
+const VERT = "attribute vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }";
+const FRAG = `
+precision highp float;
+uniform vec2 uRes, uCenter;
+uniform float uScale, uTime, uClock, uMotion, uAgent, uUser, uAgentTone, uUserTone, uThink, uDuck, uDark;
+uniform vec4 uRipA, uRipU;
+
+float hash(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+float noise(vec2 p){
+  vec2 i = floor(p), f = fract(p), u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), u.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+float fbm(vec2 p){ float v = 0.0, a = 0.5; for (int i = 0; i < 4; i++){ v += a * noise(p); p = p * 2.03 + vec2(17.1, 9.2); a *= 0.5; } return v; }
+float ripple(float r, float R, float start){
+  float t = uClock - start;
+  if (t < 0.0 || t > 1.4) return 0.0;
+  float w = 0.006 + t * 0.012;
+  return exp(-pow((r - (R + t * 0.3)) / w, 2.0)) * (1.0 - t / 1.4);
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - uCenter) / uScale;
+  float r = length(uv), ang = atan(uv.y, uv.x);
+  float t = uTime;
+
+  // radius: idle breathing + agent swell; contracts slightly while the user talks, shrinks when ducked
+  float R0 = 0.2 + 0.01 * sin(t * 1.26) * uMotion + 0.06 * uAgent - 0.018 * uUser - 0.035 * uDuck;
+  float n = fbm(vec2(cos(ang), sin(ang)) * 1.5 + vec2(t * 0.22, -t * 0.17));
+  float R = R0 + (0.008 + 0.03 * uAgent + 0.018 * uThink) * (n - 0.5) * 2.0 * mix(0.35, 1.0, uMotion);
+  float d = r - R, aa = 1.5 / uScale;
+  float body = 1.0 - smoothstep(-aa, aa, d);
+
+  // inside: two-tone flowing gradient, faster and brighter with the agent's voice
+  vec2 p = uv * 4.0;
+  float speed = 0.12 + 0.55 * uAgent + 0.35 * uThink;
+  float f1 = fbm(p + vec2(t * speed, -t * speed * 0.7));
+  float f2 = fbm(p * 1.6 - vec2(t * 0.18, t * 0.11) + f1);
+  vec3 deep = vec3(0.16, 0.24, 0.95), cyan = vec3(0.30, 0.84, 1.0), violet = vec3(0.70, 0.52, 1.0);
+  vec3 cA = mix(deep, cyan, smoothstep(0.18, 0.68, f1));
+  cA = mix(cA, violet, smoothstep(0.42, 0.8, f2) * 0.6);
+  cA *= 0.82 + 0.3 * uAgent + 0.22 * uAgent * uAgentTone;
+  cA += uThink * 0.18 * (0.5 + 0.5 * sin(ang * 2.0 - t * 2.4)) * vec3(0.7, 0.8, 1.0);
+  // glassy lighting: soft key light top-left, luminous core, bright rim
+  vec2 q = uv / max(R, 0.001);
+  float key = clamp(dot(q, normalize(vec2(-0.45, 0.6))), -1.0, 1.0);
+  cA *= 0.88 + 0.2 * key;
+  cA += vec3(0.85, 0.92, 1.0) * pow(max(0.0, 1.0 - length(q - vec2(-0.32, 0.38)) * 1.4), 3.0) * 0.28;
+  cA += vec3(0.4, 0.6, 1.0) * (1.0 - smoothstep(0.0, 0.75, length(q))) * (0.08 + 0.12 * uAgent);
+  cA += smoothstep(R - 0.035, R, r) * vec3(0.6, 0.8, 1.0) * 0.35;
+  cA *= 1.0 - 0.38 * uDuck;
+
+  vec3 cU = mix(vec3(1.0, 0.48, 0.32), vec3(1.0, 0.76, 0.42), uUserTone);
+  vec3 col = mix(vec3(0.962, 0.962, 0.952), vec3(0.031, 0.031, 0.043), uDark);
+  float outside = max(d, 0.0);
+
+  float glowA = exp(-outside * (10.0 - 4.0 * uAgent)) * (0.1 + 0.45 * uAgent + 0.08 * uThink) * (1.0 - 0.5 * uDuck);
+  col = mix(col, mix(cyan, deep, 0.4), clamp(glowA, 0.0, 1.0) * mix(0.65, 1.0, uDark));
+
+  // user: a soft warm aura with a thin bright edge, never a solid ring
+  float ring = exp(-pow((r - (R + 0.03 + 0.04 * uUser)) / (0.006 + 0.012 * uUser), 2.0));
+  float aura = exp(-outside * (9.0 - 3.0 * uUser));
+  float halo = clamp((ring * 0.45 + aura * 0.42) * uUser, 0.0, 0.75);
+  col = mix(col, cU, halo * (1.0 - body));
+
+  float ra = ripple(r, R, uRipA.x) + ripple(r, R, uRipA.y) + ripple(r, R, uRipA.z) + ripple(r, R, uRipA.w);
+  float ru = ripple(r, R, uRipU.x) + ripple(r, R, uRipU.y) + ripple(r, R, uRipU.z) + ripple(r, R, uRipU.w);
+  col = mix(col, cyan, clamp(ra * 0.28, 0.0, 1.0) * (1.0 - body));
+  col = mix(col, cU, clamp(ru * 0.35, 0.0, 1.0) * (1.0 - body));
+
+  col = mix(col, cA, body);
+  col += (hash(gl_FragCoord.xy + fract(uClock)) - 0.5) / 255.0;  // dither: no banding in soft gradients
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+let prog = null;
+const U_NAMES = ["uRes", "uCenter", "uScale", "uTime", "uClock", "uMotion", "uAgent", "uUser", "uAgentTone",
+  "uUserTone", "uThink", "uDuck", "uDark", "uRipA", "uRipU"];
+const loc = {};
+
+function initGL() {
+  if (!gl) return false;
+  const sh = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  try {
+    prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, VERT));
+    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FRAG));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  } catch (e) {
+    console.warn("WebGL orb unavailable, using 2D fallback:", e);
+    return false;
+  }
+  gl.useProgram(prog);
+  const b = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  const ap = gl.getAttribLocation(prog, "p");
+  gl.enableVertexAttribArray(ap);
+  gl.vertexAttribPointer(ap, 2, gl.FLOAT, false, 0, 0);
+  for (const n of U_NAMES) loc[n] = gl.getUniformLocation(prog, n);
+  return true;
+}
+const webgl = initGL();
+if (!webgl && gl) {
+  // a canvas that already has a WebGL context can't give a 2D one: swap in a fresh canvas
+  const fresh = canvas.cloneNode();
+  canvas.replaceWith(fresh);
+  canvas = fresh;
+}
+const ctx2d = webgl ? null : canvas.getContext("2d");
+
+function resize() {
+  const dpr = Math.min(2, devicePixelRatio || 1);
+  canvas.width = Math.round(innerWidth * dpr);
+  canvas.height = Math.round(innerHeight * dpr);
+}
+addEventListener("resize", resize);
+resize();
+
+let last = now(), motionTime = 0;
+function frame() {
+  const t = now(), dt = Math.min(0.1, t - last);
+  last = t;
+  measure(ctx && agentAn, A, dt, t);
+  measure(ctx && userAn, U, dt, t);
+  if (ctx) bargeInLogic(U.env);
+  S.think += (S.thinkTarget - S.think) * (1 - Math.exp(-dt / 0.35));
+  S.duck += (S.duckTarget - S.duck) * (1 - Math.exp(-dt / 0.08));
+  const motion = reduceMotion.matches ? 0 : 1;
+  motionTime += dt * motion;
+
+  // captions follow playback position
+  if (S.agentSrc && S.agentLine) {
+    const words = S.agentLine.text.split(/\s+/).length;
+    renderCaption(S.agentLine, Math.ceil(clamp((t - S.agentStart) / S.agentDur, 0, 1) * words));
+  } else if (S.userSrc && S.userLine) {
+    const words = S.userLine.text.split(/\s+/).length;
+    renderCaption(S.userLine, Math.ceil(clamp((t - S.userStart) / S.userDur, 0, 1) * words));
+  }
+
+  const w = canvas.width, h = canvas.height, scale = Math.min(w, h), cx = w / 2, cy = h * 0.58;
+  if (webgl) {
+    gl.viewport(0, 0, w, h);
+    gl.uniform2f(loc.uRes, w, h);
+    gl.uniform2f(loc.uCenter, cx, cy);
+    gl.uniform1f(loc.uScale, scale);
+    gl.uniform1f(loc.uTime, motionTime % 1000);
+    gl.uniform1f(loc.uClock, t % 1000);
+    gl.uniform1f(loc.uMotion, motion);
+    gl.uniform1f(loc.uAgent, A.env);
+    gl.uniform1f(loc.uUser, U.env);
+    gl.uniform1f(loc.uAgentTone, A.tone);
+    gl.uniform1f(loc.uUserTone, U.tone);
+    gl.uniform1f(loc.uThink, S.think);
+    gl.uniform1f(loc.uDuck, S.duck);
+    gl.uniform1f(loc.uDark, darkScheme.matches ? 1 : 0);
+    gl.uniform4fv(loc.uRipA, A.ripples.map((x) => x % 1000));
+    gl.uniform4fv(loc.uRipU, U.ripples.map((x) => x % 1000));
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  } else {
+    // 2D fallback: same signals, simpler drawing
+    const c = ctx2d, R = scale * (0.2 + 0.06 * A.env - 0.018 * U.env - 0.035 * S.duck);
+    c.fillStyle = darkScheme.matches ? "#08080b" : "#f5f5f3";
+    c.fillRect(0, 0, w, h);
+    const y = h - cy;
+    if (U.env > 0.02) {
+      c.beginPath(); c.arc(cx, y, R + scale * (0.045 + 0.05 * U.env), 0, Math.PI * 2);
+      c.strokeStyle = `rgba(255,140,90,${U.env})`; c.lineWidth = scale * 0.012; c.stroke();
+    }
+    const g = c.createRadialGradient(cx - R * 0.3, y - R * 0.3, R * 0.1, cx, y, R);
+    g.addColorStop(0, "#5fd0ff"); g.addColorStop(1, "#1b2bd6");
+    c.globalAlpha = 1 - 0.38 * S.duck;
+    c.beginPath(); c.arc(cx, y, R, 0, Math.PI * 2); c.fillStyle = g; c.fill();
+    c.globalAlpha = 1;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
