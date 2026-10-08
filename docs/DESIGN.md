@@ -10,6 +10,13 @@
 
 A fully local, ChatGPT "voice mode"-style agent that talks with you about your uploaded documents.
 
+**Voice-first (product principle, confirmed by the user 2026-10-09).** The primary way to use the product is a spoken conversation. Text is secondary: transcripts, summaries and search exist to *revisit* conversations, and typing is a fallback when speaking isn't possible. Every screen and default follows from this:
+
+- Opening or starting a chat lands in **voice mode** (presence field §3.8, a large mic control, live captions, the current answer's sources); the transcript is a panel you open, and "Type instead" is a collapsed secondary input.
+- Answers are written to be **heard**: 1–3 spoken sentences, details and citations on screen. Text turns use the same pipeline (`modality` parameter) with a somewhat fuller style.
+- The answer pipeline is **transport-agnostic**: one service yields typed events (user message, sources, deltas, agent message, error) with cancellation; text is a thin SSE adapter, voice a WebSocket adapter that feeds deltas to TTS.
+- Engineering order still builds the text path first (phase 1) because it is the same brain voice needs, and lets answer quality be debugged apart from audio; voice follows immediately after (see §10 execution order).
+
 - You speak; the agent answers **briefly**, in voice, with citations shown on screen.
 - You can **interrupt** at any time — change the question, correct it, say "stop", switch topic or language — and the agent adapts immediately. It is a conversation, not a narration.
 - It answers from your documents when the question is about them (with page citations), answers from general knowledge when it isn't, and says so when the documents don't contain the answer.
@@ -315,7 +322,8 @@ So "session" now only means a live connection; anything persisted is a project, 
 ```
 
 - **Project page:** documents (upload, ingestion status, page/chunk counts), its chats, and later a project digest built from chat summaries.
-- **Chat page:** voice or text mode over the same chat; the transcript is always available beside or instead of the particle field.
+- **Chat page (voice-first):** opens in **voice mode** — presence field, large mic, live captions, the current answer's source chips. The **transcript** is a panel/drawer to revisit the conversation (always one click away, and the default view when reopening an old chat from history), and **"Type instead"** expands a text composer. Starting a new chat requests the microphone and starts listening.
+- **Home:** the primary action is **Start a conversation** (in the current or a chosen project); recent chats are listed for revisiting.
 
 **Transcripts: yes, every chat is stored.** Each message keeps:
 
@@ -772,6 +780,8 @@ Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first
 
 Design-only PRs so far: #4 and #6 (voice presence UI, §3.8), #7 (projects, chats, transcripts, §3.9).
 
+**Execution order (voice-first).** After phase 1 lands, go straight to the voice loop with the voice-first chat page: **4 → 5 → 6**, then **3 + 7** (router, drift, language switching; summaries/titles/export as revisit features), then **2** tuning on the eval set, **8** (web search), **9** (evals, latency, polish). Phase numbers keep their meaning; only the order changes.
+
 | Phase | Deliverable | Done when |
 |---|---|---|
 | 0 | Skeleton: config loader, provider registry, `/health`, `/api/config/public`, frontend shell with runtime config | `/health` reports every provider; both config files validate; `cloud.config.json` wiring test passes (placeholders raise NotImplemented) |
@@ -779,7 +789,7 @@ Design-only PRs so far: #4 and #6 (voice presence UI, §3.8), #7 (projects, chat
 | 2 | Hybrid retrieval + reranker + confidence gate | identifiers, paraphrases, numbers, page citations correct on eval set |
 | 3 | Router + conversation state; chat memory summary; automatic chat titles; user-facing chat summaries + transcript export (§3.9) | unrelated questions skip retrieval; follow-ups and "back to the report" work; summary cites pages and flags unanswered questions; export opens as Markdown/JSON |
 | 4 | Voice in: browser mic → WebSocket → VAD → Whisper → transcript events | EN/HI transcription, silence handling, end-of-turn detection |
-| 5 | Voice out: streamed answer → sentence TTS → browser playback; voice presence field (agent motion) + live captions (§3.8) | first audio after first sentence; text and audio in sync; field follows agent voice |
+| 5 | Voice out: streamed answer → sentence TTS → browser playback; voice presence field (agent motion) + live captions (§3.8); **chat page opens in voice mode**, transcript as a panel, "Type instead" secondary (§1 voice-first) | first audio after first sentence; text and audio in sync; field follows agent voice; a new chat is usable end to end without typing |
 | 6 | Barge-in (duck-then-decide), corrections, stop; user waves + barge-in visuals (§3.8) | interrupt mid-answer; "no, I meant…" handled; backchannels ignored; field ducks with the audio |
 | 7 | Topic drift + EN/HI switching + code-mixing | drift script passes: document → general → Hindi → document |
 | 8 | Live-data tools: web search with filler + streamed partial answers (§3.7) | mixed doc+live question answered with separate [S]/[W] citations; first words < 1 s after filler; barge-in cancels search; timeout falls back to document-only answer |
