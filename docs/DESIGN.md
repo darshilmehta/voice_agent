@@ -1,6 +1,6 @@
 # poc_gibberlink — Design
 
-> **Status:** Phase −1 **complete** (2026-10-08): every local component downloaded and smoke-tested, including a full network-off run. Next: phase 0. No application code yet.
+> **Status:** Phase −1 **complete** (smoke tests incl. network-off run) · Phase 0 **complete** (skeleton, health, frontend shell, Docker, CI) · Phase 1 **in progress** (2026-10-08).
 > **Last updated:** 2026-10-08 (config moved to JSON: local + cloud template)
 > **Origin:** derived from [`blueprint.md`](blueprint.md). This document records what we actually decided; where the two disagree, this one wins.
 
@@ -760,6 +760,16 @@ Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first
 ---
 
 ## 10. Build phases (after Phase −1 is green)
+
+**Progress**
+
+| Phase | Status | Delivered in |
+|---|---|---|
+| −1 Downloads + smoke tests | ✅ done | §9; initial commit |
+| 0 Skeleton | ✅ done | PRs #1–#3 (hygiene, backend skeleton, frontend shell), #5 (CI), #8 (Docker images + `full` profile, `docker.config.json`, `strict_offline_local_hosts`) |
+| 1 Projects + text document chat | in progress | persistence (projects, documents, chats, messages) and ingestion/retrieval built in parallel |
+
+Design-only PRs so far: #4 and #6 (voice presence UI, §3.8), #7 (projects, chats, transcripts, §3.9).
 
 | Phase | Deliverable | Done when |
 |---|---|---|
