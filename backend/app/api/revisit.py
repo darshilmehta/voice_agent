@@ -1,21 +1,23 @@
-"""Revisiting a chat: regenerated titles and the user summary (docs/DESIGN.md §3.9).
+"""Revisiting a chat: automatic and regenerated titles, the user summary, and transcript export (docs/DESIGN.md §3.9).
 
-The services behind them are ``services/titles.py`` and ``chat_summary.py``; this module only maps them to HTTP.
-Errors are the app's usual ones: unknown chat → 404, bad input → 422, the model failing → 503.
+The services behind them are ``services/titles.py``, ``chat_summary.py`` and ``export.py``; this module only maps
+them to HTTP. Errors are the app's usual ones: unknown chat → 404, bad input → 422, the model failing → 503.
 """
 
 from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from ..domain.projects import Chat
 from ..domain.summaries import UserSummary
 from ..services.base import NotFound
 from ..services.chat_summary import ChatSummarizer
+from ..services.export import ExportFormat, ExportService
 from ..services.titles import TitleLocked, TitleService
 from ..settings import Language
+from .deps import DB
 
 router = APIRouter(tags=["revisit"])
 
@@ -29,8 +31,13 @@ def titles(request: Request) -> TitleService:
     return request.app.state.titles
 
 
+def exporter(db: DB) -> ExportService:
+    return ExportService(db)
+
+
 Summarizer = Annotated[ChatSummarizer, Depends(summarizer)]
 Titles = Annotated[TitleService, Depends(titles)]
+Exporter = Annotated[ExportService, Depends(exporter)]
 
 
 @router.get("/api/chats/{chat_id}/summary")
@@ -50,6 +57,19 @@ async def create_summary(chat_id: str, summaries: Summarizer, language: Language
     summary in another language is regenerated. Empty chat → 422; model unavailable → 503 (nothing stored). Long chats
     take longer (several model calls)."""
     return await summaries.generate(chat_id, language=language)
+
+
+@router.get("/api/chats/{chat_id}/export")
+async def export_chat(chat_id: str, exporter: Exporter, format: ExportFormat = "md") -> Response:
+    """The transcript as a download: ``format=md`` (Markdown, default) or ``json`` (schema in
+    ``services/export.py``). Headers: ``Content-Disposition: attachment`` with a name like
+    ``fy24-margins-2026-10-08.md``. No audio."""
+    file = await exporter.export(chat_id, format)
+    return Response(
+        content=file.body,
+        media_type=file.media_type,
+        headers={"Content-Disposition": file.content_disposition, "Cache-Control": "no-store"},
+    )
 
 
 @router.post("/api/chats/{chat_id}/title:regenerate")
