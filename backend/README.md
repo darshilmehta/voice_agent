@@ -44,6 +44,9 @@ The config file is `../config/local.config.json` unless `APP_CONFIG_FILE` says o
 | `GET` / `PATCH` / `DELETE /api/chats/{id}` | One chat / rename, `pinned`, `archived`, `document_scope` (null = all documents), `language` / delete with its messages |
 | `GET /api/chats/{id}/messages` | The transcript, paginated: `?after=<seq>` reads forward, `?before=<seq>` reads backward, `limit` ≤ 200 |
 | `POST /api/chats/{id}/messages` | Ask in text: `{"text", "language": "en" \| "hi" \| null}` → the answer as Server-Sent Events (below) |
+| `GET` / `POST /api/chats/{id}/summary` | The chat's user summary (`404` if none yet) / generate or refresh it (`?language=en\|hi`); see "Revisiting a chat" |
+| `GET /api/chats/{id}/export` | Transcript download: `?format=md` (default) or `json`, as an attachment |
+| `POST /api/chats/{id}/title:regenerate` | A new automatic title (`?force=true` also replaces a title the user set) |
 | `GET /api/pins` | Pinned projects and chats for the sidebar, most recently pinned first |
 | `WS /ws/chats/{id}/voice` | A live voice conversation in the chat (below) |
 
@@ -116,6 +119,14 @@ The turn itself is `ChatTurnService` (`app/services/chat_turns.py`), which knows
 
 A turn ends (`state: listening`) on `playback_done`, or 2 s after its audio should have finished playing if the client never says so (following the chunks as they were sent, gaps included, and pushed back by `playback` reports). Everything said is saved as messages of the chat, so the transcript view and the text endpoint see the same history.
 
+### Revisiting a chat
+
+**Titles.** A new chat is called "New chat" with `title_is_auto: true`. When its first agent message is saved (text or voice turn), `MessageService` runs the registered agent-message hook, which queues a job on the job queue: the model writes a title of at most 6 words in the conversation's language (token cap, 20 s timeout, one retry); if it gives nothing usable the cleaned first question is used instead. The write only happens if nobody renamed the chat meanwhile (compare-and-set on the title and `title_is_auto`), so a user's title is never overwritten, and it changes `title` and `updated_at` for the sidebar's next fetch. A chat gets a title once: later answers don't regenerate it. `POST /api/chats/{id}/title:regenerate` returns the updated chat: `409` if the user set the title (unless `?force=true`), `422` without a user message, `503` if the model fails (nothing changes).
+
+**Summaries.** `POST /api/chats/{id}/summary[?language=en|hi]` generates the summary (a chat with no messages is `422`, the model failing `503` with nothing stored) and `GET` returns the stored one. The response is `{id, chat_id, language, overview, key_points: [{text, sources: [{document_id, filename, page_start, page_end}]}], unanswered_questions: [{question, message_seq}], follow_ups: [str], content (the same as Markdown), covers_seq, message_count, stale, model, created_at}`. `stale` (`covers_seq < message_count`) means messages were added since: show "out of date" and POST again. Asking again for an unchanged chat in the same language returns the stored summary without calling the model. The model writes the overview, key points and follow-ups as JSON (validated with Pydantic); answers' per-answer `[S#]` markers are first renumbered chat-wide, and a key point's `sources` keep only numbers that were in the text the model saw, then become documents and pages. `unanswered_questions` are the user's questions of the turns the agent abstained on. Chats longer than the context budget (`llm.num_ctx` minus room for instructions and output) are summarised in windows and combined (map-reduce). The language is the chat's dominant one unless `language` is given.
+
+**Export.** `GET /api/chats/{id}/export?format=md|json` returns the transcript with `Content-Disposition: attachment` (`fy24-margins-2026-10-08.md`: slugified title and creation date). Markdown has the title, project, creation date and languages, the summary (if any), every message with speaker, time and modality (an interrupted answer shows what was heard, then the full answer), citations as `[1]` and a sources list. JSON is `{"schema_version": 1, "exported_at", "chat", "messages", "sources", "summary"}`; `messages[].text` keeps the `[S#]` markers as saved and `messages[].citations[].ref` is the number in `sources` (the Markdown's `[n]`). No audio is stored, so none is exported. The models are in `app/services/export.py`.
+
 ## Database
 
 Projects, documents, chats, messages and summaries live in SQLite (`data/sqlite/app.db`) through SQLAlchemy, so Postgres is a URL change plus implementing the `postgres` provider (docs/DESIGN.md §3.9, §6). Ids are readable and sortable: `prj_…`, `doc_…`, `cht_…`, `msg_…` (ULID layout). Deleting a project or chat cascades in the database (`ON DELETE CASCADE`, foreign keys enforced on every SQLite connection).
@@ -151,6 +162,8 @@ They read models from `MODELS_ROOT` (default `../data/models`) and the smoke-tes
 `test_voice_e2e.py` (also needs Ollama, and the speech clips in `SMOKE_AUDIO`, default `../data/smoke/audio`, written by `scripts/smoke/09_kokoro.py`) runs the voice loop over the WebSocket with every real model preloaded: a spoken revenue question streamed in real time must come back transcribed, answered with citations and spoken; a spoken correction barges in mid-answer and must stop it (with `heard_text`) and be answered (Whisper must understand that spoken answer again); a Hindi question must be detected as Hindi. It prints the latency from the end of the user's speech to each stage.
 
 `test_concurrency_e2e.py` (same needs) uploads the smoke PDF the moment the app starts, while the models preload (it must wait, `PENDING`, and then become `READY`), then times a text and a spoken question while idle and again while a 60-page PDF is being ingested.
+
+`tests/integration/test_revisit_llm.py` needs only Ollama with `qwen3:4b-instruct` (no other model, no Qdrant): it titles and summarises scripted English and Hindi chats, and once in tiny windows to exercise map-reduce, printing the results to judge the prompts: `RUN_INTEGRATION=1 uv run pytest tests/integration/test_revisit_llm.py -s`.
 
 ## Layout
 
@@ -195,6 +208,10 @@ app/
     voice/                the voice loop: protocol.py (messages, frames, close codes), turn_taking.py (endpointing,
                           barge-in verdict), speech_text.py (speakable chunks, heard text, backchannels),
                           session.py (VoiceSession state machine, VoiceSessions: one per chat)
+    titles.py             automatic chat titles: agent-message hook → job queue → LLM (fallback: the first question)
+    chat_summary.py       user summaries: chat-wide source numbers, windows, map-reduce, grounding, Markdown
+    chat_sources.py revisit_prompts.py markdown_text.py   chat-wide citation numbers; title/summary prompts; escaping
+    export.py             transcript export (Markdown, JSON) and download file names
 tests/
   integration/       opt-in, real models + Qdrant (RUN_INTEGRATION=1)
 ```
