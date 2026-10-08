@@ -34,9 +34,11 @@ SPARSE = "sparse"
 # Longest text the embedder reads. Chunks are ≤ ~target_tokens, but whole tables can be longer; BGE-M3 handles 8192.
 EMBED_MAX_TOKENS = 2048
 # Query + passage tokens the cross-encoder reads (as in smoke test 04). Chunks of target_tokens (500) fit almost
-# whole; long table chunks are cut, which bounds their cost. Reranking is compute-bound: on an M4 (MPS, fp16),
-# 20 candidates take ~0.2 s at ~30 tokens each but ~2.1 s at ~425 tokens each, so candidate count and chunk size
-# drive voice latency (tune prefetch_k / chunking in phase 2).
+# whole; long table chunks are cut, which bounds their cost. Reranking is compute-bound and linear in the number of
+# candidates (retrieval.prefetch_k): on an M4 (MPS, fp16) ~110 ms per ~425-token candidate, ~68 ms at ~250 and
+# ~35 ms at ~120 tokens, so 20 full-size candidates take ~2.0 s and 8 take ~0.9 s. prefetch_k is 8: on the smoke
+# corpus padded with long distractors the answer's fused rank stayed within the top 5 (EN, HI, Hinglish, identifier
+# and cross-lingual queries), and the reranker reorders whatever is in the list.
 RERANK_MAX_TOKENS = 512
 RERANK_BATCH_SIZE = 32
 UPSERT_BATCH = 256
