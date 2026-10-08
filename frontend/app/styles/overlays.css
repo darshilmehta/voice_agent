@@ -1,0 +1,212 @@
+/* Things that float above the page: dialogs, menus, toasts. */
+
+.dialog {
+  width: min(440px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  padding: 0;
+  border: 0;
+  border-radius: 14px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow-lg);
+  overflow: auto;
+}
+
+.dialog-md {
+  width: min(560px, calc(100vw - 32px));
+}
+
+.dialog::backdrop {
+  background: var(--scrim);
+  backdrop-filter: blur(2px);
+}
+
+.dialog[open] {
+  animation: dialog-in 0.16s ease-out;
+}
+
+.dialog[open]::backdrop {
+  animation: fade-in 0.16s ease-out;
+}
+
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.985);
+  }
+}
+
+.dialog-body {
+  padding: 18px 20px 20px;
+}
+
+.dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: -4px -8px 2px 0;
+}
+
+.dialog-head h2 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.dialog-desc {
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.dialog-desc p {
+  margin: 6px 0 0;
+}
+
+.dialog-desc strong {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+/* ------------------------------------------------------------------ menu */
+
+.menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 196px;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+  animation: menu-in 0.1s ease-out;
+}
+
+@keyframes menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: 32px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--text);
+  font-size: 13.5px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.menu-item .icon {
+  color: var(--text-muted);
+}
+
+.menu-item:focus {
+  outline: none;
+  background: var(--selected);
+}
+
+.menu-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.menu-item.danger,
+.menu-item.danger .icon {
+  color: var(--bad);
+}
+
+.menu-sep {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
+/* ------------------------------------------------------------------ toast */
+
+.toast-region {
+  position: fixed;
+  z-index: 70;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: calc(100vw - 32px);
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 7px 7px 14px;
+  border-radius: 11px;
+  background: var(--toast-bg);
+  color: var(--toast-text);
+  box-shadow: var(--shadow-lg);
+  font-size: 14px;
+  pointer-events: auto;
+  animation: toast-in 0.18s ease-out;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+.toast-msg {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.toast-error .icon:first-child {
+  color: #f0716a;
+}
+
+@media (prefers-color-scheme: dark) {
+  .toast-error .icon:first-child {
+    color: #c2362f;
+  }
+}
+
+.toast-action {
+  flex: none;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--toast-accent);
+  font-weight: 650;
+}
+
+.toast-action:hover {
+  background: rgb(127 127 127 / 18%);
+}
+
+.toast .icon-btn {
+  color: inherit;
+  opacity: 0.75;
+}
+
+.toast .icon-btn:hover {
+  background: rgb(127 127 127 / 18%);
+  opacity: 1;
+}

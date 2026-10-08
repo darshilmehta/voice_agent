@@ -1,8 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-
-import { BackendError, fetchHealth, type HealthReport, type HealthStatus } from "@/lib/api";
+import type { HealthStatus } from "@/lib/api";
+import { useHealth } from "@/lib/health";
 
 const STATUS_LABEL: Record<HealthStatus, string> = {
   ok: "OK",
@@ -34,36 +33,9 @@ const CAPABILITY_LABEL: Record<string, string> = {
 const pretty = (capability: string) =>
   CAPABILITY_LABEL[capability] ?? capability.replaceAll("_", " ").replace(/^./, (c) => c.toUpperCase());
 
-export function StatusPanel({ backendUrl }: { backendUrl: string }) {
-  const [report, setReport] = useState<HealthReport | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [checking, setChecking] = useState(false);
-  const [checkedAt, setCheckedAt] = useState<Date | null>(null);
-  const inflight = useRef<AbortController | null>(null);
-
-  const check = useCallback(async () => {
-    inflight.current?.abort();
-    const ctrl = new AbortController();
-    inflight.current = ctrl;
-    setChecking(true);
-    try {
-      setReport(await fetchHealth(backendUrl, ctrl.signal));
-      setError(null);
-    } catch (err) {
-      if (ctrl.signal.aborted) return;
-      setError(err instanceof BackendError ? err.message : String(err));
-    } finally {
-      if (!ctrl.signal.aborted) {
-        setChecking(false);
-        setCheckedAt(new Date());
-      }
-    }
-  }, [backendUrl]);
-
-  useEffect(() => {
-    void check();
-    return () => inflight.current?.abort();
-  }, [check]);
+/** Every provider's health from GET /health (shared with the sidebar's indicator, which links here). */
+export function StatusPanel() {
+  const { report, error, checking, checkedAt, check } = useHealth();
 
   const counts = report?.providers.reduce<Record<string, number>>((acc, p) => {
     acc[p.status] = (acc[p.status] ?? 0) + 1;
