@@ -128,7 +128,9 @@ export interface VoiceOptions {
   language: Language | null;
 }
 
-const MAX_RECONNECTS = 6;
+// 0.4 s doubling up to 8 s: ten attempts keep trying for about a minute, which covers a backend restart with its
+// models loading (a restart measured against the real backend took 13 s before the socket accepted again).
+const MAX_RECONNECTS = 10;
 const CONNECT_TIMEOUT_MS = 8000;
 const PROGRESS_MS = 250;
 /** If the server never decides about a barge-in, the agent comes back to full volume. */
@@ -179,6 +181,10 @@ export class VoiceSession {
   private stopPending = false;
   /** The socket dropped: the next `ready` is a new server session. */
   private reconnected = false;
+  /** The server answered `barge_in: resume`: the utterance behind it was ignored (until the next speech or message). */
+  private discardedUtterance = false;
+  /** The browser VAD hears the user speaking right now. */
+  private vadSpeaking = false;
 
   /** Counters for the debug hook (window.__voice in development). */
   readonly stats = { uplinkFrames: 0, downlinkFrames: 0, staleFrames: 0 };
@@ -378,6 +384,8 @@ export class VoiceSession {
     this.bargePending = false;
     this.reconnected = false;
     this.stopPending = false;
+    this.discardedUtterance = false;
+    this.vadSpeaking = false;
     this.maxTurnId = -1;
     this.cutTurns.clear();
 
@@ -523,6 +531,9 @@ export class VoiceSession {
       this.cutTurns.add(turnId);
       this._player?.stopTurn(turnId);
       next.cut = true;
+      // The server drops a `stop` that finds no answer in progress (the question was still being transcribed), so
+      // it would go on to write and speak this one for nobody: now that the turn is known, say stop again.
+      this.send({ type: "stop" });
     }
     this.set({ turn: next });
     return next;
@@ -551,10 +562,9 @@ export class VoiceSession {
 
   /** Messages the page fetched itself (the transcript tail after a reconnect), merged by id, in order. */
   mergeMessages(items: Message[]): void {
+    if (items.length === 0) return;
     const byId = new Map(this.snap.messages.map((m) => [m.id, m] as const));
-    const before = byId.size;
-    for (const m of items) if (!byId.has(m.id)) byId.set(m.id, m);
-    if (byId.size === before) return;
+    for (const m of items) byId.set(m.id, m); // what the server saved is the truth: it wins over a copy we had
     this.set({ messages: [...byId.values()].sort((a, b) => a.seq - b.seq) });
   }
 
@@ -603,6 +613,7 @@ export class VoiceSession {
       case "user_speech":
         if (msg.phase === "start") {
           this.stopPending = false; // a new utterance: an earlier Stop no longer applies
+          this.discardedUtterance = false;
           this.set({ userSpeaking: true, caption: "user", userText: "", userFinal: false });
           // The browser VAD normally got here first; this covers a VAD that isn't running.
           this.beginBargeIn();
@@ -611,6 +622,9 @@ export class VoiceSession {
         }
         break;
       case "transcript_partial":
+        // The server transcribes speculatively, so the text of an utterance it has already decided to ignore ("okay"
+        // → `barge_in: resume`) can still arrive after the decision, and after `user_speech: end`.
+        if (this.discardedUtterance) break;
         this.set({ userText: msg.text, userFinal: false, caption: "user" });
         break;
       case "user_message": {
@@ -619,6 +633,7 @@ export class VoiceSession {
         const cur = this.snap.turn;
         const early =
           !!cur && cur.unasked && cur.id !== null && !cur.message && cur.chunks.length === 0 && cur.deltaText === "";
+        this.discardedUtterance = false;
         this.set({
           notice: null, // a new turn: the last one's failure has been seen
           messages: this.withMessage(msg.message),
@@ -660,7 +675,10 @@ export class VoiceSession {
         const m = msg.message;
         this.stopPending = false;
         const turn = this.snap.turn ?? freshTurn(null);
-        if ((turn.userSeq !== null && m.seq < turn.userSeq) || turn.message !== null) {
+        // The server sends an answer again, with the same id, when a complete answer is cut during playback (it now
+        // has `heard_text`): that updates the turn's message and the transcript in place.
+        const resent = turn.message !== null && turn.message.id === m.id;
+        if (!resent && ((turn.userSeq !== null && m.seq < turn.userSeq) || turn.message !== null)) {
           // The saved answer of an earlier turn (an interrupted one arriving after the next question), or a second
           // answer for a turn that has one: it only joins the transcript.
           this.set({ messages: this.withMessage(m) });
@@ -672,7 +690,7 @@ export class VoiceSession {
           this._player?.stopTurn(turn.id);
         }
         this.set({ messages: this.withMessage(m), turn: { ...turn, message: m, cut }, caption: "agent" });
-        if (!cut && turn.id !== null) this._player?.completeTurn(turn.id);
+        if (!cut && !resent && turn.id !== null) this._player?.completeTurn(turn.id);
         break;
       }
       case "barge_in":
@@ -681,6 +699,7 @@ export class VoiceSession {
         } else {
           // A backchannel or noise: the agent carries on, and the user's words (never saved) leave the captions.
           this.resumeVolume();
+          this.discardedUtterance = true;
           if (!this.snap.userFinal) this.dropUserCaption();
         }
         break;
@@ -692,14 +711,22 @@ export class VoiceSession {
     }
   }
 
+  /** The saved messages with `m` added, or, when one with its id is already there, replaced in place (never twice). */
   private withMessage(m: Message): Message[] {
-    return this.snap.messages.some((x) => x.id === m.id) ? this.snap.messages : [...this.snap.messages, m];
+    const at = this.snap.messages.findIndex((x) => x.id === m.id);
+    if (at === -1) return [...this.snap.messages, m];
+    const next = this.snap.messages.slice();
+    next[at] = m;
+    return next;
   }
 
   // ------------------------------------------------------------------ playback, barge-in
 
   private onAudible(audible: boolean): void {
     this.set({ audible });
+    // The answer starts playing while the user is still talking (they spoke up while it was being written): that is
+    // an interruption like any other, so duck at once and let the server decide, instead of talking over them.
+    if (audible && (this.vadSpeaking || this.snap.userSpeaking)) this.beginBargeIn();
   }
 
   /** All of a turn's audio has played: tell the server. */
@@ -752,6 +779,7 @@ export class VoiceSession {
   /** Server: the interruption is real. Stop that turn and discard what's queued. */
   private applyStop(turnId: number): void {
     this.clearBarge();
+    this.discardedUtterance = false; // this utterance is a real one
     this.cutTurns.add(turnId); // whatever else arrives for it is ignored, even if it comes before the turn is known
     this._player?.stopTurn(turnId);
     const cur = this.snap.turn;
@@ -801,13 +829,19 @@ export class VoiceSession {
     this.set({ vad: "loading" });
     try {
       const vad = await startBargeInVad(ctx, mic.stream, {
-        onSpeechStart: () => this.beginBargeIn(),
+        onSpeechStart: () => {
+          this.vadSpeaking = true;
+          this.beginBargeIn();
+        },
         onSpeechRealStart: () => undefined, // the server decides once it has heard enough
         onMisfire: () => {
           // Too short to be speech (a cough, a click): the agent carries on at full volume.
+          this.vadSpeaking = false;
           if (this.bargePending) this.resumeVolume();
         },
-        onSpeechEnd: () => undefined,
+        onSpeechEnd: () => {
+          this.vadSpeaking = false;
+        },
       });
       if (run !== this.run) {
         await vad.destroy();

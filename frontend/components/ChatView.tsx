@@ -154,8 +154,10 @@ function ChatPage({ chat }: { chat: Chat }) {
     if (resyncs === 0) return;
     const ctrl = new AbortController();
     const seen = Math.max(knownCount.current, ...session.getSnapshot().messages.map((m) => m.seq));
+    // A little before the newest message we have: the server may have updated the last answers after we saw them
+    // (an answer cut when it shut down gets its `heard_text` after the fact).
     api
-      .listMessages(chatId, { after: seen, limit: 50 }, ctrl.signal)
+      .listMessages(chatId, { after: Math.max(0, seen - 3), limit: 50 }, ctrl.signal)
       .then((page) => {
         session.mergeMessages(page.items);
         onSettled();

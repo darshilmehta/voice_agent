@@ -549,25 +549,29 @@ const MessageItem = memo(function MessageItem({
   const played = heard?.trimEnd() ?? "";
   const heardPrefix = cutOff && m.text.startsWith(played) ? played : null;
   const render = (text: string) => (isUser ? text : <AnswerText text={text} sources={map} />);
+  // Stopped before anything was written: the saved answer is empty, so there is no bubble to show, only the note.
+  const blank = !isUser && m.text.trim() === "";
 
   return (
     <li className={`msg msg-${m.role}`}>
       <MessageMeta m={m} isUser={isUser} />
 
-      <div className={abstained ? "bubble bubble-abstained" : "bubble"} lang={m.language ?? undefined}>
-        {abstained && <AbstainLabel />}
-        {heardPrefix !== null ? (
-          <>
-            {render(heardPrefix)}
-            <span className="unheard">
-              <span className="visually-hidden"> [not played:] </span>
-              {render(m.text.slice(heardPrefix.length))}
-            </span>
-          </>
-        ) : (
-          render(m.text)
-        )}
-      </div>
+      {!blank && (
+        <div className={abstained ? "bubble bubble-abstained" : "bubble"} lang={m.language ?? undefined}>
+          {abstained && <AbstainLabel />}
+          {heardPrefix !== null ? (
+            <>
+              {render(heardPrefix)}
+              <span className="unheard">
+                <span className="visually-hidden"> [not played:] </span>
+                {render(m.text.slice(heardPrefix.length))}
+              </span>
+            </>
+          ) : (
+            render(m.text)
+          )}
+        </div>
+      )}
 
       {cutOff && (
         <p className="msg-note">
@@ -584,10 +588,11 @@ const MessageItem = memo(function MessageItem({
 
       {!isUser && <SourceList sources={listed} />}
 
-      {!isUser && stoppedFlag(m) && (
+      {/* A cut voice answer already says "Interrupted after: …" (and is usually complete, so "wasn't written" would be wrong). */}
+      {!isUser && stoppedFlag(m) && !cutOff && (
         <p className="msg-note msg-note-quiet">
           <Icon name="stop" size={12} />
-          Stopped. The rest of this answer wasn&apos;t written.
+          {blank ? "Stopped before the answer started." : "Stopped. The rest of this answer wasn't written."}
         </p>
       )}
 
