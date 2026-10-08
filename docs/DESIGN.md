@@ -106,7 +106,7 @@ Chunks keep provenance: `document_id`, `version`, `chunk_id`, `page_start/end`, 
 
 ```text
 query (rewritten if it's a follow-up) → BGE-M3 dense + sparse
-→ Qdrant prefetch (top 20 each, filtered to active documents) → RRF fusion
+→ Qdrant prefetch (top `retrieval.prefetch_k` = 8 each, filtered to the project and the chat's documents) → RRF fusion
 → bge-reranker-v2-m3 → top 5 → context builder (dedupe, group by section, budget, [S#] ids)
 → confidence gate → answer or abstain
 ```
@@ -376,6 +376,59 @@ WS                /ws/chats/{id}                      live voice or text session
 ```
 
 **Phases.** Phase 1 brings projects, documents, chats, messages, the sidebar (with pinning) and the transcript view for text chat. Phase 3 (router, state and memory) adds automatic titles, the memory summary, user-facing summaries and transcript export. Voice phases (4–6) record voice messages into the same chats.
+
+### 3.10 Voice session protocol (WebSocket)
+
+One WebSocket per live voice session on a chat. The backend and the voice-first chat page (§1, §3.8) build against exactly this.
+
+**Endpoint:** `WS /ws/chats/{chat_id}/voice`. Unknown chat → close code `4404`; a project with no READY document still connects (turns abstain, as in text chat). One active voice session per chat: a second connection closes the first with code `4409`.
+
+**Audio frames (binary WebSocket messages).**
+
+| Direction | Format |
+|---|---|
+| Client → server | Raw **PCM16 little-endian, mono, 16 kHz**, 20–64 ms per frame (512 samples = 1,024 bytes is typical). Captured with `getUserMedia({echoCancellation, noiseSuppression, autoGainControl})` and downsampled in an AudioWorklet. Sent continuously while the mic is on. |
+| Server → client | **12-byte header + PCM16 LE mono 24 kHz** (Kokoro's rate). Header: `uint32 turn_id`, `uint32 chunk_index`, `uint32 seq` (all little-endian; `seq` counts frames within the chunk). The client plays only frames whose `turn_id` is the current agent turn and drops the rest (stale audio after an interruption). |
+
+**Control messages (JSON text frames, one object each, field `type`).**
+
+Client → server:
+
+| `type` | Fields | Meaning |
+|---|---|---|
+| `start` | `language: "en" \| "hi" \| null` | Begin the session after mic permission. `null` = detect per utterance. |
+| `barge_in_start` | `turn_id`, `played_ms` | The browser's VAD heard speech while the agent was speaking; the client has already ducked playback locally. `played_ms` = agent audio of that turn actually played so far. |
+| `playback` | `turn_id`, `played_ms` | Optional progress report (~every 250 ms while playing), so the server knows what was heard even if the socket drops. |
+| `playback_done` | `turn_id` | The last audio chunk of that turn finished playing. |
+| `stop` | — | User pressed stop: cancel the current answer (same handling as a confirmed barge-in, without a new user turn). |
+| `end` | — | Close the session cleanly. |
+
+Server → client:
+
+| `type` | Fields | Meaning |
+|---|---|---|
+| `ready` | `session_id`, `input_sample_rate: 16000`, `output_sample_rate: 24000`, `language` | Session accepted; start sending audio. |
+| `state` | `state: "listening" \| "thinking" \| "speaking" \| "interrupted"` | Drives the presence field and the state label. |
+| `user_speech` | `phase: "start" \| "end"` | Server VAD saw speech start / end of turn (end after `vad.end_of_turn_ms` silence). |
+| `transcript_partial` | `text` | Optional live partial transcript of the current user utterance. |
+| `user_message` | `message: Message` | Final transcript saved (`modality: "voice"`, detected `language`). Begins a turn; `turn_id` = the agent turn that will answer it. |
+| `turn` | `turn_id` | The agent turn id for the answer that follows (sent with or right after `user_message`). |
+| `sources` | same payload as the SSE `sources` event | Retrieval result for this turn. |
+| `delta` | `turn_id`, `text` | Answer text as generated (captions may show it ahead of audio). |
+| `audio_chunk` | `turn_id`, `chunk_index`, `text`, `duration_ms` | Announces one synthesized clause/sentence: its exact text and audio length. Its binary frames follow. Used for word-synced captions and to compute what was heard. |
+| `agent_message` | `message: Message` | Final saved agent message (full text, typed citations, `route`, `latency`; `heard_text` set only if interrupted). |
+| `barge_in` | `turn_id`, `decision: "stop" \| "resume"` | Server's decision after `barge_in_start`: **stop** = cancel generation + TTS, client stops playback and flushes queued audio for that turn; **resume** = it was a backchannel/noise, client restores volume. |
+| `error` | `detail`, `stage: "stt" \| "retrieval" \| "llm" \| "tts" \| "storage" \| "audio"` | The turn failed at that stage; the session stays open and keeps listening. |
+
+**Turn-taking rules.**
+
+1. **End of turn**: the server's VAD (Silero, `vad.*` config) on the incoming audio is the source of truth. After `end_of_turn_ms` of silence the utterance is transcribed (STT; language restricted to the configured languages), saved as a user message, and answered with `ChatTurnService` using `modality="voice"`, `length="short"`. Utterances shorter than `vad.min_speech_ms` are ignored.
+2. **Speaking**: answer deltas are cut into speakable chunks (first chunk at the first clause boundary or ≤ 8 words; then sentences), each synthesized by Kokoro and streamed as `audio_chunk` + binary frames while generation continues.
+3. **Barge-in** (§3.3 duck-then-decide): on `barge_in_start` the server keeps listening; if the new speech lasts ≥ `vad.min_speech_ms` and its transcript is more than `voice.barge_in.backchannel_max_words` words (or isn't a backchannel like "mm-hmm", "okay", "haan"), it sends `barge_in: stop`, cancels the answer, and saves the agent message with **`heard_text`** = the text of fully played chunks plus the proportional share of the chunk being played at `played_ms`; then processes the new utterance as the next user turn. Otherwise `barge_in: resume`. A decision is always sent within `voice.barge_in.decision_timeout_ms`.
+4. **Stop**: `stop` cancels like a confirmed barge-in; `route.stopped = true` as in text chat.
+5. Everything said is persisted as messages in the chat (§3.9): the transcript view and the text endpoint see the same history.
+
+**Startup.** The backend preloads the embedder, reranker, STT and TTS models at startup (in the background, reported by `/health`), so the first spoken question isn't slowed by model loading (§9 measured ~3.7 s for a cold reranker).
 
 ---
 
@@ -776,7 +829,8 @@ Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first
 |---|---|---|
 | −1 Downloads + smoke tests | ✅ done | §9; initial commit |
 | 0 Skeleton | ✅ done | PRs #1–#3 (hygiene, backend skeleton, frontend shell), #5 (CI), #8 (Docker images + `full` profile, `docker.config.json`, `strict_offline_local_hosts`) |
-| 1 Projects + text document chat | in progress | #10 persistence (SQLite + Alembic, projects/chats/messages/pins API), #11 ingestion + hybrid retrieval library (FY24 margin table ranked first in EN and HI on the real models), #12 sidebar, project and chat pages, transcript view; next: upload + streaming cited chat (backend and frontend in parallel) |
+| 1 Projects + text document chat | ✅ done | #10 persistence (SQLite + Alembic, projects/chats/messages/pins API), #11 ingestion + hybrid retrieval, #12 sidebar, project and chat pages, transcript view, #16 upload + background ingestion + streamed cited chat (transport-agnostic `ChatTurnService`), #14 upload UI + streaming composer + citation popovers. Verified end to end on the real models: FY24 EBITDA 18.2% cited p.2 in EN and HI, out-of-document question abstains, transcript survives reload |
+| 4–6 Voice loop | next | protocol §3.10; voice backend and voice-first chat page in parallel |
 
 Design-only PRs so far: #4 and #6 (voice presence UI, §3.8), #7 (projects, chats, transcripts, §3.9).
 
