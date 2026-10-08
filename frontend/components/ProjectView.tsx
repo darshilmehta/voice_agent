@@ -1,16 +1,20 @@
 "use client";
 
-/** /projects/[projectId]: header with rename/pin/archive/delete, the project's chats, its documents (read-only). */
+/**
+ * /projects/[projectId]: header with rename/pin/archive/delete, the project's chats, and its documents (upload,
+ * ingestion status, delete; components/Documents.tsx).
+ */
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 
-import type { Chat, Project, ProjectDocument } from "@/lib/api";
-import { useBackend, useDocumentTitle } from "@/lib/backend-context";
-import { formatBytes, fullDateTime, plural, relativeTime, shortDate } from "@/lib/format";
+import type { Chat, Project } from "@/lib/api";
+import { useDocumentTitle } from "@/lib/backend-context";
+import { fullDateTime, plural, relativeTime, shortDate } from "@/lib/format";
 import { chatActivity, chatsOf, keys, slotOf, useWorkspace, useWorkspaceActions } from "@/lib/workspace";
 
 import { useEntityActions } from "./Actions";
+import { DocumentsCard } from "./Documents";
 import { Icon } from "./Icon";
 import { Menu } from "./Menu";
 import { BackendDown, EmptyState, LoadFailed } from "./States";
@@ -182,101 +186,6 @@ function ChatRows({ chats }: { chats: Chat[] }) {
         </li>
       ))}
     </ul>
-  );
-}
-
-const STATUS_LABEL: Record<string, { label: string; tone: string }> = {
-  READY: { label: "Ready", tone: "ok" },
-  PROCESSING: { label: "Processing", tone: "degraded" },
-  PENDING: { label: "Queued", tone: "idle" },
-  FAILED: { label: "Failed", tone: "down" },
-};
-
-function DocumentsCard({ project }: { project: Project }) {
-  const state = useWorkspace();
-  const ws = useWorkspaceActions();
-  const { config } = useBackend();
-  const slot = slotOf(state, keys.docs(project.id));
-  const docs = state.documents[project.id] ?? null;
-  const [showWhy, setShowWhy] = useState(false);
-  const formats = config ? config.limits.allowed_extensions.join(" ") : ".pdf .docx .pptx .txt .md";
-  const limit = config ? ` up to ${config.limits.max_upload_mb} MB each` : "";
-
-  return (
-    <section className="card" aria-labelledby="docs-title">
-      <div className="card-head">
-        <h2 id="docs-title">Documents</h2>
-        <button
-          type="button"
-          className="btn btn-sm"
-          aria-disabled="true"
-          aria-describedby="upload-note"
-          onClick={() => setShowWhy(true)}
-        >
-          <Icon name="upload" />
-          Upload
-        </button>
-      </div>
-
-      {docs === null ? (
-        slot.status === "error" ? (
-          slot.unreachable ? (
-            <BackendDown onRetry={() => void ws.loadDocuments(project.id, true)} />
-          ) : (
-            <p className="form-error">{slot.error}</p>
-          )
-        ) : (
-          <div className="rows" aria-hidden>
-            <div className="row-skeleton" />
-          </div>
-        )
-      ) : docs.length === 0 ? (
-        <EmptyState icon="doc" title="No documents yet" compact>
-          <p id="upload-note" className={showWhy ? "pulse-once" : undefined}>
-            Uploading and indexing arrive with document ingestion, which is coming next. You'll be able to add{" "}
-            {formats} files{limit}.
-          </p>
-        </EmptyState>
-      ) : (
-        <>
-          <ul className="rows">
-            {docs.map((d) => (
-              <DocumentRow key={d.id} doc={d} />
-            ))}
-          </ul>
-          <p id="upload-note" className={showWhy ? "note pulse-once" : "note"}>
-            Uploading more documents arrives with document ingestion, coming next.
-          </p>
-        </>
-      )}
-    </section>
-  );
-}
-
-function DocumentRow({ doc }: { doc: ProjectDocument }) {
-  const status = STATUS_LABEL[doc.status] ?? { label: doc.status, tone: "idle" };
-  const facts = [
-    doc.page_count !== null ? plural(doc.page_count, "page") : null,
-    doc.chunk_count !== null ? plural(doc.chunk_count, "chunk") : null,
-    formatBytes(doc.size_bytes),
-    `added ${shortDate(doc.created_at)}`,
-  ].filter(Boolean);
-  return (
-    <li className="row row-static">
-      <Icon name="doc" className="row-icon" />
-      <span className="row-main">
-        <span className="row-title">{doc.filename}</span>
-        <span className="row-meta">
-          <span className="status-pill">
-            <span className={`dot ${status.tone}`} aria-hidden />
-            {status.label}
-          </span>
-          {" · "}
-          {facts.join(" · ")}
-        </span>
-        {doc.error && <span className="row-error">{doc.error}</span>}
-      </span>
-    </li>
   );
 }
 

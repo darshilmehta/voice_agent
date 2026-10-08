@@ -10,6 +10,9 @@
  *
  * Lists are fetched with include_archived=true and filtered in the UI, so the sidebar, the project page and the
  * "show archived" toggle all read the same data.
+ *
+ * Documents: while any loaded project has a document that is still PENDING or PROCESSING, that project's list is
+ * fetched again every 2 s (only while the tab is visible), and polling stops once everything is READY or FAILED.
  */
 
 import {
@@ -94,6 +97,8 @@ type Action =
   | { type: "pins"; data: PinnedItems }
   | { type: "chatList"; projectId: string; items: Chat[] }
   | { type: "documents"; projectId: string; items: ProjectDocument[] }
+  | { type: "document"; document: ProjectDocument }
+  | { type: "removeDocument"; projectId: string; id: string }
   | { type: "project"; project: Project }
   | { type: "chat"; chat: Chat }
   | { type: "removeProject"; id: string }
@@ -107,6 +112,23 @@ function byId<T extends { id: string }>(items: T[]): Record<string, T> {
 
 function without<T>(record: Record<string, T>, drop: (key: string, value: T) => boolean): Record<string, T> {
   return Object.fromEntries(Object.entries(record).filter(([k, v]) => !drop(k, v)));
+}
+
+function sameDocuments(a: ProjectDocument[], b: ProjectDocument[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every((d, i) => {
+      const e = b[i];
+      return (
+        d.id === e.id &&
+        d.status === e.status &&
+        d.updated_at === e.updated_at &&
+        d.page_count === e.page_count &&
+        d.chunk_count === e.chunk_count &&
+        d.error === e.error
+      );
+    })
+  );
 }
 
 function reducer(state: WorkspaceState, action: Action): WorkspaceState {
@@ -150,12 +172,32 @@ function reducer(state: WorkspaceState, action: Action): WorkspaceState {
         slots: { ...state.slots, [keys.chats(projectId)]: ready },
       };
     }
-    case "documents":
+    case "documents": {
+      // Polling refetches often; keep the old array when nothing changed so memoized views don't re-render.
+      const prev = state.documents[action.projectId];
+      const items = prev && sameDocuments(prev, action.items) ? prev : action.items;
       return {
         ...state,
-        documents: { ...state.documents, [action.projectId]: action.items },
+        documents: { ...state.documents, [action.projectId]: items },
         slots: { ...state.slots, [keys.docs(action.projectId)]: ready },
       };
+    }
+    case "document": {
+      const { document: doc } = action;
+      const list = state.documents[doc.project_id];
+      if (!list) return state; // not loaded yet: the caller fetches the whole list
+      const at = list.findIndex((d) => d.id === doc.id);
+      const next = at === -1 ? [doc, ...list] : list.map((d) => (d.id === doc.id ? doc : d));
+      return { ...state, documents: { ...state.documents, [doc.project_id]: next } };
+    }
+    case "removeDocument": {
+      const list = state.documents[action.projectId];
+      if (!list) return state;
+      return {
+        ...state,
+        documents: { ...state.documents, [action.projectId]: list.filter((d) => d.id !== action.id) },
+      };
+    }
     case "project": {
       const { project } = action;
       const ids = state.projectIds;
@@ -237,6 +279,9 @@ export function projectName(state: WorkspaceState, projectId: string): string | 
   return state.projects[projectId]?.name ?? state.projectNames[projectId] ?? null;
 }
 
+/** Ingestion hasn't finished: PENDING (queued) or PROCESSING. */
+export const isIngesting = (d: ProjectDocument) => d.status === "PENDING" || d.status === "PROCESSING";
+
 export function chatsOf(state: WorkspaceState, projectId: string): Chat[] | null {
   const ids = state.chatIds[projectId];
   return ids ? ids.map((id) => state.chats[id]).filter((c): c is Chat => !!c) : null;
@@ -258,7 +303,12 @@ export interface WorkspaceActions {
   createChat: (projectId: string) => Promise<Chat>;
   updateChat: (chatId: string, patch: ChatPatch) => Promise<Chat>;
   deleteChat: (chatId: string) => Promise<void>;
+  /** A document the backend just returned (an upload): show it at once, then fetch the list again. */
+  documentAdded: (document: ProjectDocument) => void;
+  deleteDocument: (document: ProjectDocument) => Promise<void>;
 }
+
+const POLL_DOCUMENTS_MS = 2000;
 
 const StateContext = createContext<WorkspaceState | null>(null);
 const ActionsContext = createContext<WorkspaceActions | null>(null);
@@ -374,8 +424,49 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         void loadProjects(true);
         void loadPins(true);
       },
+      documentAdded(document) {
+        const projectId = document.project_id;
+        dispatch({ type: "document", document });
+        // Forced, so a poll that started before the upload finished can't put back a list without it.
+        void loadDocuments(projectId, true);
+        void loadProject(projectId, true); // document count
+        void loadProjects(true);
+      },
+      async deleteDocument(document) {
+        const projectId = document.project_id;
+        await api.deleteDocument(document.id);
+        dispatch({ type: "removeDocument", projectId, id: document.id });
+        void loadDocuments(projectId, true);
+        void loadProject(projectId, true);
+        void loadProjects(true);
+        // The backend dropped it from every chat's document scope.
+        if (stateRef.current.chatIds[projectId]) void loadChats(projectId, true);
+        for (const chat of Object.values(stateRef.current.chats)) {
+          if (chat.project_id === projectId && chat.document_scope?.includes(document.id)) void loadChat(chat.id, true);
+        }
+      },
     };
   }, [api, run]);
+
+  // Poll the document lists that still have ingestion in progress.
+  const ingesting = Object.entries(state.documents)
+    .filter(([, docs]) => docs.some(isIngesting))
+    .map(([projectId]) => projectId)
+    .sort()
+    .join(",");
+  useEffect(() => {
+    if (!ingesting) return;
+    const projectIds = ingesting.split(",");
+    const poll = () => {
+      if (document.visibilityState === "visible") for (const id of projectIds) void actions.loadDocuments(id);
+    };
+    const timer = window.setInterval(poll, POLL_DOCUMENTS_MS);
+    document.addEventListener("visibilitychange", poll);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", poll);
+    };
+  }, [ingesting, actions]);
 
   // The sidebar needs every project and everything pinned from the start.
   useEffect(() => {

@@ -68,6 +68,15 @@ const PATHS = {
   sparkle: <path d="M12 3.5c.6 4.3 2.7 6.9 7.5 8.5-4.8 1.6-6.9 4.2-7.5 8.5-.6-4.3-2.7-6.9-7.5-8.5 4.8-1.6 6.9-4.2 7.5-8.5z" />,
   refresh: <path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v4h-4" />,
   arrowUp: <path d="M12 19V5M6 11l6-6 6 6" />,
+  arrowDown: <path d="M12 5v14M6 13l6 6 6-6" />,
+  stop: <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" stroke="none" />,
+  check: <path d="m5 12.5 4.5 4.5L19 7.5" />,
+  info: (
+    <>
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M12 11v5.5M12 7.8v.1" />
+    </>
+  ),
 } as const;
 
 export type IconName = keyof typeof PATHS;
