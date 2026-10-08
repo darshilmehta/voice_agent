@@ -381,7 +381,7 @@ poc_gibberlink/
 │   │   ├── main.py  settings.py  container.py
 │   │   ├── api/             health models documents chat voice ws
 │   │   ├── domain/          Document, Chunk, TurnRoute, SessionState, Event (Pydantic)
-│   │   ├── providers/       one folder per capability: base.py + implementations + cloud stubs
+│   │   ├── providers/       base.py, registry.py + one module per capability group (becomes a package as it grows)
 │   │   ├── services/
 │   │   │   ├── ingestion/   pipeline normalizer chunker ingestion_qa
 │   │   │   ├── retrieval/   hybrid context_builder confidence

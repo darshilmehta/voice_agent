@@ -22,6 +22,8 @@ APP_CONFIG_FILE              (default: config/local.config.json)
 ```
 
 - **Secrets never go in the file.** Use `"${VAR}"` placeholders and set the variables in the deployment environment (or a `.env` that is never committed).
+- **Top-level switches are file-only.** `profile`, `strict_offline` and `strict_offline_exceptions` can't be changed by environment variables, so the offline guard can only be turned off by editing the file.
+- **`ingestion.ocr_engine` must name an engine** (`rapidocr`, …). Docling's `auto` mode silently skips OCR when it finds none, so it is rejected.
 - **`strict_offline: true`** (local) makes startup fail if any provider is remote or any URL is not loopback, and forces Hugging Face offline mode. The only escape hatch is `strict_offline_exceptions` (e.g. `["web_search"]`), which allows exactly that capability to reach the network.
 
 ## Deploying to a server

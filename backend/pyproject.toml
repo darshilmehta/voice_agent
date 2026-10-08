@@ -1,0 +1,39 @@
+[project]
+name = "voice-agent-backend"
+version = "0.1.0"
+description = "Local document voice agent: backend"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi>=0.140",
+  "uvicorn[standard]>=0.50",
+  "pydantic>=2.10",
+  "httpx>=0.28",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=9.0",
+  "ruff>=0.16",
+]
+
+[tool.uv]
+# docling depends on opencv-python-headless and rapidocr on opencv-python; both install into the
+# same cv2/ directory and removing either deletes it (docs/DESIGN.md §9.6). Keep only the headless build.
+override-dependencies = ["opencv-python; sys_platform == 'never'"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+filterwarnings = [
+  # FastAPI's TestClient still uses httpx; harmless for tests
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
