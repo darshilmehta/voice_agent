@@ -107,7 +107,7 @@
     "prefetch_k": 8,
     "fusion": "rrf",
     "rerank_top_n": 5,
-    "min_rerank_score": 0.3,
+    "min_rerank_score": 0.05,
     "context_token_budget": 3000
   },
 
