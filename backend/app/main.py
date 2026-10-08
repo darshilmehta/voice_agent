@@ -14,7 +14,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
-from .api import health, public_config
+from .api import chats, health, pins, projects, public_config
+from .api.deps import install_error_handlers
 from .logging_setup import configure_logging
 from .offline import apply_runtime_env
 from .providers.registry import Container, build_container
@@ -51,9 +52,10 @@ def create_app(settings: Settings | None = None, container: Container | None = N
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.server.cors_allowed_origins,
-        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["Content-Type", "Authorization"],
     )
-    app.include_router(health.router)
-    app.include_router(public_config.router)
+    install_error_handlers(app)
+    for module in (health, public_config, projects, chats, pins):
+        app.include_router(module.router)
     return app

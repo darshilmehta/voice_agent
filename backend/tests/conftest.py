@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 
+from app.db import models as orm
+from app.main import create_app
 from app.providers import models
+from app.providers.base import ProviderContext
+from app.providers.registry import build_container
+from app.providers.storage import MetadataDB, SqliteDB
 from app.settings import PROJECT_ROOT, Settings, load_settings
 
 LOCAL_CONFIG = PROJECT_ROOT / "config/local.config.json"
@@ -109,3 +119,73 @@ def mock_http(*, ollama_models: list[str] | None = None, qdrant: bool = True) ->
         return httpx.Response(404)
 
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+class Clock:
+    """A deterministic clock for services: every call is one second after the previous one."""
+
+    def __init__(self, start: datetime = datetime(2026, 10, 8, 9, 0, tzinfo=UTC)) -> None:
+        self.current = start
+
+    def __call__(self) -> datetime:
+        self.current += timedelta(seconds=1)
+        return self.current
+
+
+@pytest.fixture
+def clock() -> Clock:
+    return Clock()
+
+
+@pytest.fixture
+async def db(load_local) -> AsyncIterator[SqliteDB]:
+    """The real sqlite provider on a fresh database under tmp_path, migrated to head."""
+    settings = load_local()
+    async with mock_http() as http:
+        provider = SqliteDB(settings.metadata_db, ProviderContext(settings=settings, http=http))
+        await provider.start()
+        try:
+            yield provider
+        finally:
+            await provider.close()
+
+
+async def add_document(db: MetadataDB, project_id: str, filename: str = "annual_report.pdf", **fields: Any) -> str:
+    """Insert a document with one version and one ingestion job, as the ingestion pipeline will. Returns its id."""
+    async with db.session() as s:
+        doc = orm.Document(
+            project_id=project_id,
+            filename=filename,
+            mime="application/pdf",
+            size_bytes=1024,
+            sha256=hashlib.sha256(filename.encode()).hexdigest(),
+            **fields,
+        )
+        s.add(doc)
+        await s.flush()  # no ORM relationships: parents are flushed before children explicitly
+        s.add(
+            orm.DocumentVersion(
+                document_id=doc.id,
+                version=1,
+                filename=filename,
+                mime=doc.mime,
+                size_bytes=doc.size_bytes,
+                sha256=doc.sha256,
+                storage_key=f"{project_id}/{doc.id}/v1/{filename}",
+            )
+        )
+        s.add(orm.IngestionJob(document_id=doc.id, version=1))
+        return doc.id
+
+
+async def count_rows(db: MetadataDB, model: type[orm.Base]) -> int:
+    async with db.session() as s:
+        return await s.scalar(select(func.count()).select_from(model)) or 0
+
+
+@pytest.fixture
+def api(load_local) -> Iterator[TestClient]:
+    """The app on a fresh database under tmp_path (HTTP to Ollama/Qdrant mocked)."""
+    settings = load_local()
+    with TestClient(create_app(settings, build_container(settings, http=mock_http()))) as client:
+        yield client

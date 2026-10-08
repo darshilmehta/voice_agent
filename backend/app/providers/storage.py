@@ -2,45 +2,88 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
-import sqlite3
+from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 
-from .base import HealthStatus, PlaceholderProvider, Provider, ProviderHealth
+from pydantic import BaseModel
+from sqlalchemy.engine import URL
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+
+from ..db import migrate
+from ..db.engine import create_engine, database_url, is_sqlite
+from .base import HealthStatus, PlaceholderProvider, Provider, ProviderContext, ProviderHealth
 from .registry import register
 
 
 class MetadataDB(Provider):
+    """Projects, documents, chats and messages (docs/DESIGN.md §3.9). Business logic (``app/services``) depends on
+    this interface only: it opens a unit of work with ``session()`` and uses the models in ``app.db.models``."""
+
     capability = "metadata_db"
+
+    def session(self) -> AbstractAsyncContextManager[AsyncSession]:
+        """A unit of work: ``async with db.session() as s: …`` commits when the block succeeds and rolls back
+        if it raises."""
+        raise NotImplementedError(f"metadata_db provider {self.name!r} does not implement session()")
 
 
 @register
 class SqliteDB(MetadataDB):
+    """SQLite through SQLAlchemy (aiosqlite). ``start()`` creates the directory and migrates the schema to head."""
+
     name = "sqlite"
+
+    def __init__(self, config: BaseModel, ctx: ProviderContext) -> None:
+        super().__init__(config, ctx)
+        self._engine: AsyncEngine | None = None
+        self._sessions: async_sessionmaker[AsyncSession] | None = None
+
+    @property
+    def url(self) -> URL:
+        url = database_url(self.ctx.settings)
+        if not is_sqlite(url):
+            raise ValueError(f"metadata_db provider 'sqlite' needs a sqlite+aiosqlite:/// url, got {url.drivername}")
+        return url
 
     @property
     def db_path(self) -> Path:
-        url: str = self.config.url  # type: ignore[attr-defined]
-        if ":///" not in url:
-            raise ValueError(f"sqlite url must look like sqlite+aiosqlite:///path/to/app.db, got {url!r}")
-        return self.ctx.settings.path(url.split(":///", 1)[1])
+        return Path(self.url.database or "")
 
     async def start(self) -> None:
+        url = self.url
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        await migrate.upgrade(url)
+        self._engine = create_engine(url)
+        self._sessions = async_sessionmaker(self._engine, expire_on_commit=False)
+
+    async def close(self) -> None:
+        if self._engine is not None:
+            await self._engine.dispose()
+        self._engine = self._sessions = None
+
+    @asynccontextmanager
+    async def _session(self) -> AsyncIterator[AsyncSession]:
+        if self._sessions is None:
+            raise RuntimeError("metadata_db is not started")
+        async with self._sessions() as session, session.begin():
+            yield session
+
+    def session(self) -> AbstractAsyncContextManager[AsyncSession]:
+        return self._session()
 
     async def health(self) -> ProviderHealth:
-        path = self.db_path
-
-        def ping() -> None:
-            with sqlite3.connect(path, timeout=2) as conn:
-                conn.execute("SELECT 1")
-
+        where = _rel(self.db_path, self.ctx.settings.root_dir)
+        if self._engine is None:
+            return self._health(HealthStatus.DOWN, f"{where}: not started")
         try:
-            await asyncio.to_thread(ping)
-        except sqlite3.Error as e:
-            return self._health(HealthStatus.DOWN, f"{path}: {e}")
-        return self._health(HealthStatus.OK, f"{_rel(path, self.ctx.settings.root_dir)}")
+            async with self._engine.connect() as conn:
+                revision = await migrate.current_revision(conn)
+        except SQLAlchemyError as e:
+            return self._health(HealthStatus.DOWN, f"{where}: {e}")
+        return self._health(HealthStatus.OK, f"{where}, schema {revision}")
 
 
 @register
