@@ -80,7 +80,7 @@ Consequences:
    │       │   sentence splitter ─► TTS (Kokoro) ─► audio ──┘
    │       ▼                                                │
    │  SessionState (topic, language, active docs, mode)     │
-   │  SQLite: documents, jobs, sessions, turns              │
+   │  SQLite: projects, documents, jobs, chats, messages    │
    └────────────────────────────────────────────────────────┘
         Ollama (host, :11434)      Qdrant (Docker, :6333)
 ```
@@ -156,19 +156,20 @@ Router input: the new utterance, the last few turns, the session state, and — 
 
 ```json
 {
-  "session_id": "…",
+  "project_id": "…",
+  "chat_id": "…",
   "active_document_ids": ["doc_01"],
   "active_topic": "financial_performance",
   "previous_topic": "small_talk",
   "input_language": "hi",
   "response_language": "hi",
   "agent_state": "SPEAKING",
-  "last_interrupted_turn_id": "t41",
+  "last_interrupted_message_id": "m41",
   "retrieval_enabled": true
 }
 ```
 
-Agent states: `IDLE → LISTENING → THINKING → SPEAKING → (INTERRUPTED → LISTENING)`. Prompt context = recent turns + compact session summary + retrieved evidence + current utterance; never the full transcript.
+Agent states: `IDLE → LISTENING → THINKING → SPEAKING → (INTERRUPTED → LISTENING)`. Prompt context = recent messages + the chat's compact memory summary + retrieved evidence + current utterance; never the full transcript. Live state lives in the session store for the duration of a voice session; everything said is persisted as messages (§3.9).
 
 ### 3.6 Failure handling
 
@@ -265,6 +266,109 @@ Sources: the user's mic `MediaStream` (after browser echo cancellation, so the a
 
 **Build plan.** Phase 5 ships the field with agent-driven motion and captions; phase 6 adds the user's warm inward waves, barge-in visuals and docking; phase 9 polishes (palettes per theme, onset tuning, stroke count on low-end GPUs).
 
+### 3.9 Projects, chats and transcripts
+
+**Idea (user, 2026-10-08):** organise everything into projects. A project holds documents and several chats; everything persists locally; a sidebar lists projects and chats with pinning; every chat's transcript is stored and viewable; chats can be summarised on demand.
+
+**Vocabulary** (used in UI, API and code alike):
+
+| Term | Meaning | Replaces (earlier drafts) |
+|---|---|---|
+| **Project** | A container of documents and chats about one subject ("Annual report FY24", "Vendor contracts") | blueprint's optional *workspace* |
+| **Document** | An uploaded file, ingested once, belonging to one project | — |
+| **Chat** | One conversation inside a project, by voice and/or text, answered from the project's documents | *session* in §3.5 / §6 |
+| **Message** | One utterance in a chat: from the user or the agent | *turn* |
+| **Transcript** | A chat's full ordered list of messages, viewable and exportable | — |
+| **Summary** | A user-facing digest of a chat, generated on demand | — (distinct from the internal *memory summary*, §3.5) |
+| **Voice session** | The live WebSocket audio connection while a chat is in voice mode; not stored | — |
+
+So "session" now only means a live connection; anything persisted is a project, document, chat or message.
+
+**Behaviour.**
+
+- A chat answers from **its project's documents** (Qdrant filter on `project_id`), optionally narrowed to selected documents per chat. Documents never leak across projects.
+- New chats get an **automatic title** from the first question (editable).
+- **Pinning:** projects and chats can be pinned; pinned items appear at the top of the sidebar.
+- **Deleting** a chat removes its messages and summaries; deleting a project removes its documents, vectors, uploads, chats and summaries. Everything is local, so delete really deletes.
+
+**Sidebar and screens.**
+
+```text
+┌────────────────────┬────────────────────────────────────────────────┐
+│ ＋ New project      │  Annual report FY24  ›  FY24 margins      ⋯     │
+│ ⌕ Search            │  annual_report.pdf · investor_deck.pdf  EN·HI   │
+│                    │                                                │
+│ PINNED             │        (voice mode: particle field §3.8,       │
+│  ★ FY24 margins     │         text mode: transcript + composer)      │
+│  ★ Vendor contracts │                                                │
+│                    │                                                │
+│ PROJECTS           │                                                │
+│ ▾ Annual report FY24│                                                │
+│     FY24 margins  2m│   [ Summary ]  [ Transcript ]  [ 🎙 Voice ]      │
+│     Risk section  1d│                                                │
+│     ＋ New chat      │                                                │
+│ ▸ Vendor contracts  │                                                │
+│ ▸ Board decks       │                                                │
+│                    │                                                │
+│ ● All systems OK    │  ← health from /health, opens the status panel │
+└────────────────────┴────────────────────────────────────────────────┘
+```
+
+- **Project page:** documents (upload, ingestion status, page/chunk counts), its chats, and later a project digest built from chat summaries.
+- **Chat page:** voice or text mode over the same chat; the transcript is always available beside or instead of the particle field.
+
+**Transcripts: yes, every chat is stored.** Each message keeps:
+
+- text (the user's from STT or typing; the agent's full generated answer), language, modality (voice/text), timestamps;
+- for interrupted agent answers, both the full answer and **what was actually heard** (the barge-in truncation, §3.3), shown as "interrupted after: …";
+- citations (document, page, chunk) and, for debugging, the router decision and stage latencies.
+
+Audio itself is **not** stored by default (privacy and disk); a later `chats.store_audio` option can add it. Transcripts can be viewed in the app and **exported** as Markdown or JSON (a local download).
+
+**Summaries ("what did we talk about").** A *Summarize* action on a chat produces, with the local LLM:
+
+- a short overview;
+- topics discussed;
+- key answers with their page citations;
+- questions the documents couldn't answer;
+- suggested follow-ups.
+
+Long chats are summarised in chunks and then combined (map-reduce) to fit the model's context. The summary is cached with the message it covers up to; when new messages arrive it shows "out of date — update". This is separate from the internal memory summary that keeps prompts short (§3.5), though both come from the same messages.
+
+**Data model (SQLite now, Postgres later via SQLAlchemy).**
+
+```text
+projects        id, name, description, pinned_at, archived_at, created_at, updated_at
+documents       id, project_id → projects, filename, mime, size_bytes, sha256, version, status,
+                page_count, chunk_count, error, created_at          (+ document_versions, ingestion_jobs)
+chats           id, project_id → projects, title, title_is_auto, pinned_at, document_scope (null = all),
+                language, created_at, updated_at, last_message_at, archived_at
+messages        id, chat_id → chats, role (user | agent | event), modality (voice | text), text,
+                heard_text (agent, if interrupted), language, citations (json), route (json),
+                latency (json), created_at
+chat_summaries  id, chat_id → chats, kind (user | memory), content (json/markdown),
+                covers_message_id, model, created_at
+```
+
+Every row carries ids that work unchanged in the cloud profile; a nullable `owner_id` is added when authentication (OIDC) is implemented.
+
+**API.**
+
+```text
+GET/POST          /api/projects                       list (with pinned first) / create
+PATCH/DELETE      /api/projects/{id}                  rename, pin, archive / delete (cascade)
+GET/POST          /api/projects/{id}/documents        list / upload
+DELETE            /api/documents/{id}
+GET/POST          /api/projects/{id}/chats            list / create
+PATCH/DELETE      /api/chats/{id}                     rename, pin, document scope / delete
+GET               /api/chats/{id}/messages            transcript, paginated
+GET               /api/chats/{id}/transcript?format=md|json   export
+GET/POST          /api/chats/{id}/summary             read / generate or refresh
+WS                /ws/chats/{id}                      live voice or text session for that chat
+```
+
+**Phases.** Phase 1 brings projects, documents, chats, messages, the sidebar (with pinning) and the transcript view for text chat. Phase 3 (router, state and memory) adds automatic titles, the memory summary, user-facing summaries and transcript export. Voice phases (4–6) record voice messages into the same chats.
+
 ---
 
 ## 4. Model stack
@@ -291,7 +395,7 @@ Licenses (verify again before any redistribution): Qwen3 Apache-2.0, BGE-M3 MIT,
 data/                         (gitignored)
 ├── uploads/                  original files (object store: filesystem provider)
 ├── processed/                Docling output (structured JSON / markdown)
-├── sqlite/app.db             documents, document_versions, ingestion_jobs, sessions, turns
+├── sqlite/app.db             projects, documents, document_versions, ingestion_jobs, chats, messages, chat_summaries (§3.9)
 ├── qdrant/                   Qdrant storage (bind-mounted into the container)
 └── models/
     ├── huggingface/          HF_HOME — bge-m3, reranker, whisper variants, kokoro
@@ -660,9 +764,9 @@ Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first
 | Phase | Deliverable | Done when |
 |---|---|---|
 | 0 | Skeleton: config loader, provider registry, `/health`, `/api/config/public`, frontend shell with runtime config | `/health` reports every provider; both config files validate; `cloud.config.json` wiring test passes (placeholders raise NotImplemented) |
-| 1 | Text-only document chat: upload → Docling → chunks → BGE-M3 → Qdrant → Qwen with citations | fact questions cited; out-of-document questions abstain; two docs distinguished |
+| 1 | Text-only document chat inside projects: projects, documents, chats, messages persisted; sidebar with pinning; transcript view (§3.9); upload → Docling → chunks → BGE-M3 → Qdrant → Qwen with citations | fact questions cited; out-of-document questions abstain; two docs distinguished; documents never leak across projects; chats and pins survive a restart |
 | 2 | Hybrid retrieval + reranker + confidence gate | identifiers, paraphrases, numbers, page citations correct on eval set |
-| 3 | Router + session state | unrelated questions skip retrieval; follow-ups and "back to the report" work |
+| 3 | Router + conversation state; chat memory summary; automatic chat titles; user-facing chat summaries + transcript export (§3.9) | unrelated questions skip retrieval; follow-ups and "back to the report" work; summary cites pages and flags unanswered questions; export opens as Markdown/JSON |
 | 4 | Voice in: browser mic → WebSocket → VAD → Whisper → transcript events | EN/HI transcription, silence handling, end-of-turn detection |
 | 5 | Voice out: streamed answer → sentence TTS → browser playback; voice presence field (agent motion) + live captions (§3.8) | first audio after first sentence; text and audio in sync; field follows agent voice |
 | 6 | Barge-in (duck-then-decide), corrections, stop; user waves + barge-in visuals (§3.8) | interrupt mid-answer; "no, I meant…" handled; backchannels ignored; field ducks with the audio |
