@@ -214,10 +214,11 @@ export function VoiceChat({
   // Esc steps back one level.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || e.defaultPrevented) return;
+      // A held key repeats: only the first press counts (stopping the answer and then ending the conversation is two presses).
+      if (e.key !== "Escape" || e.defaultPrevented || e.repeat) return;
       // A dialog, a menu or the sidebar drawer is open: Esc belongs to it.
       if (document.querySelector("dialog[open], [role=menu], .app[data-drawer=open]")) return;
-      const target = e.target as HTMLElement | null;
+      const target = e.target instanceof Element ? e.target : null;
       if (target?.closest("textarea, input, [contenteditable=true]")) return; // the composer has its own Esc
       if (panelOpen && overlay) {
         e.preventDefault();

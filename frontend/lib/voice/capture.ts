@@ -8,50 +8,97 @@ import { INPUT_SAMPLE_RATE, UPLINK_FRAME_SAMPLES } from "./protocol";
 
 /**
  * The worklet's source. It lives in a string, not a file, so the app doesn't depend on a bundler or a public path for
- * it; it is loaded from a Blob URL. Each output sample is the average of the input samples it covers (a box filter with
- * fractional edges): enough anti-aliasing for speech at 48 kHz → 16 kHz, no state besides one partial sample.
+ * it; it is loaded from a Blob URL.
+ *
+ * Downsampling to 16 kHz is a windowed-sinc low-pass fused with the decimation: each output sample is a 32-tap FIR
+ * (Kaiser window, beta 6) of the input around its instant, with the cutoff at 7 kHz and 256 fractional phases so any
+ * input rate (48, 44.1, 32 kHz …) lands exactly on the 16 kHz grid. Anything above 8 kHz would fold back into the
+ * speech band when decimated; this keeps it out (-60 dB or better from 10 kHz up, against -6 to -10 dB for a plain
+ * average). Output timing is the same fixed ratio, so frames still leave every 32 ms of input; the only cost is 16
+ * input samples (a third of a millisecond at 48 kHz) of look-ahead. At 16 kHz the input passes straight through.
  */
 const WORKLET_SOURCE = `
 class PcmCapture extends AudioWorkletProcessor {
   constructor(options) {
     super();
     const o = options.processorOptions || {};
-    this.ratio = sampleRate / (o.targetRate || 16000);
+    const target = o.targetRate || 16000;
+    this.ratio = sampleRate / target;
     this.frame = o.frameSamples || 512;
     this.out = new Int16Array(this.frame);
-    this.pos = 0;
-    this.acc = 0;
-    this.accW = 0;
+    this.n = 0;
+    this.direct = sampleRate === target;
+    if (!this.direct) {
+      const taps = 32, phases = 256, half = taps / 2, beta = 6;
+      const cutoff = Math.min(7000, 0.45 * Math.min(sampleRate, target)) / sampleRate;
+      const bessel = (x) => {
+        let sum = 1, term = 1;
+        for (let k = 1; k < 30; k++) { term *= (x / (2 * k)) * (x / (2 * k)); sum += term; }
+        return sum;
+      };
+      const norm = bessel(beta);
+      this.taps = taps;
+      this.half = half;
+      this.table = new Float32Array((phases + 1) * taps);
+      for (let p = 0; p <= phases; p++) {
+        let sum = 0;
+        for (let j = 0; j < taps; j++) {
+          const tau = j - (half - 1) - p / phases;
+          const r = tau / half;
+          const w = r >= 1 || r <= -1 ? 0 : bessel(beta * Math.sqrt(1 - r * r)) / norm;
+          const a = 2 * cutoff * tau;
+          const v = 2 * cutoff * (a === 0 ? 1 : Math.sin(Math.PI * a) / (Math.PI * a)) * w;
+          this.table[p * taps + j] = v;
+          sum += v;
+        }
+        for (let j = 0; j < taps; j++) this.table[p * taps + j] /= sum;
+      }
+      this.phases = phases;
+      this.buf = new Float32Array(taps + 1024);
+      this.len = half - 1;
+      this.t = half - 1;
+    }
+  }
+  emit(v) {
+    v = v < -1 ? -1 : v > 1 ? 1 : v;
+    this.out[this.n++] = v < 0 ? v * 32768 : v * 32767;
+    if (this.n === this.frame) {
+      const buffer = this.out.buffer;
+      this.port.postMessage(buffer, [buffer]);
+      this.out = new Int16Array(this.frame);
+      this.n = 0;
+    }
   }
   process(inputs) {
     const ch = inputs[0] && inputs[0][0];
     if (!ch) return true;
-    const r = this.ratio;
-    for (let i = 0; i < ch.length; i++) {
-      const s = ch[i];
-      let w = 1;
-      while (w > 1e-9) {
-        const room = r - this.accW;
-        if (w < room) {
-          this.acc += s * w;
-          this.accW += w;
-          w = 0;
-        } else {
-          this.acc += s * room;
-          w -= room;
-          let v = this.acc / r;
-          v = v < -1 ? -1 : v > 1 ? 1 : v;
-          this.out[this.pos++] = v < 0 ? v * 32768 : v * 32767;
-          this.acc = 0;
-          this.accW = 0;
-          if (this.pos === this.frame) {
-            const buffer = this.out.buffer;
-            this.port.postMessage(buffer, [buffer]);
-            this.out = new Int16Array(this.frame);
-            this.pos = 0;
-          }
-        }
-      }
+    if (this.direct) {
+      for (let i = 0; i < ch.length; i++) this.emit(ch[i]);
+      return true;
+    }
+    if (this.len + ch.length > this.buf.length) {
+      const bigger = new Float32Array(this.len + ch.length + 1024);
+      bigger.set(this.buf.subarray(0, this.len));
+      this.buf = bigger;
+    }
+    this.buf.set(ch, this.len);
+    this.len += ch.length;
+    const taps = this.taps, half = this.half, table = this.table, buf = this.buf;
+    for (;;) {
+      const i0 = Math.floor(this.t);
+      if (i0 + half >= this.len) break;
+      const row = Math.round((this.t - i0) * this.phases) * taps;
+      const from = i0 - (half - 1);
+      let acc = 0;
+      for (let j = 0; j < taps; j++) acc += buf[from + j] * table[row + j];
+      this.emit(acc);
+      this.t += this.ratio;
+    }
+    const keep = Math.floor(this.t) - (half - 1);
+    if (keep > 0) {
+      buf.copyWithin(0, keep, this.len);
+      this.len -= keep;
+      this.t -= keep;
     }
     return true;
   }

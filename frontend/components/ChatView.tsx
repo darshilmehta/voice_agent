@@ -137,6 +137,33 @@ function ChatPage({ chat }: { chat: Chat }) {
     if (savedByVoice > 0) onSettled();
   }, [savedByVoice, onSettled]);
 
+  // The backend turned voice off while the page was open (the public config was reloaded): let go of the microphone
+  // and the socket.
+  useEffect(() => {
+    if (!voiceEnabled) void session.stop();
+  }, [voiceEnabled, session]);
+
+  // After a dropped connection the voice service starts a new session, which never sent what the old one saved (an
+  // answer that was being given, the last question): read the end of the transcript again.
+  const resyncs = snapshot.resyncs;
+  const knownCount = useRef(chat.message_count);
+  useEffect(() => {
+    knownCount.current = chat.message_count;
+  }, [chat.message_count]);
+  useEffect(() => {
+    if (resyncs === 0) return;
+    const ctrl = new AbortController();
+    const seen = Math.max(knownCount.current, ...session.getSnapshot().messages.map((m) => m.seq));
+    api
+      .listMessages(chatId, { after: seen, limit: 50 }, ctrl.signal)
+      .then((page) => {
+        session.mergeMessages(page.items);
+        onSettled();
+      })
+      .catch(() => undefined); // the next save refreshes it anyway
+    return () => ctrl.abort();
+  }, [resyncs, api, chatId, session, onSettled]);
+
   // What's being said right now but not saved yet, for the transcript.
   const voiceTurn = snapshot.turn;
   const voiceLive = useMemo(() => {

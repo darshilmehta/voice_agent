@@ -64,6 +64,24 @@ export interface BargeInVad {
 }
 
 /**
+ * Frees a VAD whose `start()` failed. MicVAD.destroy() assumes the audio nodes exist and throws before it releases the
+ * model when they don't (the failure came while they were being made), so the model is released directly then.
+ */
+async function releaseUnstarted(vad: MicVAD): Promise<void> {
+  try {
+    await vad.destroy();
+    return;
+  } catch {
+    // no audio nodes to tear down
+  }
+  try {
+    await (vad as unknown as { model: { release: () => Promise<void> } }).model.release();
+  } catch {
+    // already released
+  }
+}
+
+/**
  * Starts the VAD on an existing stream and context. Tuning follows the smoke tests (§9.5): thresholds 0.5 / 0.35,
  * ~600 ms of trailing silence ends a segment, anything under ~250 ms is a misfire.
  */
@@ -99,6 +117,12 @@ export async function startBargeInVad(
     onVADMisfire: events.onMisfire,
     onSpeechEnd: events.onSpeechEnd,
   } as Parameters<typeof MicVAD.new>[0]);
-  await vad.start();
+  try {
+    await vad.start();
+  } catch (err) {
+    // The model and its ONNX session are loaded by now: release them, or they stay in memory for good.
+    await releaseUnstarted(vad);
+    throw err;
+  }
   return { destroy: () => vad.destroy().catch(() => undefined) };
 }

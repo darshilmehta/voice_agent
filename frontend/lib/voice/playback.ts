@@ -14,6 +14,10 @@ import { OUTPUT_SAMPLE_RATE } from "./protocol";
 export const DUCK_LEVEL = 0.2;
 /** How far ahead of "now" the first audio of a turn (or audio after an underrun) is scheduled, to absorb jitter. */
 const START_LEAD_S = 0.1;
+/** An announced chunk counts as fully received when its frames add up to its length, give or take about one frame. */
+const CHUNK_TOLERANCE_S = 0.07;
+/** After `agent_message`, how long to wait for announced audio that hasn't all arrived before calling the turn played. */
+const GRACE_MS = 1500;
 
 interface Slot {
   turnId: number;
@@ -28,6 +32,8 @@ interface ChunkSpan {
   end: number;
   /** Announced length (`audio_chunk.duration_ms`), seconds; null until announced. */
   announced: number | null;
+  /** Seconds of audio frames received for the chunk so far. */
+  received: number;
 }
 
 interface TurnBus {
@@ -39,6 +45,10 @@ interface TurnBus {
   frozenAt: number | null;
   /** The server has sent everything for this turn (agent_message). */
   complete: boolean;
+  /** `performance.now()` of the last frame and of `agent_message`. */
+  lastFrameAt: number;
+  completedAt: number;
+  recheck: number | null;
   doneFired: boolean;
 }
 
@@ -86,18 +96,20 @@ export class AgentPlayer {
     return this._ducked;
   }
 
-  /** Seconds of audio the listener hears "now": the context clock minus the output device's latency. */
+  /** Seconds of audio the listener hears "now": the context clock minus the audio output's latency (device + graph). */
   private heardNow(): number {
-    const latency = this.ctx.outputLatency || this.ctx.baseLatency || 0;
-    return this.ctx.currentTime - Math.min(latency, 0.25);
+    const latency = (this.ctx.outputLatency || 0) + (this.ctx.baseLatency || 0);
+    return this.ctx.currentTime - Math.min(latency, 0.3);
   }
 
-  /** A new agent turn: older turns' audio is cut off (the server moved on without a stop). */
+  /**
+   * A new agent turn: older turns' audio is cut off (the server moved on without a stop). A turn that was cancelled
+   * stays cancelled (its late frames are dropped); `reset()` starts a new session's numbering.
+   */
   setTurn(turnId: number): void {
     if (this.turn === turnId) return;
     if (this.turn !== null && this.turn !== turnId) this.stopTurn(this.turn, { restore: false });
     this.turn = turnId;
-    this.cancelled.delete(turnId);
     this.nextTime = 0;
   }
 
@@ -107,7 +119,7 @@ export class AgentPlayer {
     const bus = this.bus(turnId);
     const span = bus.chunks.get(chunkIndex);
     if (span) span.announced = durationMs / 1000;
-    else bus.chunks.set(chunkIndex, { start: Infinity, end: 0, announced: durationMs / 1000 });
+    else bus.chunks.set(chunkIndex, { start: Infinity, end: 0, announced: durationMs / 1000, received: 0 });
   }
 
   private bus(turnId: number): TurnBus {
@@ -115,18 +127,32 @@ export class AgentPlayer {
     if (!bus) {
       const gain = this.ctx.createGain();
       gain.connect(this.master);
-      bus = { gain, chunks: new Map(), played: [], frozenAt: null, complete: false, doneFired: false };
+      bus = {
+        gain,
+        chunks: new Map(),
+        played: [],
+        frozenAt: null,
+        complete: false,
+        lastFrameAt: performance.now(),
+        completedAt: 0,
+        recheck: null,
+        doneFired: false,
+      };
       this.buses.set(turnId, bus);
       // Keep only a few old turns around.
       for (const [id, old] of this.buses) {
         if (this.buses.size <= 3) break;
-        if (id !== this.turn && !this.slots.some((s) => s.turnId === id)) {
-          old.gain.disconnect();
-          this.buses.delete(id);
-        }
+        if (id !== this.turn && !this.slots.some((s) => s.turnId === id)) this.dropBus(id, old);
       }
     }
     return bus;
+  }
+
+  private dropBus(id: number, bus: TurnBus): void {
+    if (bus.recheck !== null) window.clearTimeout(bus.recheck);
+    bus.recheck = null;
+    bus.gain.disconnect();
+    this.buses.delete(id);
   }
 
   /** Schedule one frame (float samples at the output rate) of `turnId`'s chunk. False if it was dropped as stale. */
@@ -155,12 +181,14 @@ export class AgentPlayer {
     const slot: Slot = { turnId, chunkIndex, start, dur: buffer.duration, source };
     this.slots.push(slot);
     bus.played.push({ start, dur: buffer.duration });
+    bus.lastFrameAt = performance.now();
     const span = bus.chunks.get(chunkIndex);
     if (span) {
       span.start = Math.min(span.start, start);
       span.end = Math.max(span.end, start + buffer.duration);
+      span.received += buffer.duration;
     } else {
-      bus.chunks.set(chunkIndex, { start, end: start + buffer.duration, announced: null });
+      bus.chunks.set(chunkIndex, { start, end: start + buffer.duration, announced: null, received: buffer.duration });
     }
     source.onended = () => {
       this.slots = this.slots.filter((s) => s !== slot);
@@ -171,7 +199,12 @@ export class AgentPlayer {
     return true;
   }
 
-  /** The server has sent everything for the turn; `onTurnPlayed` fires once its audio has finished playing. */
+  /**
+   * The server has sent everything for the turn (`agent_message`); `onTurnPlayed` fires once its audio has finished
+   * playing: every announced chunk has delivered its length in frames (the server sends `agent_message` after the last
+   * frame, but a late frame must not be missed) and nothing is left to play. If announced audio never fully arrives,
+   * the turn counts as played after a short grace period.
+   */
   completeTurn(turnId: number): void {
     const bus = this.buses.get(turnId);
     if (!bus) {
@@ -180,17 +213,42 @@ export class AgentPlayer {
       return;
     }
     bus.complete = true;
+    bus.completedAt = performance.now();
     this.check();
+  }
+
+  /** Announced chunks that haven't received their full length of frames. */
+  private awaitingFrames(bus: TurnBus): boolean {
+    for (const span of bus.chunks.values()) {
+      if (span.announced !== null && span.received < span.announced - CHUNK_TOLERANCE_S) return true;
+    }
+    return false;
   }
 
   private check(): void {
     const active = this.slots.some((s) => !this.cancelled.has(s.turnId));
     if (!active) this.setAudible(false);
     for (const [id, bus] of this.buses) {
-      if (bus.complete && !bus.doneFired && !this.slots.some((s) => s.turnId === id)) {
+      if (!bus.complete || bus.doneFired || this.slots.some((s) => s.turnId === id)) continue;
+      if (this.cancelled.has(id)) {
         bus.doneFired = true;
-        if (!this.cancelled.has(id)) this.events.onTurnPlayed?.(id);
+        continue;
       }
+      if (this.awaitingFrames(bus)) {
+        const waited = performance.now() - Math.max(bus.lastFrameAt, bus.completedAt);
+        if (waited < GRACE_MS) {
+          // Frames may still be on their way: look again when the grace period would be over.
+          if (bus.recheck === null) {
+            bus.recheck = window.setTimeout(() => {
+              bus.recheck = null;
+              this.check();
+            }, GRACE_MS - waited + 20);
+          }
+          continue;
+        }
+      }
+      bus.doneFired = true;
+      this.events.onTurnPlayed?.(id);
     }
   }
 
@@ -217,6 +275,11 @@ export class AgentPlayer {
   /** Is the agent's voice playing (or about to) right now? */
   get isAudible(): boolean {
     return this.audible;
+  }
+
+  /** Was this turn stopped (by the user or the server) or replaced? Its audio is dropped. */
+  isCancelled(turnId: number): boolean {
+    return this.cancelled.has(turnId);
   }
 
   // ------------------------------------------------------------------ duck / stop
@@ -274,6 +337,14 @@ export class AgentPlayer {
     this.turn = null;
   }
 
+  /** A new server session numbers its turns from the start again: cut everything off and forget the old turns. */
+  reset(): void {
+    this.stopAll();
+    for (const [id, bus] of [...this.buses]) this.dropBus(id, bus);
+    this.cancelled.clear();
+    this.nextTime = 0;
+  }
+
   // ------------------------------------------------------------------ progress
 
   /** Milliseconds of the turn the listener has actually heard, frozen at the moment it was cut off. */
@@ -304,6 +375,7 @@ export class AgentPlayer {
     if (this.poll !== null) window.clearInterval(this.poll);
     this.poll = null;
     this.stopAll();
+    for (const bus of this.buses.values()) if (bus.recheck !== null) window.clearTimeout(bus.recheck);
     try {
       this.master.disconnect();
       this.analyser.disconnect();
