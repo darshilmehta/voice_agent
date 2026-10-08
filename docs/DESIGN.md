@@ -218,51 +218,52 @@ Production additions: fallback chain (search API → SearXNG if deployed → doc
 
 Local status: config has `provider: searxng`, `enabled: false` until phase 8; enabling it also requires `strict_offline_exceptions: ["web_search"]`. In the fully offline smoke run (test 12) web search is expected to be unavailable and must degrade to a document-only answer.
 
-### 3.8 Voice presence UI (the "breathing" orb)
+### 3.8 Voice presence UI (the "breathing" particle field)
 
-**Idea (user, 2026-10-08):** while the conversation happens, an animated presence that *breathes* with the voices of both the human and the agent. Modern and sleek. Inspiration (not copied): ChatGPT voice mode's orb, Gemini Live's glow, Siri's edge light, ElevenLabs' conversational orb. Prototype: [`docs/prototypes/voice-presence.html`](prototypes/voice-presence.html).
+**Idea (user, 2026-10-08):** while the conversation happens, an animated presence that *breathes* with the voices of both the human and the agent. Modern and sleek. The direction (v2) combines the particle field of the [antigravity.google](https://antigravity.google) hero (thousands of short strokes that organise into rings and swirl around the cursor, blue → violet → magenta → coral → amber) with a small breathing core. Prototype: [`docs/prototypes/voice-presence.html`](prototypes/voice-presence.html). v1, a solid shader orb, is in git history.
 
-**Concept: one presence, two voices.**
+**Concept: one presence, two voices, sound moves.**
 
 | Who is speaking | What the screen does |
 |---|---|
-| Agent | The orb swells and its inner gradient flows faster with the agent's voice (cool palette) |
-| User | A warm halo ripples around the orb with the user's voice; the orb contracts slightly, "listening" |
-| Both (barge-in) | The orb dims and shrinks as the agent ducks; the user's halo takes over, matching the audio ducking in §3.3 |
-| Nobody (idle) | Slow breathing (~0.2 Hz), barely moving |
-| Thinking | No amplitude; a gentle internal swirl, faster when retrieval/LLM is busy |
+| Agent | The active band of rings widens, brightens and shifts **cool** (blue/violet); the core swells; every syllable sends a wave of strokes **outward** (sound leaving the agent) |
+| User | The band tightens and shifts **warm** (coral/amber); waves travel **inward** (sound arriving) |
+| Both (barge-in) | The core dims and the field fades as the agent ducks, then the inward waves take over, matching the audio ducking in §3.3 |
+| Nobody (idle) | Faint dotted rings in the full spectrum, breathing at ~0.2 Hz; ambient specks across the page swirl into small rings around the cursor and settle when it stops |
+| Thinking | The field rotates slowly and the strokes tilt into a swirl |
 
 **Driven by the voice's shape, not just volume.** Both streams are analysed in the browser (zero added latency, no backend round trip):
 
-- **Loudness** (RMS envelope) → orb/halo size. Fast attack (~40 ms), slow release (~250 ms), so it breathes instead of jittering.
-- **Brightness** (spectral centroid) → colour intensity / hue shift within the speaker's palette.
-- **Onsets** (sudden energy rise, roughly syllables) → a ripple ring travels outward.
+- **Loudness** (RMS envelope) → band radius, width and density. Fast attack (~40 ms), slow release (~250 ms), so it breathes instead of jittering.
+- **Brightness** (spectral centroid) → colour intensity within the speaker's palette.
+- **Onsets** (sudden energy rise, roughly syllables) → a radial wave (outward for the agent, inward for the user).
 
-Sources: the user's mic `MediaStream` (after browser echo cancellation, so the agent's own voice doesn't drive the user halo) and the agent's playback graph (the TTS `GainNode` feeds an `AnalyserNode`). Both already exist in the client for VAD and playback.
+Sources: the user's mic `MediaStream` (after browser echo cancellation, so the agent's own voice doesn't drive the user's waves) and the agent's playback graph (the TTS `GainNode` feeds an `AnalyserNode`). Both already exist in the client for VAD and playback.
 
-**Rendering.** One WebGL fragment shader on a full-screen canvas (noise-deformed blob, flowing two-tone gradient, soft glow, up to 4 ripple rings); no 3D library needed. Inputs are a handful of uniforms per frame (time, agent level, user level, agent/user brightness, thinking, ripple times). Canvas 2D fallback without WebGL; `prefers-reduced-motion` switches to a calm static orb with a simple level ring. GPU cost is negligible next to the LLM.
+**Rendering.** One WebGL2 draw call of ~8,000 instanced strokes (ambient field, presence rings, core), each a capsule with an antialiased edge; all motion is computed in the vertex shader from a handful of uniforms per frame (time, levels, brightness, think, duck, pointer, 4 outward + 4 inward wave start times). No libraries. Light theme uses normal blending on near-white; dark theme uses additive blending for a luminous look. Canvas 2D fallback draws the rings only; `prefers-reduced-motion` freezes drift, rotation and waves while the band still reflects who is speaking. The field is sized to stay clear of the captions below it.
 
 **Screen layout (voice mode).**
 
 ```text
 ┌──────────────────────────────────────────────┐
 │  annual_report.pdf · contract.pdf      EN · HI │  documents in scope, language
-│                                              │
-│                    ◉  orb                    │
-│                                              │
+│        ·  ·    ·      ·     ·    ·   ·         │  ambient field (swirls around the cursor)
+│                  ⁘⁘⁘⁘⁘⁘⁘                        │
+│               ⁘⁘   ◉ core  ⁘⁘                   │  presence rings + core
+│                  ⁘⁘⁘⁘⁘⁘⁘                        │
 │      "FY24 revenue was ₹4,210 crore, up…"     │  live captions: agent words highlight as spoken,
-│                                    p.47 ↗     │  citations appear as chips
+│                                    p.46 ↗     │  citations appear as chips
 │                 Listening…                   │  state label (also announced to screen readers)
-│        [ mute ]     ( ● mic )     [ end ]     │
+│        [ stop ]     ( ● mic )     [ think ]   │
 └──────────────────────────────────────────────┘
 ```
 
-- **Live captions:** the agent's words highlight as they're spoken (Kokoro returns per-token durations); the user's partial transcript appears in a muted colour while they speak.
-- **Docking:** when the visual canvas (§12.1) shows a chart, the orb shrinks and docks so the visual takes the stage; it keeps breathing as the presence indicator.
-- **Later states:** web search (§3.7) adds orbiting "searching" particles; a language switch briefly tints the caption badge.
-- **Accessibility:** state always available as text (`aria-live`), captions on by default, colour never the only signal (shape and motion differ per state), reduced-motion respected.
+- **Live captions:** the agent's words highlight as they're spoken (Kokoro returns per-token durations); the user's partial transcript appears in a warm colour while they speak.
+- **Docking:** when the visual canvas (§12.1) shows a chart, the field shrinks and docks so the visual takes the stage; it keeps breathing as the presence indicator.
+- **Later states:** web search (§3.7) sends strokes orbiting outward ("searching"); a language switch briefly tints the caption badge.
+- **Accessibility:** state always available as text (`aria-live`), captions on by default, colour never the only signal (wave direction and band shape differ per speaker), reduced motion respected.
 
-**Build plan.** Phase 5 ships the orb with agent-driven motion and captions; phase 6 adds the user halo, barge-in visuals and docking; phase 9 polishes (palette per theme, onset tuning, performance on low-end GPUs).
+**Build plan.** Phase 5 ships the field with agent-driven motion and captions; phase 6 adds the user's warm inward waves, barge-in visuals and docking; phase 9 polishes (palettes per theme, onset tuning, stroke count on low-end GPUs).
 
 ---
 
@@ -663,8 +664,8 @@ Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first
 | 2 | Hybrid retrieval + reranker + confidence gate | identifiers, paraphrases, numbers, page citations correct on eval set |
 | 3 | Router + session state | unrelated questions skip retrieval; follow-ups and "back to the report" work |
 | 4 | Voice in: browser mic → WebSocket → VAD → Whisper → transcript events | EN/HI transcription, silence handling, end-of-turn detection |
-| 5 | Voice out: streamed answer → sentence TTS → browser playback; voice presence orb (agent motion) + live captions (§3.8) | first audio after first sentence; text and audio in sync; orb follows agent voice |
-| 6 | Barge-in (duck-then-decide), corrections, stop; user halo + barge-in visuals (§3.8) | interrupt mid-answer; "no, I meant…" handled; backchannels ignored; orb ducks with the audio |
+| 5 | Voice out: streamed answer → sentence TTS → browser playback; voice presence field (agent motion) + live captions (§3.8) | first audio after first sentence; text and audio in sync; field follows agent voice |
+| 6 | Barge-in (duck-then-decide), corrections, stop; user waves + barge-in visuals (§3.8) | interrupt mid-answer; "no, I meant…" handled; backchannels ignored; field ducks with the audio |
 | 7 | Topic drift + EN/HI switching + code-mixing | drift script passes: document → general → Hindi → document |
 | 8 | Live-data tools: web search with filler + streamed partial answers (§3.7) | mixed doc+live question answered with separate [S]/[W] citations; first words < 1 s after filler; barge-in cancels search; timeout falls back to document-only answer |
 | 9 | Evals + observability + UI polish | retrieval Recall@5/MRR, groundedness, latency dashboard; demo script runs end to end |
