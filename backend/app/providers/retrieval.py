@@ -1,6 +1,6 @@
 """Embeddings, reranker and vector store providers (docs/DESIGN.md §3.2, §6).
 
-Models load lazily from their local snapshot on first use and run off the event loop (``asyncio.to_thread``);
+Models load lazily from their local snapshot on first use (or at startup, ``preload``) and run off the event loop;
 torch, FlagEmbedding and sentence-transformers come from the optional ``ml`` dependency group.
 ``qdrant-client`` is a runtime dependency but is also imported lazily to keep startup light.
 """
@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +18,7 @@ from pydantic import BaseModel
 
 from .base import HealthStatus, Provider, ProviderContext, ProviderHealth
 from .ingestion import Chunk, point_id
-from .models import LocalModelProvider, free_torch_memory, quiet_ml_env, require_modules
+from .models import LazyModelProvider
 from .registry import register
 
 if TYPE_CHECKING:
@@ -112,47 +111,12 @@ class Embedder(Provider):
         raise NotImplementedError(f"{type(self).__name__}.embed")
 
 
-class _LazyModel(LocalModelProvider):
-    """A model loaded on first use, used by one thread at a time, and freed on close."""
-
-    def __init__(self, config: BaseModel, ctx: ProviderContext) -> None:
-        super().__init__(config, ctx)
-        self._lock = threading.Lock()
-        self._model: Any = None
-
-    @property
-    def loaded(self) -> bool:
-        return self._model is not None
-
-    def _load(self, snapshot: Path) -> Any:  # pragma: no cover - needs the ml group and model files
-        raise NotImplementedError
-
-    def _model_locked(self) -> Any:
-        """The model, loading it from the local snapshot if needed. Call with ``self._lock`` held."""
-        if self._model is None:
-            require_modules(f"{self.capability} provider {self.name!r}", self.required_modules)
-            snapshot = self.snapshot_path()
-            quiet_ml_env()
-            self._model = self._load(snapshot)
-        return self._model
-
-    def unload(self) -> None:
-        with self._lock:
-            model, self._model = self._model, None
-        if model is not None:
-            del model
-            free_torch_memory()
-
-    async def close(self) -> None:
-        await asyncio.to_thread(self.unload)
-
-
 def _use_fp16(device: str, fp16: bool) -> bool:
     return fp16 and device != "cpu"  # half precision on CPU is slow or unsupported
 
 
 @register
-class BgeM3Embedder(Embedder, _LazyModel):
+class BgeM3Embedder(Embedder, LazyModelProvider):
     name = "bge_m3"
     dim = 1024
     required_modules = ("FlagEmbedding", "torch")
@@ -164,13 +128,16 @@ class BgeM3Embedder(Embedder, _LazyModel):
     async def embed(self, texts: Sequence[str]) -> list[DenseSparse]:
         if not texts:
             return []
-        return await asyncio.to_thread(self._embed_sync, list(texts))
+        return await self._run(self._embed_sync, list(texts))
 
     def _load(self, snapshot: Path) -> Any:
         from FlagEmbedding import BGEM3FlagModel
 
         cfg = self.cfg
         return BGEM3FlagModel(str(snapshot), use_fp16=_use_fp16(cfg.device, cfg.fp16), devices=cfg.device)
+
+    def _warm(self, model: Any) -> None:
+        model.encode(["warm up"], batch_size=1, max_length=32, return_dense=True, return_sparse=True)
 
     def _embed_sync(self, texts: list[str]) -> list[DenseSparse]:
         with self._lock:
@@ -205,7 +172,7 @@ class Reranker(Provider):
 
 
 @register
-class BgeReranker(Reranker, _LazyModel):
+class BgeReranker(Reranker, LazyModelProvider):
     name = "bge_reranker"
     required_modules = ("sentence_transformers", "torch")
 
@@ -216,7 +183,7 @@ class BgeReranker(Reranker, _LazyModel):
     async def score(self, query: str, passages: Sequence[str]) -> list[float]:
         if not passages:
             return []
-        return await asyncio.to_thread(self._score_sync, query, list(passages))
+        return await self._run(self._score_sync, query, list(passages))
 
     def _load(self, snapshot: Path) -> Any:
         import torch
@@ -231,6 +198,9 @@ class BgeReranker(Reranker, _LazyModel):
             local_files_only=True,
             model_kwargs={"dtype": dtype},
         )
+
+    def _warm(self, model: Any) -> None:
+        model.predict([("warm up", "warm up")], show_progress_bar=False)
 
     def _score_sync(self, query: str, passages: list[str]) -> list[float]:
         with self._lock:

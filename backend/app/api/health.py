@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from .. import __version__
 from ..providers.base import HealthStatus, ProviderHealth
+from ..services.preload import PreloadReport
 
 router = APIRouter(tags=["health"])
 
@@ -21,6 +22,7 @@ class HealthReport(BaseModel):
     profile: str
     strict_offline: bool
     providers: list[ProviderHealth]
+    preload: PreloadReport  # the conversation models loading in the background since startup
 
 
 @router.get("/health", response_model=HealthReport)
@@ -33,4 +35,5 @@ async def health(request: Request) -> HealthReport:
         profile=container.settings.profile,
         strict_offline=container.settings.strict_offline,
         providers=providers,
+        preload=request.app.state.preloader.report(),
     )

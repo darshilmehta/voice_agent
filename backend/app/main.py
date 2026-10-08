@@ -6,6 +6,8 @@ uv run uvicorn --factory app.main:create_app --reload  # development
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -19,14 +21,23 @@ from .api.deps import install_error_handlers
 from .logging_setup import configure_logging
 from .offline import apply_runtime_env
 from .providers.registry import Container, build_container
+from .services.chat_turns import wait_for_background
 from .services.document_pipeline import DocumentPipeline
+from .services.preload import ModelPreloader
 from .settings import Settings, load_settings
 
 log = logging.getLogger("app")
 
+SHUTDOWN_SAVE_WAIT_S = 10.0  # at shutdown, time given to saves still running before the database closes
 
-def create_app(settings: Settings | None = None, container: Container | None = None) -> FastAPI:
-    """Build the app. Configuration problems raise ConfigError here, before the server accepts traffic."""
+
+def create_app(
+    settings: Settings | None = None, container: Container | None = None, *, preload_models: bool = True
+) -> FastAPI:
+    """Build the app. Configuration problems raise ConfigError here, before the server accepts traffic.
+
+    ``preload_models``: load the conversation models (VAD, STT, TTS, embedder, reranker, LLM) in the background at
+    startup, reported in ``/health``. Tests that build the real providers without models turn it off."""
     settings = settings or load_settings()
     configure_logging(settings)
     container = container or build_container(settings)
@@ -38,6 +49,9 @@ def create_app(settings: Settings | None = None, container: Container | None = N
         app.state.container = container
         app.state.document_pipeline = DocumentPipeline.from_container(container)
         await app.state.document_pipeline.start()  # re-queues ingestions a restart interrupted
+        app.state.preloader = ModelPreloader(container)
+        if preload_models:
+            app.state.preloader.start()
         log.info(
             "started %s %s profile=%s strict_offline=%s config=%s",
             settings.app.name,
@@ -49,6 +63,9 @@ def create_app(settings: Settings | None = None, container: Container | None = N
         try:
             yield
         finally:
+            with contextlib.suppress(TimeoutError):  # saves of stopped answers
+                await asyncio.wait_for(wait_for_background(), SHUTDOWN_SAVE_WAIT_S)
+            await app.state.preloader.stop()
             await container.close()
 
     app = FastAPI(title=settings.client.app_title, version=__version__, lifespan=lifespan)

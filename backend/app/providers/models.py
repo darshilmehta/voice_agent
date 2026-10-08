@@ -1,20 +1,28 @@
 """Shared logic for providers backed by locally downloaded Hugging Face models.
 
-Heavy ML libraries (torch, FlagEmbedding, sentence-transformers, docling) live in the optional ``ml`` dependency
-group and are imported lazily inside methods, so the app, its health checks and CI run without them.
+Heavy ML libraries (torch, FlagEmbedding, sentence-transformers, docling, mlx-whisper, kokoro …) live in the optional
+``ml`` dependency group and are imported lazily inside methods, so the app, its health checks and CI run without them.
+
+Models load on first use, or earlier through ``preload()`` (the app preloads the conversation models in the background
+at startup, so the first question isn't slowed by loading). Inference runs off the event loop.
 """
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import importlib.util
 import os
 import platform
 import sys
+import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
-from .base import HealthStatus, Provider, ProviderHealth, local_snapshot
+from pydantic import BaseModel
+
+from .base import HealthStatus, Provider, ProviderContext, ProviderHealth, local_snapshot
 
 APPLE_SILICON = sys.platform == "darwin" and platform.machine() == "arm64"
 
@@ -99,3 +107,80 @@ class LocalModelProvider(Provider):
             return self._health(HealthStatus.DEGRADED, "; ".join(problems))
         note = " (CUDA verified at load)" if device == "cuda" else ""
         return self._health(HealthStatus.OK, f"{repo} present, device {device}{note}; loads on first use")
+
+
+class LazyModelProvider(LocalModelProvider):
+    """A model loaded on first use (or by ``preload``), used by one thread at a time, and freed on close.
+
+    Subclasses implement ``_load(snapshot)`` and optionally ``_warm(model)`` (a tiny inference run once after a
+    preload, so the first real request doesn't pay for kernel compilation or lazy initialisation). Blocking work goes
+    through ``_run``, which uses a worker thread (``asyncio.to_thread``); providers whose library is bound to one
+    thread (MLX) override it.
+    """
+
+    def __init__(self, config: BaseModel, ctx: ProviderContext) -> None:
+        super().__init__(config, ctx)
+        self._lock = threading.Lock()
+        self._model: Any = None
+        self._load_error: str | None = None
+
+    @property
+    def loaded(self) -> bool:
+        return self._model is not None
+
+    def _load(self, snapshot: Path) -> Any:  # pragma: no cover - needs the ml group and model files
+        raise NotImplementedError
+
+    def _warm(self, model: Any) -> None:
+        """Run a tiny inference right after a preload. Default: nothing."""
+
+    def _model_locked(self) -> Any:
+        """The model, loading it from the local snapshot if needed. Call with ``self._lock`` held."""
+        if self._model is None:
+            require_modules(f"{self.capability} provider {self.name!r}", self.required_modules)
+            snapshot = self.snapshot_path()
+            quiet_ml_env()
+            try:
+                self._model = self._load(snapshot)
+            except Exception as e:
+                self._load_error = f"{type(e).__name__}: {e}"
+                raise
+            self._load_error = None
+        return self._model
+
+    async def _run[T](self, fn: Callable[..., T], *args: Any) -> T:
+        """Run blocking model work off the event loop."""
+        return await asyncio.to_thread(fn, *args)
+
+    async def preload(self) -> None:
+        await self._run(self._preload_sync)
+
+    def _preload_sync(self) -> None:
+        with self._lock:
+            fresh = self._model is None
+            model = self._model_locked()
+            if fresh:
+                self._warm(model)
+
+    def _release(self, model: Any) -> None:
+        """Free library-level caches holding the model (beyond our reference). Default: nothing."""
+
+    def unload(self) -> None:
+        with self._lock:
+            model, self._model = self._model, None
+        if model is not None:
+            self._release(model)
+            del model
+            free_torch_memory()
+
+    async def close(self) -> None:
+        await self._run(self.unload)
+
+    async def health(self) -> ProviderHealth:
+        report = await super().health()
+        if self._model is not None and report.status == HealthStatus.OK:
+            device = self.config.device  # type: ignore[attr-defined]
+            return self._health(HealthStatus.OK, f"{self.model_repo()} loaded, device {device}")
+        if self._load_error and report.status == HealthStatus.OK:
+            return self._health(HealthStatus.DOWN, f"{self.model_repo()} failed to load: {self._load_error}")
+        return report
