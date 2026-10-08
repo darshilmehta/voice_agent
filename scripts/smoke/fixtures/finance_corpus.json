@@ -1,0 +1,37 @@
+{
+  "passages": [
+    {"id": "p01", "page": 47, "lang": "en", "text": "FY24 EBITDA margin stood at 18.2%, up from 16.9% in FY23, driven by operating leverage and lower input costs."},
+    {"id": "p02", "page": 31, "lang": "en", "text": "In FY23, EBITDA margin was 16.9%, compressed by higher raw material prices and wage inflation."},
+    {"id": "p03", "page": 112, "lang": "en", "text": "EBITDA is defined as earnings before interest, taxes, depreciation and amortisation. It is a non-GAAP measure used to assess operating performance."},
+    {"id": "p04", "page": 46, "lang": "en", "text": "Revenue from operations grew 34% year on year to ₹4,210 crore in FY24, led by the enterprise segment."},
+    {"id": "p05", "page": 30, "lang": "en", "text": "Revenue from operations for FY23 was ₹3,142 crore, an increase of 21% over the previous year."},
+    {"id": "p06", "page": 88, "lang": "en", "text": "Either party may terminate this agreement by giving ninety (90) days' written notice to the other party, as set out in Clause 14.2."},
+    {"id": "p07", "page": 89, "lang": "en", "text": "The aggregate liability of the Vendor under this agreement shall not exceed the total fees paid by the Client in the preceding twelve months."},
+    {"id": "p08", "page": 12, "lang": "en", "text": "Our margins benefited from operating leverage as fixed costs were spread over a larger revenue base."},
+    {"id": "p09", "page": 63, "lang": "en", "text": "Product SKU-48213, an industrial sensor module, contributed 7% of total segment revenue during the year."},
+    {"id": "p10", "page": 5, "lang": "en", "text": "The Board recommended a final dividend of ₹6 per equity share for the financial year 2023-24."},
+    {"id": "p11", "page": 70, "lang": "en", "text": "The company employed 12,480 people at the end of the year, of whom 31% were women."},
+    {"id": "p12", "page": 20, "lang": "en", "text": "The Mumbai headquarters were relocated to a new campus in Powai during the second quarter."},
+    {"id": "p13", "page": 95, "lang": "hi", "text": "कंपनी ने वित्त वर्ष 2024 में अपने कार्बन उत्सर्जन में 15 प्रतिशत की कमी की, जिसका मुख्य कारण सौर ऊर्जा का उपयोग था।"}
+  ],
+  "queries": [
+    {"q": "What was the EBITDA margin in FY24?", "lang": "en", "expect": "p01", "kind": "fact, FY23 distractor"},
+    {"q": "FY24 में EBITDA मार्जिन कितना था?", "lang": "hi", "expect": "p01", "kind": "Hindi query → English doc"},
+    {"q": "FY24 mein revenue kitna badha?", "lang": "hinglish", "expect": "p04", "kind": "Hinglish query"},
+    {"q": "How much notice is needed to end the contract?", "lang": "en", "expect": "p06", "kind": "paraphrase"},
+    {"q": "SKU-48213", "lang": "en", "expect": "p09", "kind": "exact identifier"},
+    {"q": "How much did the company cut its carbon emissions?", "lang": "en", "expect": "p13", "kind": "English query → Hindi doc"},
+    {"q": "अनुबंध में विक्रेता की देयता की सीमा क्या है?", "lang": "hi", "expect": "p07", "kind": "Hindi paraphrase"},
+    {"q": "How many employees did the company have?", "lang": "en", "expect": "p11", "kind": "paraphrase"}
+  ],
+  "no_answer_queries": [
+    "What is the CEO's annual salary?",
+    "कंपनी का मुख्य प्रतिस्पर्धी कौन है?"
+  ],
+  "translation_pairs": [
+    ["The company's revenue grew by 34 percent in fiscal year 2024.", "वित्त वर्ष 2024 में कंपनी का राजस्व 34 प्रतिशत बढ़ा।"],
+    ["The notice period for terminating the contract is 90 days.", "अनुबंध समाप्त करने के लिए नोटिस अवधि 90 दिन है।"],
+    ["The company's revenue grew by 34 percent in fiscal year 2024.", "Company ka revenue FY24 mein 34 percent badha."]
+  ],
+  "unrelated": "The weather in Mumbai is very humid during the monsoon season."
+}

@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Barge-in Mic Check</title>
+  <style>
+    :root { --bg: #fafaf9; --fg: #1c1917; --muted: #78716c; --ok: #15803d; --bad: #b91c1c; --warn: #b45309; --card: #fff; --line: #e7e5e4; --accent: #2563eb; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #1c1917; --fg: #f5f5f4; --muted: #a8a29e; --ok: #4ade80; --bad: #f87171; --warn: #fbbf24; --card: #292524; --line: #44403c; --accent: #60a5fa; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px 16px; background: var(--bg); color: var(--fg); font: 15px/1.5 -apple-system, system-ui, sans-serif; }
+    main { max-width: 720px; margin: 0 auto; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin: 12px 0; }
+    .muted { color: var(--muted); }
+    button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; margin: 4px 6px 4px 0; }
+    button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    button:disabled { opacity: .5; cursor: default; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
+    .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); font-size: 13px; }
+    .big { font-size: 28px; font-weight: 600; }
+    #meter { height: 10px; background: var(--line); border-radius: 5px; overflow: hidden; flex: 1; min-width: 120px; }
+    #meter > div { height: 100%; width: 0; background: var(--accent); transition: width 60ms linear; }
+    #log { font: 12px/1.5 ui-monospace, monospace; max-height: 220px; overflow: auto; white-space: pre-wrap; }
+    ol { padding-left: 20px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Smoke test 10b: echo and barge-in (manual)</h1>
+  <p class="muted">Your microphone listens while the "agent" talks through your speakers. The agent's own voice must <b>not</b> trigger an interruption; your voice must. Use speakers, not headphones, for the hardest case. Nothing leaves this machine.</p>
+
+  <div class="card">
+    <ol>
+      <li><b>Start mic</b> and allow microphone access.</li>
+      <li><b>Round 1 (stay silent):</b> click <b>Play agent voice</b> and say nothing until it stops. False barge-ins should stay at <b>0</b>.</li>
+      <li><b>Round 2 (interrupt):</b> click <b>Play agent voice</b> again and start talking halfway through. The agent should get quieter right away, then <b>stop completely</b> once you've spoken for ~¼ s. A cough or click should only dip the volume briefly.</li>
+    </ol>
+    <div class="row">
+      <button id="start" class="primary">Start mic</button>
+      <button id="play" disabled>Play agent voice</button>
+      <span class="badge" id="state">mic off</span>
+      <div id="meter"><div></div></div>
+    </div>
+  </div>
+
+  <div class="card row">
+    <div><div class="muted">False barge-ins (round 1)</div><div class="big" id="false">0</div></div>
+    <div><div class="muted">Barge-ins (round 2)</div><div class="big" id="true">0</div></div>
+    <div><div class="muted">Duck reaction</div><div class="big" id="react">–</div></div>
+    <div><div class="muted">Duck → full stop</div><div class="big" id="stopped">–</div></div>
+  </div>
+
+  <div class="card"><div class="muted">Event log</div><div id="log"></div></div>
+</main>
+<script src="node_modules/onnxruntime-web/dist/ort.wasm.min.js"></script>
+<script src="node_modules/@ricky0123/vad-web/dist/bundle.min.js"></script>
+<script>
+const BASE = "node_modules/";
+const CLIPS = [0, 1, 2, 3, 4].map(i => `/data/smoke/audio/kokoro_en_${i}.wav`);
+const $ = id => document.getElementById(id);
+const state = { round: 0, playing: false, falseCount: 0, trueCount: 0, events: [] };
+window.__mic = state;
+let ctx, gain, agentBuf, myvad, src;
+
+const log = (msg) => {
+  const t = ctx ? ctx.currentTime.toFixed(2) : "0.00";
+  state.events.push([t, msg]);
+  $("log").textContent = `${t}s  ${msg}\n` + $("log").textContent;
+};
+
+async function loadAgentVoice() {
+  const bufs = await Promise.all(CLIPS.map(async u => ctx.decodeAudioData(await (await fetch(u)).arrayBuffer())));
+  const gap = Math.round(ctx.sampleRate * 0.4);
+  const len = bufs.reduce((n, b) => n + b.length + gap, 0);
+  const out = ctx.createBuffer(1, len, ctx.sampleRate);
+  let pos = 0;
+  for (const b of bufs) { out.getChannelData(0).set(b.getChannelData(0), pos); pos += b.length + gap; }
+  return out;
+}
+
+$("start").onclick = async () => {
+  $("start").disabled = true;
+  ctx = new AudioContext();
+  gain = ctx.createGain();
+  gain.connect(ctx.destination);
+  agentBuf = await loadAgentVoice();
+  myvad = await vad.MicVAD.new({
+    model: "v5",
+    audioContext: ctx,
+    baseAssetPath: new URL(BASE + "@ricky0123/vad-web/dist/", location.href).href,
+    onnxWASMBasePath: new URL(BASE + "onnxruntime-web/dist/", location.href).href,
+    positiveSpeechThreshold: 0.5,
+    negativeSpeechThreshold: 0.35,
+    redemptionMs: 600,
+    minSpeechMs: 250,
+    onFrameProcessed: (p) => { $("meter").firstElementChild.style.width = `${Math.round(p.isSpeech * 100)}%`; },
+    onSpeechStart: () => {
+      const t0 = performance.now();
+      state.duckAt = t0;
+      if (state.playing) {
+        gain.gain.setTargetAtTime(0.15, ctx.currentTime, 0.03);  // duck immediately
+        $("react").textContent = `${Math.round(performance.now() - t0)} ms`;
+        if (state.round === 1) { state.falseCount++; $("false").textContent = state.falseCount; log("FALSE barge-in: agent voice triggered VAD"); }
+        else { state.trueCount++; $("true").textContent = state.trueCount; log("barge-in: agent ducked"); }
+      } else {
+        log("speech start (agent not playing)");
+      }
+      $("state").textContent = "speech";
+    },
+    // Speech confirmed (lasted ≥ minSpeechMs): the agent drops its thought and listens.
+    onSpeechRealStart: () => {
+      if (state.playing && src) {
+        src.onended = null;
+        src.stop();
+        state.playing = false;
+        $("play").disabled = false;
+        $("stopped").textContent = `${Math.round(performance.now() - state.duckAt)} ms`;
+        log(`agent STOPPED: speech confirmed (${state.round === 1 ? "false barge-in" : "barge-in"}), rest of answer discarded`);
+      }
+    },
+    onSpeechEnd: () => { log("speech end"); $("state").textContent = "listening"; },
+    // Too short to be a real interruption (cough, click, "mm"): restore the agent's volume and carry on.
+    onVADMisfire: () => {
+      if (state.playing) { gain.gain.setTargetAtTime(1, ctx.currentTime, 0.05); log("short sound: agent volume restored, continues"); }
+      else log("short sound ignored (misfire)");
+      $("state").textContent = "listening";
+    },
+  });
+  myvad.start();
+  $("state").textContent = "listening";
+  $("play").disabled = false;
+  log("mic started (echo cancellation on)");
+};
+
+$("play").onclick = () => {
+  if (state.playing) return;
+  state.round = Math.min(state.round + 1, 2);
+  gain.gain.cancelScheduledValues(ctx.currentTime);
+  gain.gain.setValueAtTime(1, ctx.currentTime);
+  src = ctx.createBufferSource();
+  src.buffer = agentBuf;
+  src.connect(gain);
+  src.onended = () => { state.playing = false; $("play").disabled = false; log(`round ${state.round} finished`); };
+  state.playing = true;
+  $("play").disabled = true;
+  src.start();
+  log(`round ${state.round} started: ${state.round === 1 ? "stay silent" : "interrupt halfway"}`);
+};
+</script>
+</body>
+</html>

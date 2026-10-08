@@ -1,0 +1,9 @@
+{
+  "name": "smoke-browser-vad",
+  "private": true,
+  "description": "Smoke test 10: browser VAD (Silero via @ricky0123/vad-web) served from local files",
+  "dependencies": {
+    "@ricky0123/vad-web": "^0.0.31",
+    "onnxruntime-web": "^1.30.0"
+  }
+}

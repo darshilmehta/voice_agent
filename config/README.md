@@ -1,0 +1,60 @@
+# Configuration
+
+One JSON file configures the whole backend. The frontend gets its settings from the backend at runtime.
+
+| File | Used by | Purpose |
+|---|---|---|
+| `local.config.json` | default | Everything on this machine. Fields only clouds need are `null`. |
+| `cloud.config.json` | nothing (template) | Example server deployment with placeholder hosts (`*.example.com`) and `${VAR}` secrets. Copy it, edit it, point the app at it. |
+
+Both files share exactly the same keys and are validated by the same schema, so the template can't silently drift from the code (a test loads both).
+
+## How the backend loads config
+
+```text
+APP_CONFIG_FILE              (default: config/local.config.json)
+  → parse JSON
+  → resolve "${VAR}" strings from environment variables   (missing var = startup error)
+  → apply env overrides, nested with "__"                 (e.g. LLM__CHAT_MODEL=qwen3:4b-instruct)
+  → validate (pydantic)
+  → strict_offline check
+  → build providers
+```
+
+- **Secrets never go in the file.** Use `"${VAR}"` placeholders and set the variables in the deployment environment (or a `.env` that is never committed).
+- **`strict_offline: true`** (local) makes startup fail if any provider is remote or any URL is not loopback, and forces Hugging Face offline mode. The only escape hatch is `strict_offline_exceptions` (e.g. `["web_search"]`), which allows exactly that capability to reach the network.
+
+## Deploying to a server
+
+```bash
+cp config/cloud.config.json config/prod.config.json   # edit hosts, buckets, models
+export APP_CONFIG_FILE=config/prod.config.json
+export LLM_API_KEY=… QDRANT_API_KEY=… DB_PASSWORD=… S3_ACCESS_KEY_ID=… S3_SECRET_ACCESS_KEY=… REDIS_PASSWORD=… TURN_PASSWORD=…
+docker compose -f infra/docker-compose.yml --profile full up -d
+```
+
+Frontend: set one variable, `BACKEND_URL` (e.g. `https://api.gibberlink.example.com`). It is read at runtime, so the same frontend image works for any environment. Everything else the UI needs (languages, voice on/off, auth client id) comes from the backend's `GET /api/config/public`, built from the `client` and `auth` sections.
+
+## Provider status
+
+What the POC builds vs. what stays a placeholder. (No application code exists yet — see `docs/DESIGN.md` §10 for build phases.)
+
+| Capability | Built in this POC | Placeholder (raises NotImplementedError) |
+|---|---|---|
+| llm | `ollama` | `openai_compatible` |
+| embeddings | `bge_m3` (mps / cuda / cpu) | — |
+| reranker | `bge_reranker` (mps / cuda / cpu) | — |
+| vector_store | `qdrant` (local or remote URL + api_key) | — |
+| metadata_db | `sqlite` | `postgres` |
+| object_store | `filesystem` | `s3` |
+| ingestion | `docling` | — |
+| stt | `mlx_whisper` (macOS), `faster_whisper` (cpu / cuda) | — |
+| vad | `silero` | — |
+| tts | `kokoro` | — |
+| audio_transport | `websocket` | `webrtc` |
+| auth | `none` | `oidc` |
+| job_queue / session_store / event_bus | `in_process` / `in_memory` | `redis` |
+| observability | `none` | `prometheus`, `otlp` |
+| tools.web_search | `searxng` (local; off until phase 8) | `search_api` (production) |
+
+So `cloud.config.json` as written would start only once the placeholder providers it names are implemented. The self-hosted pieces (Qdrant, BGE-M3, reranker, faster-whisper, Kokoro, Docling on a CUDA server) already work with config changes alone.

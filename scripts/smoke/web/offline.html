@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Browser VAD Check</title>
+  <style>
+    :root { --bg: #fafaf9; --fg: #1c1917; --muted: #78716c; --ok: #15803d; --bad: #b91c1c; --card: #fff; --line: #e7e5e4; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #1c1917; --fg: #f5f5f4; --muted: #a8a29e; --ok: #4ade80; --bad: #f87171; --card: #292524; --line: #44403c; } }
+    body { margin: 0; padding: 24px 16px; background: var(--bg); color: var(--fg); font: 15px/1.5 -apple-system, system-ui, sans-serif; }
+    main { max-width: 720px; margin: 0 auto; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin: 12px 0; }
+    .pass { color: var(--ok); } .fail { color: var(--bad); } .muted { color: var(--muted); }
+    code { font: 13px ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Smoke test 10a: browser VAD, local assets only</h1>
+  <p class="muted">Feeds a known track into the real-time VAD (Silero v5, AudioWorklet) through a virtual microphone. Every asset is served from this machine.</p>
+  <button id="run">Run test</button>
+  <div class="card" id="out">Click “Run test” (audio needs a click to start). Takes ~18 s.</div>
+</main>
+<script src="node_modules/onnxruntime-web/dist/ort.wasm.min.js"></script>
+<script src="node_modules/@ricky0123/vad-web/dist/bundle.min.js"></script>
+<script>
+const BASE = "node_modules/";
+const out = document.getElementById("out");
+const lines = [];
+const check = (name, ok, detail = "") => {
+  lines.push(`<div class="${ok ? "pass" : "fail"}">${ok ? "PASS" : "FAIL"} ${name}${detail ? ` <span class="muted">— ${detail}</span>` : ""}</div>`);
+  out.innerHTML = lines.join("");
+  return ok;
+};
+
+// Real-time path (MicVAD, Silero v5, AudioWorklet) fed by a virtual microphone that plays a known track.
+async function run() {
+  document.getElementById("run").disabled = true;
+  const results = { checks: [], events: [] };
+  try {
+    const truth = (await (await fetch("/data/smoke/audio/vad_track.json")).json()).truth_s;
+    const ctx = new AudioContext({ sampleRate: 48000 });
+    const buf = await ctx.decodeAudioData(await (await fetch("/data/smoke/audio/vad_track.wav")).arrayBuffer());
+    const dest = ctx.createMediaStreamDestination();
+    let t0 = null;
+    const at = () => (ctx.currentTime - t0);
+
+    const tl = performance.now();
+    const myvad = await vad.MicVAD.new({
+      model: "v5",
+      audioContext: ctx,
+      baseAssetPath: new URL(BASE + "@ricky0123/vad-web/dist/", location.href).href,
+      onnxWASMBasePath: new URL(BASE + "onnxruntime-web/dist/", location.href).href,
+      getStream: async () => dest.stream,
+      pauseStream: async () => {},
+      resumeStream: async () => dest.stream,
+      startOnLoad: false,
+      positiveSpeechThreshold: 0.5,
+      negativeSpeechThreshold: 0.35,
+      redemptionMs: 600,
+      minSpeechMs: 250,
+      preSpeechPadMs: 30,
+      onSpeechStart: () => results.events.push(["start", at()]),
+      onSpeechEnd: () => results.events.push(["end", at()]),
+      onVADMisfire: () => results.events.push(["misfire", at()]),
+    });
+    results.checks.push(check("MicVAD (v5) + ONNX runtime + worklet loaded from local files", true, `${(performance.now() - tl).toFixed(0)} ms`));
+
+    await myvad.start();
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(dest);
+    t0 = ctx.currentTime;
+    src.start(t0);
+    out.insertAdjacentHTML("beforeend", `<div class="muted">playing ${buf.duration.toFixed(1)} s track into the VAD…</div>`);
+    await new Promise(r => { src.onended = r; });
+    await new Promise(r => setTimeout(r, 1500));
+    await myvad.pause?.();
+
+    const starts = results.events.filter(e => e[0] === "start").map(e => e[1]);
+    const ends = results.events.filter(e => e[0] === "end").map(e => e[1]);
+    results.checks.push(check("3 turns: 3 starts + 3 ends", starts.length === 3 && ends.length === 3,
+      results.events.map(([k, t]) => `${k} ${t.toFixed(2)}s`).join(", ") + ` · truth ${truth.map(([s, e]) => `${s.toFixed(2)}–${e.toFixed(2)}`).join(", ")}`));
+    if (starts.length === 3 && ends.length === 3) {
+      const sd = starts.map((s, i) => s - truth[i][0]);
+      const ed = ends.map((e, i) => e - truth[i][1]);
+      results.startDelays = sd; results.endDelays = ed;
+      results.checks.push(check("speech-start fires within 200 ms (barge-in trigger)", Math.max(...sd) < 0.2, sd.map(d => `${(d * 1000).toFixed(0)} ms`).join(", ")));
+      results.checks.push(check("end-of-turn fires within 1.2 s", Math.max(...ed) < 1.2, ed.map(d => `${(d * 1000).toFixed(0)} ms`).join(", ")));
+    }
+    const remote = performance.getEntriesByType("resource").map(r => r.name).filter(u => new URL(u).hostname !== location.hostname);
+    results.remote = remote;
+    results.checks.push(check("no network requests outside this machine", remote.length === 0, remote.join(", ") || `${performance.getEntriesByType("resource").length} local requests`));
+  } catch (err) {
+    results.error = String(err && err.stack || err);
+    results.checks.push(check("ran without error", false, results.error));
+  }
+  results.passed = results.checks.filter(Boolean).length;
+  results.total = results.checks.length;
+  window.__smoke = results;
+}
+document.getElementById("run").addEventListener("click", run);
+</script>
+</body>
+</html>

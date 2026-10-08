@@ -1,0 +1,185 @@
+{
+  "profile": "cloud",
+  "strict_offline": false,
+
+  "app": {
+    "name": "poc_gibberlink",
+    "environment": "production",
+    "log_level": "INFO",
+    "log_format": "json",
+    "data_dir": "/var/lib/gibberlink"
+  },
+
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "public_base_url": "https://api.gibberlink.example.com",
+    "cors_allowed_origins": ["https://gibberlink.example.com"],
+    "trusted_proxy_ips": ["10.0.0.0/8"],
+    "max_upload_mb": 50,
+    "request_timeout_s": 120
+  },
+
+  "auth": {
+    "provider": "oidc",
+    "issuer_url": "https://auth.example.com/realms/gibberlink",
+    "audience": "gibberlink-api",
+    "client_id": "gibberlink-web",
+    "jwks_url": "https://auth.example.com/realms/gibberlink/protocol/openid-connect/certs"
+  },
+
+  "client": {
+    "app_title": "Document Voice Agent",
+    "languages": ["en", "hi"],
+    "default_language": "en",
+    "voice_enabled": true,
+    "show_debug_panel": false
+  },
+
+  "llm": {
+    "provider": "openai_compatible",
+    "base_url": "https://llm.internal.example.com/v1",
+    "api_key": "${LLM_API_KEY}",
+    "chat_model": "qwen3-4b-instruct",
+    "router_model": "qwen3-4b-instruct",
+    "think": false,
+    "num_ctx": 8192,
+    "keep_alive": null,
+    "timeout_s": 60,
+    "temperature": { "router": 0.0, "answer": 0.3 }
+  },
+
+  "embeddings": {
+    "provider": "bge_m3",
+    "model": "BAAI/bge-m3",
+    "device": "cuda",
+    "fp16": true,
+    "batch_size": 64,
+    "base_url": null,
+    "api_key": null
+  },
+
+  "reranker": {
+    "provider": "bge_reranker",
+    "model": "BAAI/bge-reranker-v2-m3",
+    "device": "cuda",
+    "fp16": true,
+    "base_url": null,
+    "api_key": null
+  },
+
+  "vector_store": {
+    "provider": "qdrant",
+    "url": "https://qdrant.example.com:6333",
+    "api_key": "${QDRANT_API_KEY}",
+    "collection": "chunks_v1",
+    "prefer_grpc": true,
+    "timeout_s": 10
+  },
+
+  "metadata_db": {
+    "provider": "postgres",
+    "url": "postgresql+asyncpg://gibberlink:${DB_PASSWORD}@db.example.com:5432/gibberlink",
+    "pool_size": 10
+  },
+
+  "object_store": {
+    "provider": "s3",
+    "root": null,
+    "bucket": "gibberlink-uploads",
+    "region": "ap-south-1",
+    "endpoint_url": null,
+    "access_key_id": "${S3_ACCESS_KEY_ID}",
+    "secret_access_key": "${S3_SECRET_ACCESS_KEY}"
+  },
+
+  "ingestion": {
+    "provider": "docling",
+    "artifacts_path": "/var/lib/gibberlink/models/docling",
+    "ocr": true,
+    "ocr_engine": "auto",
+    "max_pages": 500,
+    "allowed_extensions": [".pdf", ".docx", ".pptx", ".txt", ".md"],
+    "chunking": { "version": "v1", "target_tokens": 500, "overlap_tokens": 80 }
+  },
+
+  "retrieval": {
+    "prefetch_k": 20,
+    "fusion": "rrf",
+    "rerank_top_n": 5,
+    "min_rerank_score": 0.3,
+    "context_token_budget": 3000
+  },
+
+  "stt": {
+    "provider": "faster_whisper",
+    "model": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+    "device": "cuda",
+    "compute_type": "float16",
+    "languages": ["en", "hi"],
+    "base_url": null,
+    "api_key": null
+  },
+
+  "vad": {
+    "provider": "silero",
+    "threshold": 0.5,
+    "min_speech_ms": 250,
+    "end_of_turn_ms": 600
+  },
+
+  "tts": {
+    "provider": "kokoro",
+    "model": "hexgrad/Kokoro-82M",
+    "device": "cuda",
+    "voices": { "en": "af_heart", "hi": "hf_alpha" },
+    "sample_rate": 24000,
+    "base_url": null,
+    "api_key": null
+  },
+
+  "voice": {
+    "max_spoken_sentences": 3,
+    "barge_in": {
+      "duck_volume": 0.2,
+      "backchannel_max_words": 2,
+      "decision_timeout_ms": 700
+    }
+  },
+
+  "audio_transport": {
+    "provider": "webrtc",
+    "input_sample_rate": 16000,
+    "ice_servers": [
+      { "urls": ["stun:stun.example.com:3478"] },
+      { "urls": ["turn:turn.example.com:3478"], "username": "gibberlink", "credential": "${TURN_PASSWORD}" }
+    ]
+  },
+
+  "tools": {
+    "web_search": {
+      "enabled": true,
+      "provider": "search_api",
+      "url": "https://api.search-vendor.example.com/v1/search",
+      "api_key": "${WEB_SEARCH_API_KEY}",
+      "max_results": 5,
+      "timeout_s": 8,
+      "stream_partial_results": true
+    }
+  },
+  "strict_offline_exceptions": [],
+
+  "job_queue": { "provider": "redis", "url": "rediss://:${REDIS_PASSWORD}@redis.example.com:6380/0", "concurrency": 4 },
+  "session_store": { "provider": "redis", "url": "rediss://:${REDIS_PASSWORD}@redis.example.com:6380/1", "ttl_s": 86400 },
+  "event_bus": { "provider": "redis", "url": "rediss://:${REDIS_PASSWORD}@redis.example.com:6380/2" },
+
+  "model_cache": {
+    "hf_home": "/var/lib/gibberlink/models/huggingface"
+  },
+
+  "observability": {
+    "metrics": "prometheus",
+    "tracing": "otlp",
+    "otlp_endpoint": "https://otel.example.com:4317"
+  }
+}

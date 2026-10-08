@@ -1,0 +1,27 @@
+# Local infrastructure for poc_gibberlink.
+# Only Qdrant runs in Docker: Docker on macOS has no Metal GPU access, so
+# Ollama, the backend and the ML models run natively on the host.
+#
+#   docker compose -f infra/docker-compose.yml up -d qdrant
+
+name: poc_gibberlink
+
+services:
+  qdrant:
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.19.2}
+    container_name: gibberlink-qdrant
+    ports:
+      # Bound to loopback only; never exposed to the network.
+      - "127.0.0.1:6333:6333" # REST
+      - "127.0.0.1:6334:6334" # gRPC
+    volumes:
+      - ../data/qdrant:/qdrant/storage
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    mem_limit: 1g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12

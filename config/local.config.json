@@ -1,0 +1,182 @@
+{
+  "profile": "local",
+  "strict_offline": true,
+
+  "app": {
+    "name": "poc_gibberlink",
+    "environment": "development",
+    "log_level": "INFO",
+    "log_format": "console",
+    "data_dir": "data"
+  },
+
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "public_base_url": "http://localhost:8000",
+    "cors_allowed_origins": ["http://localhost:3000"],
+    "trusted_proxy_ips": [],
+    "max_upload_mb": 50,
+    "request_timeout_s": 120
+  },
+
+  "auth": {
+    "provider": "none",
+    "issuer_url": null,
+    "audience": null,
+    "client_id": null,
+    "jwks_url": null
+  },
+
+  "client": {
+    "app_title": "Document Voice Agent",
+    "languages": ["en", "hi"],
+    "default_language": "en",
+    "voice_enabled": true,
+    "show_debug_panel": true
+  },
+
+  "llm": {
+    "provider": "ollama",
+    "base_url": "http://127.0.0.1:11434",
+    "api_key": null,
+    "chat_model": "qwen3:4b-instruct",
+    "router_model": "qwen3:4b-instruct",
+    "think": false,
+    "num_ctx": 8192,
+    "keep_alive": "30m",
+    "timeout_s": 60,
+    "temperature": { "router": 0.0, "answer": 0.3 }
+  },
+
+  "embeddings": {
+    "provider": "bge_m3",
+    "model": "BAAI/bge-m3",
+    "device": "mps",
+    "fp16": true,
+    "batch_size": 16,
+    "base_url": null,
+    "api_key": null
+  },
+
+  "reranker": {
+    "provider": "bge_reranker",
+    "model": "BAAI/bge-reranker-v2-m3",
+    "device": "mps",
+    "fp16": true,
+    "base_url": null,
+    "api_key": null
+  },
+
+  "vector_store": {
+    "provider": "qdrant",
+    "url": "http://127.0.0.1:6333",
+    "api_key": null,
+    "collection": "chunks_v1",
+    "prefer_grpc": false,
+    "timeout_s": 10
+  },
+
+  "metadata_db": {
+    "provider": "sqlite",
+    "url": "sqlite+aiosqlite:///data/sqlite/app.db",
+    "pool_size": null
+  },
+
+  "object_store": {
+    "provider": "filesystem",
+    "root": "data/uploads",
+    "bucket": null,
+    "region": null,
+    "endpoint_url": null,
+    "access_key_id": null,
+    "secret_access_key": null
+  },
+
+  "ingestion": {
+    "provider": "docling",
+    "artifacts_path": "data/models/docling",
+    "ocr": true,
+    "ocr_engine": "auto",
+    "max_pages": 500,
+    "allowed_extensions": [".pdf", ".docx", ".pptx", ".txt", ".md"],
+    "chunking": { "version": "v1", "target_tokens": 500, "overlap_tokens": 80 }
+  },
+
+  "retrieval": {
+    "prefetch_k": 20,
+    "fusion": "rrf",
+    "rerank_top_n": 5,
+    "min_rerank_score": 0.3,
+    "context_token_budget": 3000
+  },
+
+  "stt": {
+    "provider": "mlx_whisper",
+    "model": "mlx-community/whisper-small-mlx",
+    "device": "gpu",
+    "compute_type": null,
+    "languages": ["en", "hi"],
+    "base_url": null,
+    "api_key": null
+  },
+
+  "vad": {
+    "provider": "silero",
+    "threshold": 0.5,
+    "min_speech_ms": 250,
+    "end_of_turn_ms": 600
+  },
+
+  "tts": {
+    "provider": "kokoro",
+    "model": "hexgrad/Kokoro-82M",
+    "device": "cpu",
+    "voices": { "en": "af_heart", "hi": "hf_alpha" },
+    "sample_rate": 24000,
+    "base_url": null,
+    "api_key": null
+  },
+
+  "voice": {
+    "max_spoken_sentences": 3,
+    "barge_in": {
+      "duck_volume": 0.2,
+      "backchannel_max_words": 2,
+      "decision_timeout_ms": 700
+    }
+  },
+
+  "audio_transport": {
+    "provider": "websocket",
+    "input_sample_rate": 16000,
+    "ice_servers": []
+  },
+
+  "tools": {
+    "web_search": {
+      "enabled": false,
+      "provider": "searxng",
+      "url": "http://127.0.0.1:8888",
+      "api_key": null,
+      "max_results": 5,
+      "timeout_s": 8,
+      "stream_partial_results": true
+    }
+  },
+  "strict_offline_exceptions": [],
+
+  "job_queue": { "provider": "in_process", "url": null, "concurrency": 1 },
+  "session_store": { "provider": "in_memory", "url": null, "ttl_s": 86400 },
+  "event_bus": { "provider": "in_process", "url": null },
+
+  "model_cache": {
+    "hf_home": "data/models/huggingface"
+  },
+
+  "observability": {
+    "metrics": "none",
+    "tracing": "none",
+    "otlp_endpoint": null
+  }
+}

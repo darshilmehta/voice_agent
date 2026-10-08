@@ -1,0 +1,21 @@
+{
+  "_note": "Ground-truth sentences for TTS (09) and STT (06-07). Clips are generated into data/smoke/audio/.",
+  "en": [
+    "What was the company's revenue in fiscal year twenty twenty four?",
+    "No wait, I meant the EBITDA margin, not the revenue.",
+    "Can you summarize the termination clause in simple words?",
+    "Okay, let's go back to the annual report.",
+    "How many employees did the company have at the end of the year?"
+  ],
+  "hi": [
+    "कंपनी का पिछले साल का मुनाफा कितना था?",
+    "रुको, मैं राजस्व के बारे में पूछ रहा था।",
+    "अनुबंध की समाप्ति की शर्तें आसान भाषा में बताइए।",
+    "चलो, अब वापस रिपोर्ट पर चलते हैं।",
+    "कंपनी ने कार्बन उत्सर्जन कितना कम किया?"
+  ],
+  "voices": {
+    "kokoro": {"en": "af_heart", "hi": "hf_alpha"},
+    "macos_say": {"en": "Rishi", "hi": "Lekha"}
+  }
+}
