@@ -22,7 +22,7 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0  # exact tag: setup-uv publishes no moving major tag
         with:
           enable-cache: true
           cache-dependency-glob: backend/uv.lock
