@@ -1,6 +1,38 @@
+# Local data: models, uploads, databases, vector storage, smoke-test outputs
 data/
+
+# Secrets and local overrides (config/*.config.json templates are tracked)
+.env
+.env.*
+!.env.example
+config/*.local.json
+config/prod.config.json
+
+# Python
 .venv/
 __pycache__/
-.env
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Node / Next.js
 node_modules/
 .next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Editors, OS, local tool state
+.DS_Store
+.idea/
+.vscode/
+.claude/

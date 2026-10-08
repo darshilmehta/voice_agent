@@ -600,11 +600,10 @@ Also: onnxruntime threads abort during Python shutdown on macOS (`libc++abi … 
 
 Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first audio (2 of 3 runs favour MPS). Config stays `cpu` to keep GPU memory for the LLM; revisit when tuning latency (MPS costs ~0.56 GB).
 
-### Setup notes for this machine
+### Setup notes
 
 - Ollama runs as a brew service (`brew services start ollama`), bound to `127.0.0.1:11434`.
-- Docker Desktop memory set to 1.5 GB (`MemoryMiB: 1536` in `~/Library/Group Containers/group.com.docker/settings-store.json`; backup alongside).
-- The home router's DNS (`192.168.0.1`) stopped resolving during downloads; `1.1.1.1` / `8.8.8.8` were added as fallbacks. Irrelevant once everything is downloaded.
+- Docker Desktop memory is capped at 1.5 GB (Settings → Resources); only Qdrant runs in Docker.
 - Before going offline: install spaCy `en_core_web_sm` into the backend env (Kokoro's `misaki` otherwise fetches it at first run).
 
 ---
