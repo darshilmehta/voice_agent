@@ -7,13 +7,16 @@ cancellation then fires again at every await. The first test reproduces exactly 
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+
 import anyio
 import pytest
 
 from app.api.chats import sse
 from app.providers.retrieval import IndexedChunk
 from app.services.base import InvalidInput
-from app.services.chat_turns import ChatTurnService, DeltaEvent, wait_for_background
+from app.services.chat_turns import AnswerStop, ChatTurnService, DeltaEvent, wait_for_background
 from app.services.chats import ChatService
 from app.services.messages import MessageService
 from app.services.projects import ProjectService
@@ -155,3 +158,62 @@ async def test_voice_turns_and_answer_length_are_parameters_of_the_service(setup
     assert ANSWER_LENGTHS["full"].instruction in full_call["messages"][0].content
     with pytest.raises(InvalidInput, match="length"):
         await pipeline.begin(chat_id, "hi", length="essay")  # type: ignore[arg-type]
+
+
+# ------------------------------------------------------------------ voice: what was heard
+
+
+async def _stop_after(pipeline, turn, stop, *, deltas: int) -> None:
+    """Consume the turn until ``deltas`` deltas arrived (0: right after the user message), then cancel it."""
+    seen = 0
+
+    async def consume() -> None:
+        nonlocal seen
+        async with contextlib.aclosing(pipeline.run(turn, stop=stop)) as events:
+            async for event in events:
+                seen += event.name == "delta"
+                if event.name == ("delta" if deltas else "user_message") and seen >= deltas:
+                    started.set()
+
+    started = asyncio.Event()
+    task = asyncio.create_task(consume())
+    await started.wait()
+    task.cancel()
+    await asyncio.wait([task])
+
+
+async def test_a_stopped_voice_answer_is_saved_with_what_was_heard(setup, db, fakes):
+    pipeline, chat_id = setup
+    turn = await pipeline.begin(chat_id, "What was the EBITDA margin in FY24?", modality="voice")
+    stop = AnswerStop()
+    stop.heard_text, stop.reason = "Margin", "barge_in"
+    await _stop_after(pipeline, turn, stop, deltas=3)
+    assert stop.saved is not None and stop.user is not None and stop.completed is None
+    user, agent = await transcript(db, chat_id)
+    assert stop.user == user and stop.saved == agent
+    assert agent.text == "Margin 18.2% [S1]" and agent.heard_text == "Margin" and agent.interrupted
+    assert agent.route["stopped"] is True and agent.route["interrupted"] == "barge_in"
+
+
+async def test_a_voice_answer_stopped_before_any_text_is_saved_empty(setup, db, fakes):
+    pipeline, chat_id = setup
+    fakes.llm.hold_after = 0  # still "thinking"
+    turn = await pipeline.begin(chat_id, "What was the EBITDA margin in FY24?", modality="voice")
+    stop = AnswerStop(heard_text="", reason="stop")
+    await _stop_after(pipeline, turn, stop, deltas=0)
+    _, agent = await transcript(db, chat_id)
+    assert stop.saved == agent and (agent.text, agent.heard_text, agent.citations) == ("", "", [])
+    assert agent.route["stopped"] is True and agent.route["interrupted"] == "stop"
+    assert agent.latency["first_delta_ms"] is None and agent.latency["llm_ms"] is None  # stopped before retrieval
+
+
+async def test_voice_spoken_language_and_stt_timings_are_saved_on_the_user_message(setup, db, fakes):
+    pipeline, chat_id = setup
+    fakes.llm.delay = 0.0
+    stt = {"speech_ms": 2100, "stt_ms": 410.5, "speculative_stt": True}
+    turn = await pipeline.begin(
+        chat_id, "kya EBITDA margin badha?", modality="voice", language="hi", input_language="hi", input_latency=stt
+    )
+    [e async for e in pipeline.run(turn)]
+    user, agent = await transcript(db, chat_id)
+    assert (user.language, user.latency, agent.language) == ("hi", stt, "hi")  # Hinglish, spoken as Hindi

@@ -75,6 +75,21 @@ class MessageService(Service):
             )
         return Message.model_validate(message)
 
+    async def record_interruption(self, message_id: str, *, heard_text: str, reason: str) -> Message:
+        """Mark an agent answer as cut short after it was saved (voice: the user barged in or said stop while it was
+        still playing): ``heard_text`` is what was actually played; the route gets ``stopped = true`` and
+        ``interrupted = reason``."""
+        async with self.db.session() as s:
+            row = await s.get(orm.Message, message_id)
+            if row is None:
+                raise NotFound("message", message_id)
+            if row.role != "agent":
+                raise InvalidInput(f"message {message_id!r} is not an agent answer")
+            row.heard_text = heard_text
+            row.route = {**(row.route or {}), "stopped": True, "interrupted": reason}
+            await s.flush()
+            return Message.model_validate(row)
+
     async def list(
         self,
         chat_id: str,

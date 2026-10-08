@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 from collections.abc import AsyncIterator, Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,7 +22,17 @@ from app.providers.registry import build_container
 from app.providers.storage import MetadataDB, SqliteDB
 from app.settings import PROJECT_ROOT, Settings, load_settings
 
-from .fakes import FakeEmbedder, FakeLLM, FakeReranker, FakeStore, TextParser, keyword_scorer
+from .fakes import (
+    FakeEmbedder,
+    FakeLLM,
+    FakeReranker,
+    FakeStore,
+    FakeSTT,
+    FakeTTS,
+    FakeVAD,
+    TextParser,
+    keyword_scorer,
+)
 
 LOCAL_CONFIG = PROJECT_ROOT / "config/local.config.json"
 CLOUD_CONFIG = PROJECT_ROOT / "config/cloud.config.json"
@@ -203,13 +213,17 @@ def api(make_app) -> Iterator[TestClient]:
 
 @dataclass
 class Fakes:
-    """The providers an upload or a chat turn uses, replaced by in-memory fakes (no ML, Qdrant or Ollama)."""
+    """The providers an upload, a chat turn or a voice session uses, replaced by in-memory fakes (no ML, Qdrant or
+    Ollama)."""
 
     parser: TextParser
     embedder: FakeEmbedder
     reranker: FakeReranker
     store: FakeStore
     llm: FakeLLM
+    vad: FakeVAD = field(default_factory=FakeVAD)
+    stt: FakeSTT = field(default_factory=FakeSTT)
+    tts: FakeTTS = field(default_factory=FakeTTS)
 
     def install(self, container: Any) -> Any:
         container.providers.update(
@@ -218,6 +232,9 @@ class Fakes:
             reranker=self.reranker,
             vector_store=self.store,
             llm=self.llm,
+            vad=self.vad,
+            stt=self.stt,
+            tts=self.tts,
         )
         return container
 

@@ -18,7 +18,9 @@ The user message stays saved when a later stage fails; a failed answer is not sa
 barge-in), cancel the task consuming the events or ``await events.aclose()``: generation is cancelled (the LLM stream
 is closed) and the text generated so far is saved with ``route.stopped = true``, citing only what that text cites;
 nothing is saved if no text was generated yet. Every saved agent message's ``route`` carries top-level ``abstained``
-and ``stopped`` booleans.
+and ``stopped`` booleans. A caller that knows what the user actually heard of the answer (the voice session, §3.3 c)
+passes an ``AnswerStop`` to ``run``: the stopped answer is saved with that ``heard_text`` and ``route.interrupted``
+(the reason), and the saved message is handed back on it.
 """
 
 from __future__ import annotations
@@ -61,11 +63,14 @@ HISTORY_CHARS = 1000  # per message
 
 Stage = Literal["retrieval", "llm", "storage"]
 
-# Saves of stopped answers run as their own tasks (a cancelled request can't interrupt them); keep them referenced.
+# Saves of stopped answers (and voice session clean-ups) run as their own tasks, so a cancelled request can't interrupt
+# them; keep them referenced.
 _BACKGROUND: set[asyncio.Task[Any]] = set()
 
 
-def _detach(coro: Any) -> asyncio.Task[Any]:
+def detach(coro: Any) -> asyncio.Task[Any]:
+    """Run ``coro`` as its own task that the caller's cancellation can't interrupt (await it with asyncio.shield).
+    Needed under anyio cancel scopes, whose cancellation fires again at every await of the cancelled task."""
     task = asyncio.ensure_future(coro)
     _BACKGROUND.add(task)
     task.add_done_callback(_BACKGROUND.discard)
@@ -73,9 +78,10 @@ def _detach(coro: Any) -> asyncio.Task[Any]:
 
 
 async def wait_for_background() -> None:
-    """Wait for pending saves of stopped answers (tests, shutdown)."""
-    while _BACKGROUND:
-        await asyncio.gather(*list(_BACKGROUND), return_exceptions=True)
+    """Wait for pending saves of stopped answers and session clean-ups of this event loop (tests, shutdown)."""
+    loop = asyncio.get_running_loop()
+    while pending := [t for t in _BACKGROUND if t.get_loop() is loop and not t.done()]:
+        await asyncio.wait(pending)
 
 
 # ------------------------------------------------------------------ events
@@ -170,6 +176,31 @@ class Turn:
     requested_language: Language | None
     modality: Modality = "text"
     length: AnswerLength = "short"
+    input_language: Language | None = None  # the language the user spoke (STT); None: read from the text's script
+    input_latency: dict[str, Any] | None = None  # saved as the user message's latency (voice: VAD and STT timings)
+
+
+InterruptReason = Literal["barge_in", "stop"]
+
+
+@dataclass(eq=False)
+class AnswerStop:
+    """Lets a caller that cuts an answer short (voice: barge-in or stop, §3.3 c) record what the user heard of it.
+
+    Set ``heard_text`` and ``reason`` before cancelling the consumer of ``run``. The stopped answer is then saved with
+    ``heard_text`` and ``route.interrupted = reason`` (with the text generated so far, which may be empty: a stopped
+    voice turn always ends with an agent message), and once the cancelled consumer has finished:
+
+    - ``saved`` is that message (None if the save failed or the answer had already been saved complete);
+    - ``completed`` is the complete answer when it was saved before the stop took effect;
+    - ``user`` is the turn's user message (set as soon as it is saved), even if its event was never consumed.
+    """
+
+    heard_text: str | None = None
+    reason: InterruptReason | None = None
+    saved: Message | None = None
+    completed: Message | None = None
+    user: Message | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +213,23 @@ class TurnPlan:
     intent: Literal["document_qa"] = "document_qa"
     needs_retrieval: bool = True
     query_en: str | None = None
+
+
+@dataclass
+class _Progress:
+    """How far a turn's answer got, so a stopped answer can be saved with what it had."""
+
+    plan: TurnPlan
+    result: RetrievalResult | None = None
+    sources: list[Source] = field(default_factory=list)
+    parts: list[str] = field(default_factory=list)  # answer text so far
+    abstained: bool = False
+    reason: AbstainReason | None = None
+    retrieval_ms: float | None = None
+    first_delta_ms: float | None = None
+    llm_start: float | None = None
+    saving: bool = False  # the complete answer is being saved: a stop must not save a second copy
+    final: Message | None = None  # the complete answer, saved
 
 
 class TurnRouter(Protocol):
@@ -253,10 +301,13 @@ class ChatTurnService:
         language: Language | None = None,
         modality: Modality = "text",
         length: AnswerLength = "short",
+        input_language: Language | None = None,
+        input_latency: dict[str, Any] | None = None,
     ) -> Turn:
         """Check the chat and the message before any event is produced (unknown chat → NotFound, bad text →
         InvalidInput). ``language`` forces the answer language (else the message's script decides); ``modality`` is
-        recorded on both messages; ``length`` sets the answer style and token cap."""
+        recorded on both messages; ``length`` sets the answer style and token cap. Voice turns pass the spoken
+        language (``input_language``, saved on the user message) and the STT timings (``input_latency``)."""
         chat = await self.chats.get(chat_id)
         text = text.strip()
         if not text:
@@ -266,9 +317,11 @@ class ChatTurnService:
         if length not in ANSWER_LENGTHS:
             raise InvalidInput(f"length must be one of {', '.join(ANSWER_LENGTHS)}")
         fallback: Language = chat.language if chat.language in ("en", "hi") else self.settings.client.default_language  # type: ignore[assignment]
-        return Turn(chat, text, choose_language(text, language, fallback), language, modality, length)
+        language_ = choose_language(text, language, fallback)
+        return Turn(chat, text, language_, language, modality, length, input_language, input_latency)
 
-    async def run(self, turn: Turn) -> AsyncGenerator[ChatEvent, None]:
+    async def run(self, turn: Turn, *, stop: AnswerStop | None = None) -> AsyncGenerator[ChatEvent, None]:
+        """The turn's events. ``stop``: see ``AnswerStop`` (callers that know what was heard of a stopped answer)."""
         clock = _Clock()
         chat = turn.chat
         try:
@@ -277,16 +330,42 @@ class ChatTurnService:
                 role="user",
                 text=turn.text,
                 modality=turn.modality,
-                language=message_language(turn.text) or turn.language,
+                language=turn.input_language or message_language(turn.text) or turn.language,
+                latency=turn.input_latency,
             )
             history = await self._history(chat.id, before=user.seq)
         except Exception as e:
             log.exception("chat %s: saving the user message failed", chat.id)
             yield ErrorEvent("storage", f"could not save the message: {_describe(e)}")
             return
-        yield UserMessageEvent(user)
+        if stop is not None:
+            stop.user = user
+        p = _Progress(TurnPlan(query=turn.text, language=turn.language))
+        try:
+            yield UserMessageEvent(user)
+            async with contextlib.aclosing(self._answer(turn, history, clock, p)) as answer:
+                async for event in answer:
+                    yield event
+        except (asyncio.CancelledError, GeneratorExit):
+            # Stopped (client gone, barge-in, "stop"): keep what was generated. The save runs as its own task, so a
+            # consumer whose cancellation keeps re-firing (anyio cancel scopes) can't interrupt it; this frame waits if
+            # it can. A caller passing ``stop`` (voice) always gets a saved answer, even an empty one.
+            if p.final is not None:
+                if stop is not None:
+                    stop.completed = p.final
+            elif not p.saving and (p.parts or stop is not None):
+                save = detach(self._save_stopped(turn, p, clock, stop))
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(save)
+            raise
 
-        plan = await self.router.plan(turn, history)
+    async def _answer(
+        self, turn: Turn, history: Sequence[Message], clock: _Clock, p: _Progress
+    ) -> AsyncGenerator[ChatEvent, None]:
+        """Everything after the user message, recording its progress in ``p`` so that ``run`` can save a stopped
+        answer. ``run`` closes this generator when it is closed, which closes the LLM stream (stops generation)."""
+        chat = turn.chat
+        plan = p.plan = await self.router.plan(turn, history)
         try:
             ready = await self.documents.ready_documents(chat.project_id, chat.document_scope)
             result = (
@@ -300,63 +379,54 @@ class ChatTurnService:
             log.warning("chat %s: retrieval failed: %s", chat.id, _describe(e))
             yield ErrorEvent("retrieval", f"document search failed: {_describe(e)}")
             return
-        retrieval_ms = clock.ms()
+        p.result = result
+        retrieval_ms = p.retrieval_ms = clock.ms()
         confidence = result.confidence if result is not None else None
 
         if confidence is None or not confidence.above_threshold:
             reason: AbstainReason = "no_documents" if not ready else "not_covered"
+            p.abstained, p.reason = True, reason
             yield SourcesEvent([], confidence, abstained=True)
             answer = abstention(plan.language, reason)
+            p.parts.append(answer)
             yield DeltaEvent(answer)
             route = self._route(turn, plan, result, abstained=True, reason=reason, sources=0)
             latency = self._latency(clock, result, retrieval_ms, first_delta_ms=clock.ms(), llm_ms=None)
-            async for event in self._save_answer(turn, plan, answer, [], route, latency):
+            async for event in self._save_answer(turn, plan, answer, [], route, latency, p):
                 yield event
             return
 
         assert result is not None
-        sources = build_sources(result.chunks, ready, budget_tokens=self.settings.retrieval.context_token_budget)
+        sources = p.sources = build_sources(
+            result.chunks, ready, budget_tokens=self.settings.retrieval.context_token_budget
+        )
         yield SourcesEvent([s.citation() for s in sources], confidence, abstained=False)
 
-        parts: list[str] = []
-        first_delta_ms: float | None = None
-        llm_start = time.perf_counter()
+        p.llm_start = time.perf_counter()
         prompt = self._prompt(turn, plan, history, sources)
         stream = self.llm.stream(prompt, max_tokens=ANSWER_LENGTHS[turn.length].max_tokens)
         try:
             async with contextlib.aclosing(stream):  # type: ignore[type-var]  (closing the stream stops generation)
                 async for piece in stream:
-                    if first_delta_ms is None:
-                        first_delta_ms = clock.ms()
-                    parts.append(piece)
+                    if p.first_delta_ms is None:
+                        p.first_delta_ms = clock.ms()
+                    p.parts.append(piece)
                     yield DeltaEvent(piece)
-        except (asyncio.CancelledError, GeneratorExit):
-            # Stopped (client gone, barge-in): keep what was generated. The save runs as its own task, so a consumer
-            # whose cancellation keeps re-firing (anyio cancel scopes) can't interrupt it; this frame waits if it can.
-            if parts:
-                route = self._route(
-                    turn, plan, result, abstained=False, reason=None, sources=len(sources), stopped=True
-                )
-                latency = self._latency(
-                    clock, result, retrieval_ms, first_delta_ms=first_delta_ms, llm_ms=clock.ms(llm_start)
-                )
-                save = _detach(self._save_stopped(turn, plan, "".join(parts), sources, route, latency))
-                with contextlib.suppress(BaseException):
-                    await asyncio.shield(save)
-            raise
-        except Exception as e:
+        except Exception as e:  # cancellation (BaseException) goes to run's handler
             log.warning("chat %s: answer generation failed: %s", chat.id, _describe(e))
             yield ErrorEvent("llm", f"answer generation failed: {_describe(e)}")
             return
-        answer, citations = finalize_answer("".join(parts), sources)
+        answer, citations = finalize_answer("".join(p.parts), sources)
         if not answer:
             yield ErrorEvent("llm", "the model returned an empty answer")
             return
         if not citations:
             log.info("chat %s: answer cites no source", chat.id)
         route = self._route(turn, plan, result, abstained=False, reason=None, sources=len(sources))
-        latency = self._latency(clock, result, retrieval_ms, first_delta_ms=first_delta_ms, llm_ms=clock.ms(llm_start))
-        async for event in self._save_answer(turn, plan, answer, citations, route, latency):
+        latency = self._latency(
+            clock, result, retrieval_ms, first_delta_ms=p.first_delta_ms, llm_ms=clock.ms(p.llm_start)
+        )
+        async for event in self._save_answer(turn, plan, answer, citations, route, latency, p):
             yield event
 
     # -------------------------------------------------------------- helpers
@@ -408,7 +478,7 @@ class ChatTurnService:
     def _latency(
         clock: _Clock,
         result: RetrievalResult | None,
-        retrieval_ms: float,
+        retrieval_ms: float | None,
         *,
         first_delta_ms: float | None,
         llm_ms: float | None,
@@ -432,7 +502,9 @@ class ChatTurnService:
         citations: list[Citation],
         route: dict[str, Any],
         latency: dict[str, Any],
+        p: _Progress,
     ) -> AsyncGenerator[ChatEvent, None]:
+        p.saving = True  # from here on a stop must not save a second copy
         try:
             agent = await self.messages.append(
                 turn.chat.id,
@@ -448,29 +520,31 @@ class ChatTurnService:
             log.exception("chat %s: saving the answer failed", turn.chat.id)
             yield ErrorEvent("storage", f"could not save the answer: {_describe(e)}")
             return
+        p.final = agent
         yield AgentMessageEvent(agent)
 
-    async def _save_stopped(
-        self,
-        turn: Turn,
-        plan: TurnPlan,
-        partial: str,
-        sources: Sequence[Source],
-        route: dict[str, Any],
-        latency: dict[str, Any],
-    ) -> None:
+    async def _save_stopped(self, turn: Turn, p: _Progress, clock: _Clock, stop: AnswerStop | None) -> None:
         """Save an answer that was stopped: the text generated so far (a marker cut in half dropped), citing only the
-        sources that text cites. Nothing is saved when no text remains."""
-        text, citations = finalize_answer(trim_open_marker(partial), sources)
-        if not text:
+        sources that text cites, with what was heard of it when the caller knows (``stop``). Without ``stop``,
+        nothing is saved when no text remains; with it (voice) an empty answer is saved, so the turn is closed."""
+        text, citations = finalize_answer(trim_open_marker("".join(p.parts)), p.sources)
+        if not text and stop is None:
             return
+        route = self._route(
+            turn, p.plan, p.result, abstained=p.abstained, reason=p.reason, sources=len(p.sources), stopped=True
+        )
+        if stop is not None and stop.reason is not None:
+            route["interrupted"] = stop.reason
+        llm_ms = clock.ms(p.llm_start) if p.llm_start is not None else None
+        latency = self._latency(clock, p.result, p.retrieval_ms, first_delta_ms=p.first_delta_ms, llm_ms=llm_ms)
         try:
-            await self.messages.append(
+            message = await self.messages.append(
                 turn.chat.id,
                 role="agent",
                 text=text,
                 modality=turn.modality,
-                language=plan.language,
+                heard_text=stop.heard_text if stop is not None else None,
+                language=p.plan.language,
                 citations=citations,
                 route=route,
                 latency=latency,
@@ -478,4 +552,6 @@ class ChatTurnService:
         except Exception:
             log.exception("chat %s: saving the stopped answer failed", turn.chat.id)
             return
+        if stop is not None:
+            stop.saved = message
         log.info("chat %s: answer stopped after %d characters", turn.chat.id, len(text))
