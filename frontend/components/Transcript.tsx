@@ -410,6 +410,12 @@ function abstainedFlag(m: Message): boolean {
   return route.abstained === true || nested?.abstained === true;
 }
 
+/** Answers the user stopped mid-stream are saved with what was written so far and `route.stopped`. */
+function stoppedFlag(m: Message): boolean {
+  const route = m.route as Record<string, unknown> | null;
+  return route?.stopped === true;
+}
+
 function bySourceId(refs: SourceRef[]): Record<string, SourceRef> {
   const out: Record<string, SourceRef> = {};
   for (const r of refs) if (r.sourceId && !out[r.sourceId]) out[r.sourceId] = r;
@@ -517,6 +523,13 @@ const MessageItem = memo(function MessageItem({
       )}
 
       {!isUser && <SourceList sources={listed} />}
+
+      {!isUser && stoppedFlag(m) && (
+        <p className="msg-note msg-note-quiet">
+          <Icon name="stop" size={12} />
+          Stopped. The rest of this answer wasn&apos;t written.
+        </p>
+      )}
 
       {showDebug && (m.route || m.latency || live) && (
         <details className="msg-debug">
