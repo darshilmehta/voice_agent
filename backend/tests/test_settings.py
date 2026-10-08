@@ -7,7 +7,7 @@ import pytest
 
 from app.settings import ConfigError, load_settings
 
-from .conftest import CLOUD_CONFIG, CLOUD_SECRETS, LOCAL_CONFIG
+from .conftest import CLOUD_CONFIG, CLOUD_SECRETS, DOCKER_CONFIG, LOCAL_CONFIG
 
 
 def _keys(node: object, prefix: str = "") -> set[str]:
@@ -34,9 +34,14 @@ def test_cloud_config_validates_with_secrets(cloud_settings):
 
 
 def test_config_files_share_every_key():
-    local = json.loads(LOCAL_CONFIG.read_text())
-    cloud = json.loads(CLOUD_CONFIG.read_text())
-    assert _keys(local) == _keys(cloud)
+    local, cloud, docker = (json.loads(f.read_text()) for f in (LOCAL_CONFIG, CLOUD_CONFIG, DOCKER_CONFIG))
+    assert _keys(local) == _keys(cloud) == _keys(docker)
+
+
+def test_local_hosts_must_be_bare_hostnames(write_config, tmp_path):
+    bad = write_config(LOCAL_CONFIG, strict_offline_local_hosts=["http://qdrant:6333"])
+    with pytest.raises(ConfigError, match="bare hostnames"):
+        load_settings(bad, {"APP_ROOT_DIR": str(tmp_path)})
 
 
 def test_missing_secrets_are_all_reported(tmp_path):

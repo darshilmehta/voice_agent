@@ -6,6 +6,7 @@ One JSON file configures the whole backend. The frontend gets its settings from 
 |---|---|---|
 | `local.config.json` | default | Everything on this machine. Fields only clouds need are `null`. |
 | `cloud.config.json` | nothing (template) | Example server deployment with placeholder hosts (`*.example.com`) and `${VAR}` secrets. Copy it, edit it, point the app at it. |
+| `docker.config.json` | the backend container (Compose profile `full`) | The local setup inside Docker: Qdrant at `qdrant:6333`, Ollama on the host at `host.docker.internal:11434`, CPU devices, faster-whisper (mlx-whisper is macOS-only). |
 
 Both files share exactly the same keys and are validated by the same schema, so the template can't silently drift from the code (a test loads both).
 
@@ -22,9 +23,18 @@ APP_CONFIG_FILE              (default: config/local.config.json)
 ```
 
 - **Secrets never go in the file.** Use `"${VAR}"` placeholders and set the variables in the deployment environment (or a `.env` that is never committed).
-- **Top-level switches are file-only.** `profile`, `strict_offline` and `strict_offline_exceptions` can't be changed by environment variables, so the offline guard can only be turned off by editing the file.
+- **Top-level switches are file-only.** `profile`, `strict_offline`, `strict_offline_exceptions` and `strict_offline_local_hosts` can't be changed by environment variables, so the offline guard can only be relaxed by editing the file.
+- **`strict_offline_local_hosts`** lists hostnames that are on this machine without being loopback: Docker Compose service names and `host.docker.internal` (exact names only; `docker.config.json` uses `["qdrant", "host.docker.internal"]`).
 - **`ingestion.ocr_engine` must name an engine** (`rapidocr`, …). Docling's `auto` mode silently skips OCR when it finds none, so it is rejected.
 - **`strict_offline: true`** (local) makes startup fail if any provider is remote or any URL is not loopback, and forces Hugging Face offline mode. The only escape hatch is `strict_offline_exceptions` (e.g. `["web_search"]`), which allows exactly that capability to reach the network.
+
+## Running everything in Docker
+
+```bash
+docker compose -f infra/docker-compose.yml --profile full up -d --build
+```
+
+Qdrant, backend and frontend run in containers (ports published on `127.0.0.1` only); Ollama stays on the host. Models are mounted from `data/`, never baked into images. On macOS Docker has no Apple GPU, so models run on CPU: once the backend loads models (phase 1 onwards) raise Docker Desktop's memory limit accordingly (BGE-M3 alone needs about 2.3 GB on CPU) — or keep running natively, which is the recommended way on a Mac. On Linux, start Ollama with `OLLAMA_HOST=0.0.0.0` so the container can reach it.
 
 ## Deploying to a server
 

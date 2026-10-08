@@ -2,14 +2,15 @@
 
 With ``strict_offline: true`` the app must not reach anything outside this machine. Startup fails if
 any configured provider is remote or any configured URL is not loopback, unless that capability is
-listed in ``strict_offline_exceptions`` (currently only ``web_search`` may be).
+listed in ``strict_offline_exceptions`` (currently only ``web_search`` may be). Hostnames listed in
+``strict_offline_local_hosts`` (Docker Compose services, ``host.docker.internal``) count as this machine.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import os
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from typing import Any
 from urllib.parse import urlparse
 
@@ -20,8 +21,9 @@ _INBOUND_URL_FIELDS = {"server.public_base_url"}
 _URL_KEYS = ("url", "urls", "base_url", "endpoint_url", "issuer_url", "jwks_url", "otlp_endpoint")
 
 
-def is_loopback_url(url: str) -> bool:
-    """True for URLs that can only reach this machine (loopback hosts, local files, sqlite paths)."""
+def is_loopback_url(url: str, local_hosts: Collection[str] = ()) -> bool:
+    """True for URLs that can only reach this machine: loopback hosts, local files, sqlite paths, and any
+    hostname explicitly listed as local (``strict_offline_local_hosts``)."""
     parsed = urlparse(url)
     if parsed.scheme in ("file", "") or parsed.scheme.startswith("sqlite"):
         return True
@@ -31,7 +33,7 @@ def is_loopback_url(url: str) -> bool:
         host = parsed.path.split(":")[0] or None
     if host is None:
         return False
-    if host == "localhost" or host.endswith(".localhost"):
+    if host == "localhost" or host.endswith(".localhost") or host in local_hosts:
         return True
     try:
         return ipaddress.ip_address(host).is_loopback
@@ -58,17 +60,18 @@ def _url_fields(node: Any, path: str = "") -> Iterator[tuple[str, str]]:
 def offline_violations(settings: Settings, remote_capabilities: Mapping[str, str]) -> list[str]:
     """Everything that would reach the network. ``remote_capabilities`` maps capability → remote provider name."""
     excepted = set(settings.strict_offline_exceptions)
+    local_hosts = set(settings.strict_offline_local_hosts)
     web_search = settings.tools.web_search
     problems = [
         f"{cap}: provider {name!r} is remote" for cap, name in remote_capabilities.items() if cap not in excepted
     ]
     data = settings.model_dump(mode="json")
     for path, url in _url_fields(data):
-        if path in _INBOUND_URL_FIELDS or is_loopback_url(url):
+        if path in _INBOUND_URL_FIELDS or is_loopback_url(url, local_hosts):
             continue
         if path.startswith("tools.web_search.") and (not web_search.enabled or "web_search" in excepted):
             continue
-        problems.append(f"{path}: {url} is not a loopback address")
+        problems.append(f"{path}: {url} is not loopback or a listed local host")
     if web_search.enabled and "web_search" not in excepted:
         problems.append('tools.web_search is enabled but "web_search" is not in strict_offline_exceptions')
     return problems

@@ -13,6 +13,7 @@ from app.settings import PROJECT_ROOT, Settings, load_settings
 
 LOCAL_CONFIG = PROJECT_ROOT / "config/local.config.json"
 CLOUD_CONFIG = PROJECT_ROOT / "config/cloud.config.json"
+DOCKER_CONFIG = PROJECT_ROOT / "config/docker.config.json"
 
 # Values for every ${VAR} in cloud.config.json. Distinctive so tests can assert they never leak.
 CLOUD_SECRETS = {

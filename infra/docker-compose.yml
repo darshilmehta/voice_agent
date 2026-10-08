@@ -1,8 +1,15 @@
 # Local infrastructure for poc_gibberlink.
-# Only Qdrant runs in Docker: Docker on macOS has no Metal GPU access, so
-# Ollama, the backend and the ML models run natively on the host.
 #
-#   docker compose -f infra/docker-compose.yml up -d qdrant
+#   docker compose -f infra/docker-compose.yml up -d qdrant                 # default: Qdrant only
+#   docker compose -f infra/docker-compose.yml --profile full up -d --build # Qdrant + backend + frontend
+#
+# Default (development on macOS): only Qdrant runs in Docker. Docker on macOS has no Metal GPU access,
+# so Ollama, the backend and the ML models run natively on the host.
+#
+# Profile "full": backend and frontend in containers too (config/docker.config.json: CPU devices,
+# faster-whisper). Ollama stays on the host and is reached at host.docker.internal; on Linux, start it
+# with OLLAMA_HOST=0.0.0.0 so the container can reach it. Don't run the native backend/frontend at the
+# same time: they use the same ports.
 
 name: poc_gibberlink
 
@@ -25,3 +32,39 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+
+  backend:
+    profiles: [full]
+    build:
+      context: ..
+      dockerfile: infra/docker/backend.Dockerfile
+    image: voice-agent-backend:local
+    container_name: gibberlink-backend
+    environment:
+      APP_CONFIG_FILE: config/docker.config.json
+    volumes:
+      - ../data:/app/data # models, uploads, SQLite; never baked into the image
+    ports:
+      - "127.0.0.1:8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # Linux; built in on Docker Desktop
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    profiles: [full]
+    build:
+      context: ..
+      dockerfile: infra/docker/frontend.Dockerfile
+    image: voice-agent-frontend:local
+    container_name: gibberlink-frontend
+    environment:
+      BACKEND_URL: http://localhost:8000 # as seen from the browser
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
