@@ -170,6 +170,10 @@ Router input: the new utterance, the last few turns, the session state, and — 
 
 Agent states: `IDLE → LISTENING → THINKING → SPEAKING → (INTERRUPTED → LISTENING)`. Prompt context = recent turns + compact session summary + retrieved evidence + current utterance; never the full transcript.
 
+### 3.6 Failure handling
+
+Degrade, never fake: LLM down → explicit error; Qdrant down → general chat only, document mode disabled with a message; Docling fails → document marked `FAILED` with the error; STT fails → text input still works; TTS fails → text still shown.
+
 ### 3.7 Live-data tools (web search) — in scope
 
 Knowledge comes from the ingested documents. When a question is **partly about the documents but needs current data** ("the report says revenue grew 34% — how is the stock doing today?"), the agent can call a live-data tool.
@@ -214,9 +218,51 @@ Production additions: fallback chain (search API → SearXNG if deployed → doc
 
 Local status: config has `provider: searxng`, `enabled: false` until phase 8; enabling it also requires `strict_offline_exceptions: ["web_search"]`. In the fully offline smoke run (test 12) web search is expected to be unavailable and must degrade to a document-only answer.
 
-### 3.6 Failure handling
+### 3.8 Voice presence UI (the "breathing" orb)
 
-Degrade, never fake: LLM down → explicit error; Qdrant down → general chat only, document mode disabled with a message; Docling fails → document marked `FAILED` with the error; STT fails → text input still works; TTS fails → text still shown.
+**Idea (user, 2026-10-08):** while the conversation happens, an animated presence that *breathes* with the voices of both the human and the agent. Modern and sleek. Inspiration (not copied): ChatGPT voice mode's orb, Gemini Live's glow, Siri's edge light, ElevenLabs' conversational orb. Prototype: [`docs/prototypes/voice-presence.html`](prototypes/voice-presence.html).
+
+**Concept: one presence, two voices.**
+
+| Who is speaking | What the screen does |
+|---|---|
+| Agent | The orb swells and its inner gradient flows faster with the agent's voice (cool palette) |
+| User | A warm halo ripples around the orb with the user's voice; the orb contracts slightly, "listening" |
+| Both (barge-in) | The orb dims and shrinks as the agent ducks; the user's halo takes over, matching the audio ducking in §3.3 |
+| Nobody (idle) | Slow breathing (~0.2 Hz), barely moving |
+| Thinking | No amplitude; a gentle internal swirl, faster when retrieval/LLM is busy |
+
+**Driven by the voice's shape, not just volume.** Both streams are analysed in the browser (zero added latency, no backend round trip):
+
+- **Loudness** (RMS envelope) → orb/halo size. Fast attack (~40 ms), slow release (~250 ms), so it breathes instead of jittering.
+- **Brightness** (spectral centroid) → colour intensity / hue shift within the speaker's palette.
+- **Onsets** (sudden energy rise, roughly syllables) → a ripple ring travels outward.
+
+Sources: the user's mic `MediaStream` (after browser echo cancellation, so the agent's own voice doesn't drive the user halo) and the agent's playback graph (the TTS `GainNode` feeds an `AnalyserNode`). Both already exist in the client for VAD and playback.
+
+**Rendering.** One WebGL fragment shader on a full-screen canvas (noise-deformed blob, flowing two-tone gradient, soft glow, up to 4 ripple rings); no 3D library needed. Inputs are a handful of uniforms per frame (time, agent level, user level, agent/user brightness, thinking, ripple times). Canvas 2D fallback without WebGL; `prefers-reduced-motion` switches to a calm static orb with a simple level ring. GPU cost is negligible next to the LLM.
+
+**Screen layout (voice mode).**
+
+```text
+┌──────────────────────────────────────────────┐
+│  annual_report.pdf · contract.pdf      EN · HI │  documents in scope, language
+│                                              │
+│                    ◉  orb                    │
+│                                              │
+│      "FY24 revenue was ₹4,210 crore, up…"     │  live captions: agent words highlight as spoken,
+│                                    p.47 ↗     │  citations appear as chips
+│                 Listening…                   │  state label (also announced to screen readers)
+│        [ mute ]     ( ● mic )     [ end ]     │
+└──────────────────────────────────────────────┘
+```
+
+- **Live captions:** the agent's words highlight as they're spoken (Kokoro returns per-token durations); the user's partial transcript appears in a muted colour while they speak.
+- **Docking:** when the visual canvas (§12.1) shows a chart, the orb shrinks and docks so the visual takes the stage; it keeps breathing as the presence indicator.
+- **Later states:** web search (§3.7) adds orbiting "searching" particles; a language switch briefly tints the caption badge.
+- **Accessibility:** state always available as text (`aria-live`), captions on by default, colour never the only signal (shape and motion differ per state), reduced-motion respected.
+
+**Build plan.** Phase 5 ships the orb with agent-driven motion and captions; phase 6 adds the user halo, barge-in visuals and docking; phase 9 polishes (palette per theme, onset tuning, performance on low-end GPUs).
 
 ---
 
@@ -617,8 +663,8 @@ Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first
 | 2 | Hybrid retrieval + reranker + confidence gate | identifiers, paraphrases, numbers, page citations correct on eval set |
 | 3 | Router + session state | unrelated questions skip retrieval; follow-ups and "back to the report" work |
 | 4 | Voice in: browser mic → WebSocket → VAD → Whisper → transcript events | EN/HI transcription, silence handling, end-of-turn detection |
-| 5 | Voice out: streamed answer → sentence TTS → browser playback | first audio after first sentence; text and audio in sync |
-| 6 | Barge-in (duck-then-decide), corrections, stop | interrupt mid-answer; "no, I meant…" handled; backchannels ignored |
+| 5 | Voice out: streamed answer → sentence TTS → browser playback; voice presence orb (agent motion) + live captions (§3.8) | first audio after first sentence; text and audio in sync; orb follows agent voice |
+| 6 | Barge-in (duck-then-decide), corrections, stop; user halo + barge-in visuals (§3.8) | interrupt mid-answer; "no, I meant…" handled; backchannels ignored; orb ducks with the audio |
 | 7 | Topic drift + EN/HI switching + code-mixing | drift script passes: document → general → Hindi → document |
 | 8 | Live-data tools: web search with filler + streamed partial answers (§3.7) | mixed doc+live question answered with separate [S]/[W] citations; first words < 1 s after filler; barge-in cancels search; timeout falls back to document-only answer |
 | 9 | Evals + observability + UI polish | retrieval Recall@5/MRR, groundedness, latency dashboard; demo script runs end to end |
