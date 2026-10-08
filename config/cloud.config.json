@@ -46,6 +46,9 @@
     "num_ctx": 8192,
     "keep_alive": null,
     "timeout_s": 60,
+    "router_timeout_ms": 2500,
+    "memory_summary_every_turns": 3,
+    "memory_summary_token_budget": 1500,
     "temperature": { "router": 0.0, "answer": 0.3 }
   },
 

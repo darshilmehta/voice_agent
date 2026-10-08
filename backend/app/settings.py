@@ -92,6 +92,12 @@ class LLMSection(Section):
     num_ctx: int = Field(gt=0)
     keep_alive: str | None
     timeout_s: int = Field(gt=0)
+    # The turn router (§3.4): past this the turn falls back to a document question (it runs alongside retrieval).
+    router_timeout_ms: int = Field(gt=0)
+    # The chat's memory summary (§3.5) is refreshed in the background after a turn once this many exchanges, or this
+    # many (estimated) tokens of messages, are not covered by it yet.
+    memory_summary_every_turns: int = Field(gt=0)
+    memory_summary_token_budget: int = Field(gt=0)
     temperature: Temperatures
 
     @model_validator(mode="after")

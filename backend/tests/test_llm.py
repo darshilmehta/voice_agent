@@ -132,6 +132,9 @@ async def test_generate_json_constrains_and_validates(load_local):
     assert body["stream"] is False and body["format"] == Route.model_json_schema()
     assert body["options"]["temperature"] == 0.0  # router temperature
     assert body["model"] == "qwen3:4b-instruct"  # router model
+    assert "num_predict" not in body["options"]
+    await llm.generate_json(MESSAGES, Route, max_tokens=96)  # the router bounds its output
+    assert rec.body()["options"]["num_predict"] == 96
 
 
 async def test_generate_json_rejects_output_that_does_not_validate(load_local):
