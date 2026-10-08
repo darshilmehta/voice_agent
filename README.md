@@ -44,6 +44,20 @@ scripts/setup/download_models.sh all
 
 Docker Desktop, Python 3.12, Node 24 and ffmpeg are also expected.
 
+## Run
+
+Backend (see [`backend/README.md`](backend/README.md)):
+
+```bash
+cd backend && uv run python -m app
+```
+
+Then check every dependency at once:
+
+```bash
+curl -s localhost:8000/health
+```
+
 ## Smoke tests
 
 Each test is a self-contained script with inline dependencies:

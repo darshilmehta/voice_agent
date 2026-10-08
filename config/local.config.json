@@ -97,7 +97,7 @@
     "provider": "docling",
     "artifacts_path": "data/models/docling",
     "ocr": true,
-    "ocr_engine": "auto",
+    "ocr_engine": "rapidocr",
     "max_pages": 500,
     "allowed_extensions": [".pdf", ".docx", ".pptx", ".txt", ".md"],
     "chunking": { "version": "v1", "target_tokens": 500, "overlap_tokens": 80 }
