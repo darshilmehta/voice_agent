@@ -27,6 +27,7 @@ import { useBackend } from "@/lib/backend-context";
 import type { Turn } from "@/lib/chat-turns";
 import { citedIds, toSourceRefs, type SourceRef } from "@/lib/citations";
 import { clockTime, dayKey, dayLabel, fullDateTime, plural } from "@/lib/format";
+import { cutNote, cutReasonOf, stoppedNote } from "@/lib/interruption";
 
 import { AnswerText, CitationPopoverProvider, SourceList } from "./Citations";
 import { Icon } from "./Icon";
@@ -551,6 +552,11 @@ const MessageItem = memo(function MessageItem({
   const render = (text: string) => (isUser ? text : <AnswerText text={text} sources={map} />);
   // Stopped before anything was written: the saved answer is empty, so there is no bubble to show, only the note.
   const blank = !isUser && m.text.trim() === "";
+  const reason = cutReasonOf(m);
+  const cut = cutNote(reason, heard ?? "");
+  const stopped = stoppedFlag(m);
+  // The connection dropped while the answer was going out and nothing says how much of it was heard.
+  const droppedUnheard = !isUser && !stopped && reason === "disconnect" && heard === null;
 
   return (
     <li className={`msg msg-${m.role}`}>
@@ -576,23 +582,25 @@ const MessageItem = memo(function MessageItem({
       {cutOff && (
         <p className="msg-note">
           <Icon name="pulse" size={13} />
-          {heard ? (
-            <span>
-              Interrupted after: <q>{lastWords(heard, 8)}</q>
-            </span>
-          ) : (
-            <span>Interrupted before it was played</span>
-          )}
+          <span>
+            {cut.lead}
+            {cut.quote !== null && (
+              <>
+                {" "}
+                <q>{lastWords(cut.quote, 8)}</q>
+              </>
+            )}
+          </span>
         </p>
       )}
 
       {!isUser && <SourceList sources={listed} />}
 
-      {/* A cut voice answer already says "Interrupted after: …" (and is usually complete, so "wasn't written" would be wrong). */}
-      {!isUser && stoppedFlag(m) && !cutOff && (
+      {/* A cut voice answer already says how it was cut (and is usually complete, so "wasn't written" would be wrong). */}
+      {!isUser && (stopped || droppedUnheard) && !cutOff && (
         <p className="msg-note msg-note-quiet">
           <Icon name="stop" size={12} />
-          {blank ? "Stopped before the answer started." : "Stopped. The rest of this answer wasn't written."}
+          {stoppedNote(reason, blank, stopped)}
         </p>
       )}
 

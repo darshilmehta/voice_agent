@@ -20,6 +20,7 @@ import type { Language, Message, SourcesPayload } from "../api";
 import { MIC_ERROR_TEXT, MicError, openMic, voiceSupport, type MicCapture, type MicErrorKind } from "./capture";
 import { AgentPlayer } from "./playback";
 import {
+  CLOSE_ORIGIN_NOT_ALLOWED,
   CLOSE_REPLACED,
   CLOSE_UNKNOWN_CHAT,
   OUTPUT_SAMPLE_RATE,
@@ -169,6 +170,8 @@ export class VoiceSession {
   private duckTimer: number | null = null;
   /** barge_in_start was sent and the server hasn't decided yet. */
   private bargePending = false;
+  /** The turn that barge-in is about. */
+  private bargeTurn: number | null = null;
   private noticeKey = 0;
 
   // Turn bookkeeping. Turn ids strictly increase within a server session (a reconnect starts a new one), and after
@@ -382,6 +385,7 @@ export class VoiceSession {
     if (this.progressTimer !== null) window.clearInterval(this.progressTimer);
     this.reconnectTimer = this.connectTimer = this.duckTimer = this.progressTimer = null;
     this.bargePending = false;
+    this.bargeTurn = null;
     this.reconnected = false;
     this.stopPending = false;
     this.discardedUtterance = false;
@@ -459,7 +463,9 @@ export class VoiceSession {
       if (this.connectTimer !== null) window.clearTimeout(this.connectTimer);
       this.connectTimer = null;
       if (this.closing) return;
-      if (e.code === CLOSE_UNKNOWN_CHAT) void this.fail("This chat no longer exists.", false);
+      if (e.code === CLOSE_ORIGIN_NOT_ALLOWED)
+        void this.fail("Voice isn't allowed from this address. Open the app from the address it is set up for.", false);
+      else if (e.code === CLOSE_UNKNOWN_CHAT) void this.fail("This chat no longer exists.", false);
       else if (e.code === CLOSE_REPLACED)
         void this.fail("This conversation was opened in another tab or window, so voice stopped here.");
       else this.scheduleReconnect();
@@ -553,6 +559,18 @@ export class VoiceSession {
     this.clearBarge();
   }
 
+  /** The agent is in the middle of an answer (being written or spoken), not finished or cut off. */
+  private answering(): boolean {
+    const t = this.snap.turn;
+    return !!t && t.id !== null && !t.cut && (!t.message || this.snap.audible);
+  }
+
+  /** The utterance was ignored by the server: drop its words, and any transcript of it that is still on its way. */
+  private ignoreUtterance(): void {
+    this.discardedUtterance = true;
+    this.dropUserCaption();
+  }
+
   /** The user's words were never saved as a message (a backchannel, noise, a failed transcription): stop showing them. */
   private dropUserCaption(): void {
     const t = this.snap.turn;
@@ -601,15 +619,22 @@ export class VoiceSession {
         if (!this.vad && this.snap.vad === "off") void this.startVad();
         break;
       }
-      case "state":
+      case "state": {
         this.set({ serverState: msg.state });
+        // Words the user said that never became a message: a Stop that nothing answered is over, and the words go.
+        // The server closes every `user_speech: start` with `end` and re-sends the state: `listening` when nothing was
+        // going on, the agent's own state when it was answering (the speech was ignored). Anything but that agent
+        // state or `listening` after the end of speech is the question being worked on: its words stay.
+        const s = this.snap;
+        const unsaved = s.caption === "user" && !s.userFinal && !s.userSpeaking;
         if (msg.state === "listening") {
-          // Back to waiting: a Stop that nothing answered is over, and words that never became a message are dropped.
           this.stopPending = false;
-          const s = this.snap;
-          if (s.caption === "user" && !s.userFinal && !s.userSpeaking) this.dropUserCaption();
+          if (unsaved) this.ignoreUtterance();
+        } else if (unsaved && (msg.state === "speaking" || msg.state === "thinking") && this.answering()) {
+          this.ignoreUtterance();
         }
         break;
+      }
       case "user_speech":
         if (msg.phase === "start") {
           this.stopPending = false; // a new utterance: an earlier Stop no longer applies
@@ -754,6 +779,7 @@ export class VoiceSession {
     if (turnId === null || this.snap.turn?.cut) return;
     if (!player.isAudible && this.snap.serverState !== "speaking") return;
     this.bargePending = true;
+    this.bargeTurn = turnId;
     if (player.isAudible) {
       player.duck();
       this.set({ ducked: true });
@@ -765,6 +791,7 @@ export class VoiceSession {
 
   private clearBarge(): void {
     this.bargePending = false;
+    this.bargeTurn = null;
     if (this.duckTimer !== null) window.clearTimeout(this.duckTimer);
     this.duckTimer = null;
   }
@@ -776,15 +803,27 @@ export class VoiceSession {
     if (this.snap.ducked) this.set({ ducked: false });
   }
 
-  /** Server: the interruption is real. Stop that turn and discard what's queued. */
+  /**
+   * Server: the interruption is real. Stop that turn and discard what's queued.
+   *
+   * It comes after a `barge_in_start` (we ducked and asked), but also without one (the user spoke while the answer was
+   * still being written), and after our own Stop (the server decides a pending barge-in on `stop` too). So it must be
+   * safe to receive for a turn that is already cut: then there is nothing left to do, and a newer turn's pending
+   * barge-in (its duck, its timer) is not touched.
+   */
   private applyStop(turnId: number): void {
-    this.clearBarge();
     this.discardedUtterance = false; // this utterance is a real one
+    if (this.cutTurns.has(turnId)) return; // our own Stop, or an earlier stop, already cut it
+    const ofNewerTurn = this.bargePending && this.bargeTurn !== null && this.bargeTurn !== turnId;
+    if (!ofNewerTurn) this.clearBarge();
     this.cutTurns.add(turnId); // whatever else arrives for it is ignored, even if it comes before the turn is known
-    this._player?.stopTurn(turnId);
+    this._player?.stopTurn(turnId, { restore: !ofNewerTurn });
     const cur = this.snap.turn;
     // Only the turn it names is cut: with the next question already placed, this is an older turn's stop.
-    this.set({ ducked: false, turn: cur && cur.id === turnId ? { ...cur, cut: true } : cur });
+    this.set({
+      ducked: ofNewerTurn ? this.snap.ducked : false,
+      turn: cur && cur.id === turnId ? { ...cur, cut: true } : cur,
+    });
   }
 
   private cancelPlayback(): void {

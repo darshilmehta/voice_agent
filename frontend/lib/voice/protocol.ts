@@ -14,6 +14,8 @@ export const UPLINK_FRAME_SAMPLES = 512;
 export const AUDIO_HEADER_BYTES = 12;
 
 /** WebSocket close codes the backend uses. */
+/** The socket's `Origin` is not one the backend allows: terminal, retrying from the same address can't help. */
+export const CLOSE_ORIGIN_NOT_ALLOWED = 4403;
 export const CLOSE_UNKNOWN_CHAT = 4404;
 export const CLOSE_REPLACED = 4409;
 
