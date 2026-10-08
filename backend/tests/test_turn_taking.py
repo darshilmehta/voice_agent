@@ -123,7 +123,23 @@ def evidence(**kw) -> BargeInEvidence:
     ],
 )
 def test_barge_in_verdict(kw, backchannel, verdict):
+    kw.setdefault("real_words", len((kw.get("transcript") or "").split()))
     assert barge_in_verdict(evidence(**kw), min_speech_ms=250, is_backchannel=backchannel) == verdict
+
+
+@pytest.mark.parametrize(
+    ("kw", "verdict"),
+    [
+        # a one-word partial of speech that has already stopped: maybe a misheard "mm-hmm" — wait, don't stop yet
+        ({"speech_ms": 300, "speaking": False, "transcript": "No", "real_words": 1}, None),
+        ({"speech_ms": 300, "speaking": False, "transcript": "No", "real_words": 1, "deadline_passed": True}, "resume"),
+        # ... but the same word while the user is still talking, or two real words, stop at once
+        ({"speech_ms": 300, "speaking": True, "transcript": "No", "real_words": 1}, "stop"),
+        ({"speech_ms": 300, "speaking": False, "transcript": "No wait", "real_words": 2}, "stop"),
+    ],
+)
+def test_short_partials_of_finished_speech_wait_for_more_evidence(kw, verdict):
+    assert barge_in_verdict(evidence(**kw), min_speech_ms=250, is_backchannel=False) == verdict
 
 
 # ------------------------------------------------------------------ protocol

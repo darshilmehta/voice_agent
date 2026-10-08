@@ -4,7 +4,8 @@
                     starts early, §9.5), then whole sentences; [S#] markers and markdown removed; at most
                     voice.max_spoken_sentences sentences are spoken (the rest stays on screen)
     chunks + played_ms → heard_text: fully played chunks + the share (by words) of the chunk playing at played_ms
-    utterance text → is_backchannel: "mm-hmm", "okay", "haan", "achha" … (at most backchannel_max_words words)
+    utterance text → is_backchannel: "mm-hmm", "M M", "okay", "haan", "achha theek hai" … (only words that aren't
+                    acknowledgements count against backchannel_max_words; interruption cues never pass)
 
 English and Hindi: sentence ends include the danda (।, ॥); words are whitespace-separated in both scripts.
 """
@@ -25,8 +26,10 @@ CHUNK_MAX_WORDS = 30  # a longer sentence is cut at its last clause boundary (or
 SENTENCE_END = ".!?।॥"
 CLAUSE_END = ",;:"
 _CLOSERS = "\"'\u201d\u2019)]\u00bb"
-# Words whose trailing period isn't a sentence end ("Rs. 4,210 crore").
+# Words whose trailing period isn't a sentence end ("Rs. 4,210 crore"); initialisms ("U.S.", "e.g.") count too.
 _ABBREVIATIONS = {"rs", "mr", "mrs", "ms", "dr", "vs", "e.g", "i.e", "etc", "approx", "inc", "ltd", "co", "st", "fig"}
+_INITIALISM = re.compile(r"(?:[A-Za-z]\.){2,}")
+_LIST_NUMBER = re.compile(r"\(?\d{1,2}[.)]")  # "1." "2)" opening a list item, not ending a sentence
 _MARKDOWN = re.compile(r"[*`#]+")
 _SPACE = re.compile(r"\s+")
 _WORD = re.compile(r"\S+")
@@ -49,6 +52,12 @@ def _mask_brackets(text: str) -> str:
 def _words(text: str) -> list[re.Match[str]]:
     """Word tokens (a "।" or "—" standing alone, e.g. after a blanked marker, is not a word)."""
     return [m for m in _WORD.finditer(text) if any(ch.isalnum() for ch in m.group(0))]
+
+
+def _is_abbreviation(token: str) -> bool:
+    """A token whose final period doesn't end a sentence: "Rs.", "e.g.", "U.S."."""
+    word = token.strip(_CLOSERS + "(\"'")
+    return word.endswith(".") and (word.lower().rstrip(".") in _ABBREVIATIONS or bool(_INITIALISM.fullmatch(word)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +109,7 @@ class SpeechChunker:
         if not text:
             return
         self._first = False
-        if sentence:
+        if sentence and len(text.split()) >= 2:  # "1." or "Yes." alone doesn't use up the spoken-sentence budget
             self._sentences += 1
         out.append(text)
         self.spoken.append(text)
@@ -124,11 +133,19 @@ class SpeechChunker:
                 continue  # "18.2%", "4,210", or not known yet what follows
             sentence = ch in SENTENCE_END
             if ch == ".":
-                prev = text[:i].split()
-                if prev and prev[-1].lower().rstrip(".") in _ABBREVIATIONS:
-                    continue
+                prev = text[: i + 1].split()
+                if prev and (_is_abbreviation(prev[-1]) or _LIST_NUMBER.fullmatch(prev[-1])):
+                    continue  # "Rs. 5,000", "U.S. sales", a list item opening with "1."
             found.append(_Boundary(j, sentence))
         return found
+
+    @staticmethod
+    def _word_cut(words: list[re.Match[str]], limit: int) -> _Boundary:
+        """Cut after at most ``limit`` words, but never right after an abbreviation ("… about Rs." | "5,000")."""
+        n = limit
+        while n > 1 and _is_abbreviation(words[n - 1].group(0)):
+            n -= 1
+        return _Boundary(words[n - 1].end(), False)
 
     def _next_cut(self) -> _Boundary | None:
         text = self._visible()
@@ -143,7 +160,7 @@ class SpeechChunker:
                 if n >= (1 if b.sentence else FIRST_CHUNK_MIN_WORDS):
                     return b
             if len(words) > FIRST_CHUNK_MAX_WORDS:  # the last word is complete once the next has started
-                return _Boundary(words[FIRST_CHUNK_MAX_WORDS - 1].end(), False)
+                return self._word_cut(words, FIRST_CHUNK_MAX_WORDS)
             return None
         boundaries = self._boundaries(text)
         for b in boundaries:
@@ -153,7 +170,7 @@ class SpeechChunker:
                 break
         if len(words) > CHUNK_MAX_WORDS:
             clauses = [b for b in boundaries if not b.sentence and len(_words(text[: b.end])) <= CHUNK_MAX_WORDS]
-            return clauses[-1] if clauses else _Boundary(words[CHUNK_MAX_WORDS - 1].end(), False)
+            return clauses[-1] if clauses else self._word_cut(words, CHUNK_MAX_WORDS)
         return None
 
 
@@ -194,16 +211,27 @@ def heard_text(chunks: Sequence[SpokenChunk], played_ms: float) -> str:
 
 # Acknowledgements that mean "go on", in English, romanized Hindi and Devanagari. "stop", "wait", "no" are not here.
 BACKCHANNELS = {
-    "mm", "mhm", "mm-hm", "mm-hmm", "mmhmm", "hmm", "hm", "uh-huh", "uh huh", "uhhuh", "um", "uh", "ah", "oh", "aha",
-    "ok", "okay", "ok ok", "okay okay", "yeah", "yes", "yep", "yup", "right", "sure", "alright", "all right",
+    "mm", "mhm", "mhmm", "mmhm", "mm-hm", "mm-hmm", "mmhmm", "hmm", "hm", "hmm-hmm", "uh-huh", "uh huh", "uhhuh",
+    "um", "uh", "ah", "oh", "aha",
+    "ok", "okay", "yeah", "yes", "yep", "yup", "right", "sure", "alright", "all right",
     "i see", "got it", "cool", "nice", "great", "fine", "wow", "really", "thanks", "thank you", "go on",
     "haan", "han", "haa", "ha", "haanji", "haan ji", "ji", "ji haan", "achha", "acha", "accha", "achcha", "theek",
     "thik", "theek hai", "thik hai", "sahi", "sahi hai", "bilkul",
     "हाँ", "हां", "हा", "जी", "जी हाँ", "जी हां", "हाँ जी", "हां जी", "अच्छा", "अच्छा जी", "ठीक", "ठीक है", "सही",
-    "सही है", "बिल्कुल", "हम्म", "हम", "ओके",
+    "सही है", "बिल्कुल", "ओके",
+}  # fmt: skip
+# Words that make an utterance more than an acknowledgement, however short ("okay stop", "yes but…", "haan, kya?").
+INTERRUPTION_CUES = {
+    "stop", "wait", "no", "nope", "not", "but", "actually", "sorry", "hold", "pause", "excuse", "repeat", "again",
+    "what", "why", "how", "when", "where", "which", "who",
+    "nahi", "nahin", "ruko", "ruk", "ruka", "bas", "kya", "kyon", "kyun", "kaise", "lekin",
+    "नहीं", "नही", "रुको", "रुकिए", "रुक", "बस", "क्या", "क्यों", "कैसे", "लेकिन",
 }  # fmt: skip
 # What Whisper tends to write for noise or breath rather than speech: treated as no words at all.
 NOISE_TRANSCRIPTS = {"you", "thanks for watching", "thank you for watching", "subtitles by the amara.org community"}
+# Non-lexical sounds as Whisper writes them, one token at a time: "M M", "MM", "Mhmm", "hmm", "uh-huh", "um", "ah".
+_HUM = re.compile(r"[mh]*m[mh]*|u+[hm]+|h+u+h+|a+h+|o+h+|e+r+m*")
+_HUM_HI = {"हम", "हम्म", "हम्मम", "ह्म", "ह्म्म", "हूँ", "हूं", "हुं", "हुँ", "उम", "उम्म", "उं", "उँ", "अं", "अँ", "ऊं", "ऊँ"}
 _PUNCT = re.compile(r"[^\w\s'\-ऀ-ॿ]|[।॥]")
 _REPEAT = re.compile(r"(.)\1{2,}")
 
@@ -215,23 +243,48 @@ def normalize_utterance(text: str) -> str:
     return "" if phrase in NOISE_TRANSCRIPTS else phrase
 
 
-FILLERS = {"mm", "mhm", "mm-hm", "mm-hmm", "mmhmm", "hmm", "hm", "uh-huh", "uhhuh", "um", "uh", "ah", "oh", "हम्म", "हम"}
+def _is_hum(token: str) -> bool:
+    parts = [p for p in token.split("-") if p]
+    return bool(parts) and all(_HUM.fullmatch(p) or p in _HUM_HI for p in parts)
+
+
+def real_words(text: str) -> int:
+    """Words in a transcript that are neither noise nor hums ("M M" → 0, "No wait" → 2)."""
+    return sum(not _is_hum(w) for w in normalize_utterance(text).split())
 
 
 def is_filler(text: str) -> bool:
-    """Only non-lexical sounds ("hmm", "mm-hmm", "uh"): not worth an answer even when the agent is silent. Lexical
-    acknowledgements ("okay", "yes", "haan") are left to the answer pipeline."""
+    """Only non-lexical sounds ("hmm", "mm-hmm", "M M", "उम्म"): not worth an answer even when the agent is silent.
+    Lexical acknowledgements ("okay", "yes", "haan") are left to the answer pipeline."""
     words = normalize_utterance(text).split()
-    return bool(words) and all(w in FILLERS for w in words)
+    return bool(words) and all(_is_hum(w) for w in words)
+
+
+def _acknowledgement_cover(words: list[str]) -> tuple[int, list[str]]:
+    """(acknowledgements found, the words that aren't part of one). Phrases ("theek hai", "ठीक है") count once."""
+    found, others, i = 0, [], 0
+    while i < len(words):
+        for size in (3, 2, 1):
+            if " ".join(words[i : i + size]) in BACKCHANNELS or (size == 1 and _is_hum(words[i])):
+                found, i = found + 1, i + size
+                break
+        else:
+            others.append(words[i])
+            i += 1
+    return found, others
 
 
 def is_backchannel(text: str, max_words: int) -> bool:
-    """True for an utterance that only acknowledges ("mm-hmm", "okay", "haan ji") or has no words at all; False when
-    it has more than ``max_words`` words or any word that isn't an acknowledgement ("wait", "stop", a question)."""
-    phrase = normalize_utterance(text)
-    words = phrase.split()
+    """True for an utterance that only acknowledges, however many times ("mm-hmm", "M M", "okay okay", "achha theek
+    hai", "अच्छा, ठीक है"), or has no words at all. Only words that aren't acknowledgements count against ``max_words``:
+    an acknowledgement with up to that many other words is still one ("yes please"), unless one of them is an
+    interruption cue ("okay stop", "haan, kya?"). Without any acknowledgement it isn't one ("Stop.", "FY23?")."""
+    words = normalize_utterance(text).split()
     if not words:
         return True
-    if len(words) > max_words:
+    found, others = _acknowledgement_cover(words)
+    if not others:
+        return True
+    if not found or any(w in INTERRUPTION_CUES for w in others):
         return False
-    return phrase in BACKCHANNELS or all(w in BACKCHANNELS for w in words)
+    return len(others) <= max_words

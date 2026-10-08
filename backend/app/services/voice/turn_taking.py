@@ -182,15 +182,19 @@ class BargeInEvidence:
     transcript: str | None  # latest transcript of that speech (partial or final), None if not available yet
     ended: bool  # the utterance is over (end of turn, final transcript known)
     deadline_passed: bool  # decision_timeout_ms since barge_in_start
+    real_words: int = 0  # words of the transcript that are neither hums ("M M") nor Whisper noise
 
 
 Verdict = Literal["stop", "resume"]
 
 
 def barge_in_verdict(evidence: BargeInEvidence, *, min_speech_ms: float, is_backchannel: bool | None) -> Verdict | None:
-    """Duck, then decide (§3.3 c). ``is_backchannel`` is the transcript's classification (None without a transcript).
+    """Duck, then decide (§3.3 c). ``is_backchannel`` is the transcript's classification (None without a transcript;
+    hums, fillers, noise and empty transcripts are backchannels).
 
-    1. a transcript that isn't a backchannel                          → stop (as soon as it is known)
+    1. a transcript that isn't a backchannel                          → stop (as soon as it is known), except a
+       partial of fewer than 2 real words of speech that has already stopped: Whisper often mishears a short
+       snapshot ("M M" for "mm-hmm"), so that waits for the deadline or the final transcript
     2. the utterance ended as a backchannel, noise or too short        → resume
     3. before the deadline                                             → wait (None)
     4. at the deadline: speech shorter than min_speech_ms              → resume
@@ -199,7 +203,8 @@ def barge_in_verdict(evidence: BargeInEvidence, *, min_speech_ms: float, is_back
                                                                          to be a backchannel, the session still stops
                                                                          the answer when the utterance ends
     """
-    if evidence.transcript is not None and is_backchannel is False:
+    sure = evidence.speaking or evidence.ended or evidence.real_words >= 2
+    if evidence.transcript is not None and is_backchannel is False and sure:
         return "stop"
     if evidence.ended:
         return "resume"

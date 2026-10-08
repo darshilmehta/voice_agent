@@ -10,6 +10,7 @@ from app.services.voice.speech_text import (
     heard_text,
     is_backchannel,
     is_filler,
+    real_words,
     spoken_text,
 )
 
@@ -93,6 +94,30 @@ def test_only_the_first_sentences_are_spoken():
     assert chunks == ["One is here.", "Two is here."]
 
 
+@pytest.mark.parametrize(
+    ("text", "first"),
+    [
+        ("It was worth about Rs. 5,000 crore.", "It was worth about"),  # the 5-word cut backs off before "Rs."
+        ("Sales in the U.S. grew 12% in FY24.", "Sales in the U.S. grew"),  # initialisms don't end a sentence
+        ("For example, e.g. margins rose.", "For example,"),
+    ],
+)
+def test_never_cut_after_an_abbreviation(text, first):
+    for piece in (1, 3, 7):
+        chunks = chunk_stream(text, piece=piece)
+        assert chunks[0] == first, chunks
+        assert not any(c.endswith(("Rs.", "U.S.", "e.g.")) for c in chunks), chunks
+        assert " ".join(chunks) == text
+
+
+def test_list_numbers_are_not_sentences_and_short_chunks_do_not_use_up_the_budget():
+    text = "Yes. Two points: 1. Revenue grew 34%. 2. Margins improved to 18.2%. Third one here."
+    chunks = chunk_stream(text, max_sentences=2)
+    assert "1." not in chunks and "2." not in chunks  # "1." never stands alone as a chunk
+    assert chunks[0] == "Yes."  # one word: not counted as one of the two spoken sentences
+    assert chunks[-1].endswith("Margins improved to 18.2%.") and "Third" not in " ".join(chunks)
+
+
 def test_text_without_punctuation_is_flushed_at_the_end():
     assert chunk_stream("eighteen point two") == ["eighteen point two"]
 
@@ -134,9 +159,43 @@ def test_backchannels(text):
     assert is_backchannel(text, 2)
 
 
+# What Whisper writes for a short "mm-hmm" and other hums (seen in the end-to-end run: "M M", then "MM").
+HUMS = ["M M", "MM", "m-m", "Mm-hmm.", "Mhmm.", "hmm", "Hmmm?", "mhm", "uh huh", "Um.", "उम्म", "हम्म", "हूँ", "हूं"]
+
+
+@pytest.mark.parametrize("text", HUMS)
+def test_hums_are_backchannels_and_fillers_with_no_real_words(text):
+    assert is_backchannel(text, 2) and is_filler(text) and real_words(text) == 0
+
+
 @pytest.mark.parametrize(
     "text",
-    ["Stop.", "Wait", "No wait, I meant the revenue", "okay okay okay", "What about FY23?", "रुको", "okay stop"],
+    [
+        "अच्छा, ठीक है",  # three words, two acknowledgements: only non-acknowledgement words count
+        "achha theek hai",
+        "okay okay okay",
+        "Yeah, yeah, right, sure.",
+        "Mm-hmm, okay.",
+        "yes please",  # an acknowledgement plus one other word (within backchannel_max_words)
+    ],
+)
+def test_acknowledgements_count_once_against_the_word_limit(text):
+    assert is_backchannel(text, 2)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Stop.",
+        "Wait",
+        "No wait, I meant the revenue",
+        "What about FY23?",
+        "रुको",
+        "okay stop",  # an interruption cue is never a backchannel, however short
+        "haan, kya?",
+        "FY23",  # no acknowledgement at all
+        "okay so tell me more",  # three other words: over the limit
+    ],
 )
 def test_not_backchannels(text):
     assert not is_backchannel(text, 2)
@@ -145,3 +204,4 @@ def test_not_backchannels(text):
 def test_fillers_are_only_non_lexical_sounds():
     assert is_filler("Hmm.") and is_filler("Mm-hmm") and is_filler("uh, um")
     assert not is_filler("Okay.") and not is_filler("") and not is_filler("hmm what")
+    assert real_words("No wait") == 2 and real_words("M M") == 0 and real_words("you") == 0
