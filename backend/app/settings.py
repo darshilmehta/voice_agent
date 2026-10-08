@@ -268,6 +268,9 @@ class Settings(Section):
     profile: Literal["local", "cloud"]
     strict_offline: bool
     strict_offline_exceptions: list[Literal["web_search"]]
+    # Hostnames that resolve to this machine without being loopback, e.g. Docker Compose service names and
+    # host.docker.internal. Top-level, so (like strict_offline itself) only the config file can set it.
+    strict_offline_local_hosts: list[str]
     app: AppSection
     server: ServerSection
     auth: AuthSection
@@ -291,6 +294,13 @@ class Settings(Section):
     event_bus: EventBusSection
     model_cache: ModelCacheSection
     observability: ObservabilitySection
+
+    @model_validator(mode="after")
+    def _local_hosts_are_bare_hostnames(self) -> Settings:
+        bad = [h for h in self.strict_offline_local_hosts if not re.fullmatch(r"[A-Za-z0-9.-]+", h)]
+        if bad:
+            raise ValueError(f"strict_offline_local_hosts must be bare hostnames (no scheme, port or path): {bad}")
+        return self
 
     # Set by the loader, not read from the file.
     root_dir: Path = Field(default=PROJECT_ROOT, exclude=True)

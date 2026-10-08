@@ -1,0 +1,19 @@
+# Build context is the repo root (images need backend/ or frontend/ plus config/).
+# Never send models, uploads or databases: data/ alone is many gigabytes.
+data/
+.git/
+.github/
+docs/
+scripts/
+**/node_modules/
+**/.next/
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+**/*.tsbuildinfo
+frontend/next-env.d.ts
+frontend/AGENTS.md
+.env
+.env.*
+**/.DS_Store

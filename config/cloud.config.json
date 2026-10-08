@@ -168,6 +168,7 @@
     }
   },
   "strict_offline_exceptions": [],
+  "strict_offline_local_hosts": [],
 
   "job_queue": { "provider": "redis", "url": "rediss://:${REDIS_PASSWORD}@redis.example.com:6380/0", "concurrency": 4 },
   "session_store": { "provider": "redis", "url": "rediss://:${REDIS_PASSWORD}@redis.example.com:6380/1", "ttl_s": 86400 },

@@ -57,3 +57,17 @@ jobs:
         run: npm run build
       - name: Typecheck (after build, which generates next-env.d.ts)
         run: npm run typecheck
+
+  images:
+    name: Docker images (build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Backend image
+        run: docker build -f infra/docker/backend.Dockerfile -t voice-agent-backend:ci .
+      - name: Frontend image
+        run: docker build -f infra/docker/frontend.Dockerfile -t voice-agent-frontend:ci .
+      - name: Backend image starts and validates its config
+        # Fails if config/docker.config.json is invalid or breaks the offline guard (exit code 2).
+        run: docker run --rm --entrypoint python voice-agent-backend:ci -c "from app.settings import load_settings; from app.providers.registry import resolve_providers; resolve_providers(load_settings()); print('config ok')"

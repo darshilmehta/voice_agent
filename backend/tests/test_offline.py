@@ -6,7 +6,7 @@ from app.offline import apply_runtime_env, is_loopback_url, offline_violations
 from app.providers.registry import build_container
 from app.settings import ConfigError, load_settings
 
-from .conftest import CLOUD_CONFIG, CLOUD_SECRETS, LOCAL_CONFIG
+from .conftest import CLOUD_CONFIG, CLOUD_SECRETS, DOCKER_CONFIG, LOCAL_CONFIG
 
 
 @pytest.mark.parametrize(
@@ -27,13 +27,34 @@ def test_is_loopback_url(url, loopback):
     assert is_loopback_url(url) is loopback
 
 
+def test_listed_local_hosts_count_as_this_machine():
+    assert is_loopback_url("http://qdrant:6333", {"qdrant"})
+    assert is_loopback_url("http://host.docker.internal:11434", {"host.docker.internal"})
+    assert not is_loopback_url("http://qdrant:6333")
+    assert not is_loopback_url("http://qdrant.example.com:6333", {"qdrant"})  # exact names only
+
+
+def test_docker_config_passes_the_offline_guard(tmp_path):
+    s = load_settings(DOCKER_CONFIG, {"APP_ROOT_DIR": str(tmp_path)})
+    assert s.strict_offline is True
+    assert offline_violations(s, {}) == []
+    container = build_container(s)
+    assert container["stt"].name == "faster_whisper"  # mlx-whisper is macOS-only
+
+
+def test_local_hosts_cannot_be_added_from_env(load_local):
+    assert load_local(STRICT_OFFLINE_LOCAL_HOSTS='["evil.example.com"]').strict_offline_local_hosts == []
+
+
 def test_local_config_has_no_violations(load_local):
     assert offline_violations(load_local(), {}) == []
 
 
 def test_remote_url_is_a_violation(load_local):
     s = load_local(VECTOR_STORE__URL="https://qdrant.example.com:6333")
-    assert offline_violations(s, {}) == ["vector_store.url: https://qdrant.example.com:6333 is not a loopback address"]
+    assert offline_violations(s, {}) == [
+        "vector_store.url: https://qdrant.example.com:6333 is not loopback or a listed local host"
+    ]
     with pytest.raises(ConfigError, match="strict_offline"):
         build_container(s)
 
