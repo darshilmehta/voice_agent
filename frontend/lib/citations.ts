@@ -89,6 +89,81 @@ export function describeSource(ref: SourceRef): string {
   return `${label}: ${ref.filename}${pages ? `, ${pages.toLowerCase()}` : ""}`;
 }
 
+// ------------------------------------------------------------------ table snippets
+
+/** A markdown table found inside a citation snippet, ready to render as a compact table. */
+export interface TableSnippet {
+  /** Prose that came before the table, if any. */
+  lead: string;
+  header: string[];
+  rows: string[][];
+  /** The snippet's length limit cut the table short (rows or part of a row are missing). */
+  truncated: boolean;
+}
+
+const DELIMITER_CELL = /^:?-{2,}:?$/;
+const MAX_TABLE_ROWS = 6;
+
+/**
+ * Reads a markdown table out of a snippet, or returns null when the snippet isn't one (then show it as plain text).
+ *
+ * The backend flattens snippets to one line (whitespace runs, newlines included, become a single space and the text
+ * is cut at ~300 characters), so rows can't be told apart by line breaks: `| Metric | FY23 | | EBITDA | 16.9% |`.
+ * The delimiter row (`|---|---|`) gives the column count; the header is the cells before it, and every complete
+ * row is that many cells followed by the pipe that closes it. A row cut off by the length limit is dropped and the
+ * table is marked truncated. Snippets that still hold line breaks parse the same way.
+ */
+export function parseTableSnippet(text: string): TableSnippet | null {
+  const flat = text.replace(/\s+/g, " ").trim();
+  const first = flat.indexOf("|");
+  if (first < 0) return null;
+  const lead = flat.slice(0, first).trim();
+  // Split on unescaped pipes; the leading pipe leaves an empty first piece.
+  const cells = flat
+    .slice(first)
+    .split(/(?<!\\)\|/)
+    .slice(1)
+    .map((c) =>
+      c
+        .replace(/\\\|/g, "|")
+        .replace(/<br\s*\/?>/gi, " ")
+        .replace(/\*\*|__/g, "")
+        .trim(),
+    );
+
+  let delimiterAt = -1;
+  let columns = 0;
+  for (let i = 0; i < cells.length; i++) {
+    if (!DELIMITER_CELL.test(cells[i])) continue;
+    let end = i;
+    while (end < cells.length && DELIMITER_CELL.test(cells[end])) end++;
+    if (end - i >= 2) {
+      delimiterAt = i;
+      columns = end - i;
+      break;
+    }
+    i = end;
+  }
+  // The header is `columns` cells, then the pipe pair that ends its row, then the delimiter row.
+  if (delimiterAt < 0 || delimiterAt !== columns + 1 || cells[delimiterAt - 1] !== "") return null;
+
+  const header = cells.slice(0, columns);
+  const rows: string[][] = [];
+  let at = delimiterAt + columns + 1;
+  while (at + columns < cells.length) {
+    rows.push(cells.slice(at, at + columns));
+    at += columns + 1;
+  }
+  const leftover = cells.slice(at).some((c) => c !== "");
+  const truncated = leftover || flat.endsWith("…") || rows.length > MAX_TABLE_ROWS;
+  return { lead, header, rows: rows.slice(0, MAX_TABLE_ROWS), truncated };
+}
+
+/** Numbers, percentages and currency amounts line up to the right. */
+export function isNumericCell(cell: string): boolean {
+  return /^[(+\-−–]?\s*[₹$€£]?\s*\d[\d,.\s]*\s*(%|x|×|cr|crore|bn|m|k)?\)?$/i.test(cell.trim());
+}
+
 // ------------------------------------------------------------------ markers in answer text
 
 export type AnswerPart = { kind: "text"; text: string } | { kind: "cite"; ids: string[]; raw: string };

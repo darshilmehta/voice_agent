@@ -25,7 +25,16 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 
-import { describeSource, pagesLong, pagesShort, splitCitations, withoutPartialMarker, type SourceRef } from "@/lib/citations";
+import {
+  describeSource,
+  isNumericCell,
+  pagesLong,
+  pagesShort,
+  parseTableSnippet,
+  splitCitations,
+  withoutPartialMarker,
+  type SourceRef,
+} from "@/lib/citations";
 
 import { Icon } from "./Icon";
 
@@ -237,7 +246,7 @@ export function CitationPopoverProvider({ children }: { children: ReactNode }) {
             </div>
             {pages && <p className="cite-pop-pages">{pages}</p>}
             {source.snippet ? (
-              <blockquote className="cite-pop-snippet">{source.snippet}</blockquote>
+              <SnippetView snippet={source.snippet} />
             ) : (
               <p className="cite-pop-empty">No passage was saved with this citation.</p>
             )}
@@ -245,6 +254,51 @@ export function CitationPopoverProvider({ children }: { children: ReactNode }) {
           document.body,
         )}
     </PopoverContext>
+  );
+}
+
+/** The cited passage: a compact table when the chunk is a markdown table, quoted plain text otherwise. */
+function SnippetView({ snippet }: { snippet: string }) {
+  const table = useMemo(() => parseTableSnippet(snippet), [snippet]);
+  // A column lines up to the right when every filled cell in it is a number (the first column labels the rows).
+  const numeric = useMemo(
+    () =>
+      (table?.header ?? []).map((_, i) => {
+        const cells = (table?.rows ?? []).map((r) => r[i] ?? "").filter((c) => c.trim() && c.trim() !== "-");
+        return i > 0 && cells.length > 0 && cells.every(isNumericCell);
+      }),
+    [table],
+  );
+  if (!table) return <blockquote className="cite-pop-snippet">{snippet}</blockquote>;
+  return (
+    <div className="cite-pop-snippet is-table">
+      {table.lead && <p className="cite-pop-lead">{table.lead}</p>}
+      <div className="cite-pop-table-scroll">
+        <table className="cite-pop-table" aria-label="Table excerpt">
+          <thead>
+            <tr>
+              {table.header.map((h, i) => (
+                <th key={i} scope="col" className={numeric[i] ? "num" : undefined}>
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {table.rows.map((row, r) => (
+              <tr key={r}>
+                {row.map((cell, i) => (
+                  <td key={i} className={numeric[i] ? "num" : undefined}>
+                    {cell}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {table.truncated && <p className="cite-pop-more">More rows in the document…</p>}
+    </div>
   );
 }
 
