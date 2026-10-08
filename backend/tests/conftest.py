@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from collections.abc import AsyncIterator, Callable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ from app.providers.base import ProviderContext
 from app.providers.registry import build_container
 from app.providers.storage import MetadataDB, SqliteDB
 from app.settings import PROJECT_ROOT, Settings, load_settings
+
+from .fakes import FakeEmbedder, FakeLLM, FakeReranker, FakeStore, TextParser, keyword_scorer
 
 LOCAL_CONFIG = PROJECT_ROOT / "config/local.config.json"
 CLOUD_CONFIG = PROJECT_ROOT / "config/cloud.config.json"
@@ -194,4 +197,48 @@ def api(load_local) -> Iterator[TestClient]:
     """The app on a fresh database under tmp_path (HTTP to Ollama/Qdrant mocked)."""
     settings = load_local()
     with TestClient(create_app(settings, build_container(settings, http=mock_http()))) as client:
+        yield client
+
+
+@dataclass
+class Fakes:
+    """The providers an upload or a chat turn uses, replaced by in-memory fakes (no ML, Qdrant or Ollama)."""
+
+    parser: TextParser
+    embedder: FakeEmbedder
+    reranker: FakeReranker
+    store: FakeStore
+    llm: FakeLLM
+
+    def install(self, container: Any) -> Any:
+        container.providers.update(
+            ingestion=self.parser,
+            embeddings=self.embedder,
+            reranker=self.reranker,
+            vector_store=self.store,
+            llm=self.llm,
+        )
+        return container
+
+
+@pytest.fixture
+def fakes() -> Fakes:
+    return Fakes(TextParser(), FakeEmbedder(), FakeReranker(keyword_scorer), FakeStore(search_points=True), FakeLLM())
+
+
+@pytest.fixture
+def make_app(load_local, fakes) -> Callable[..., TestClient]:
+    """``with make_app(**env) as api``: the app with the fakes installed, on the tmp_path database and uploads."""
+
+    def make(fakes_: Fakes | None = None, **env: str) -> TestClient:
+        settings = load_local(**env)
+        container = (fakes_ or fakes).install(build_container(settings, http=mock_http()))
+        return TestClient(create_app(settings, container))
+
+    return make
+
+
+@pytest.fixture
+def app(make_app) -> Iterator[TestClient]:
+    with make_app() as client:
         yield client

@@ -29,6 +29,11 @@ class InvalidInput(ServiceError):
     """Well-formed but unacceptable input, e.g. a document scope naming documents of another project."""
 
 
+class Unavailable(Exception):
+    """A dependency the operation needs is down (e.g. the vector store during a delete). The API answers 503; the
+    operation changed nothing and can be retried."""
+
+
 class _Unset(enum.Enum):
     UNSET = "UNSET"
 

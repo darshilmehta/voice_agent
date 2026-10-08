@@ -1,12 +1,24 @@
-"""In-memory stand-ins for the ingestion/retrieval providers: no ML libraries, models or Qdrant needed."""
+"""In-memory stand-ins for the ingestion/retrieval/LLM providers: no ML libraries, models, Qdrant or Ollama needed."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from pathlib import Path
 from typing import Any
 
-from app.providers.ingestion import Chunk, DocumentParser, ParsedDocument
+from app.providers.ingestion import (
+    Chunk,
+    DocumentParser,
+    IngestionError,
+    ParsedDocument,
+    ParsedTable,
+    TableCell,
+    chunk_id,
+    detect_language,
+)
+from app.providers.llm import LLMClient, LLMError, LLMMessage
 from app.providers.retrieval import (
     DenseSparse,
     Embedder,
@@ -93,12 +105,15 @@ class FakeReranker(Reranker):
 class FakeStore(VectorStore):
     name = "fake"
 
-    def __init__(self, results: Sequence[Sequence[SearchHit]] = ()) -> None:
+    def __init__(self, results: Sequence[Sequence[SearchHit]] = (), *, search_points: bool = False) -> None:
         self.results = list(results)  # one list per hybrid_search call, in order
+        self.search_points = search_points  # no preset results: return the stored points matching the filters
         self.searches: list[tuple[DenseSparse, RetrievalFilters, int | None]] = []
         self.points: dict[str, IndexedChunk] = {}
         self.deletes: list[tuple[str, list[str]]] = []
+        self.project_deletes: list[str] = []
         self.count_override: int | None = None
+        self.fail_with: Exception | None = None  # raised by search and delete calls
 
     async def upsert(self, chunks: Sequence[IndexedChunk]) -> None:
         for c in chunks:
@@ -108,15 +123,38 @@ class FakeStore(VectorStore):
         self, query: DenseSparse, filters: RetrievalFilters, *, limit: int | None = None
     ) -> list[SearchHit]:
         self.searches.append((query, filters, limit))
-        return list(self.results.pop(0)) if self.results else []
+        if self.fail_with is not None:
+            raise self.fail_with
+        if self.results:
+            return list(self.results.pop(0))
+        if not self.search_points:
+            return []
+        return [
+            SearchHit(p.chunk, 1.0 / (i + 1), 0.5)
+            for i, p in enumerate(self._matching(filters))
+            if filters.document_ids is None or filters.document_ids
+        ]
+
+    def _matching(self, filters: RetrievalFilters) -> list[IndexedChunk]:
+        return [
+            p
+            for p in self.points.values()
+            if p.chunk.project_id == filters.project_id
+            and (filters.document_ids is None or p.chunk.document_id in filters.document_ids)
+        ]
 
     async def delete_document(self, document_id: str, *, keep: Iterable[str] = ()) -> None:
+        if self.fail_with is not None:
+            raise self.fail_with
         kept = list(keep)
         self.deletes.append((document_id, kept))
         for cid in [c for c, p in self.points.items() if p.chunk.document_id == document_id and c not in kept]:
             del self.points[cid]
 
     async def delete_project(self, project_id: str) -> None:
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.project_deletes.append(project_id)
         for cid in [c for c, p in self.points.items() if p.chunk.project_id == project_id]:
             del self.points[cid]
 
@@ -148,3 +186,150 @@ class FakeParser(DocumentParser):
     async def chunk(self, document: ParsedDocument, *, project_id: str, document_id: str, version: int) -> list[Chunk]:
         self.chunk_calls.append({"project_id": project_id, "document_id": document_id, "version": version})
         return list(self.chunks)
+
+
+class TextParser(DocumentParser):
+    """Parses text uploads for real-ish pipeline tests: pages are separated by form feeds, chunks are paragraphs
+    (blank-line separated) with their page, a paragraph of markdown table rows ("| a | b |") becomes a table.
+    ``fail_with`` makes parse raise; ``gate`` (an Event) makes parse wait, to observe PROCESSING."""
+
+    name = "fake_text"
+
+    def __init__(self) -> None:
+        self.fail_with: Exception | None = None
+        self.gate: asyncio.Event | None = None
+        self.parsed_paths: list[Path] = []
+        self.release_calls = 0
+        self._pages: dict[str, list[list[str]]] = {}
+
+    async def parse(self, path: Any) -> ParsedDocument:
+        path = Path(path)
+        self.parsed_paths.append(path)
+        if self.gate is not None:
+            await self.gate.wait()
+        if self.fail_with is not None:
+            raise self.fail_with
+        if not path.is_file():
+            raise IngestionError(f"{path.name}: file not found")
+        text = path.read_text(encoding="utf-8")
+        pages = [[b.strip() for b in page.split("\n\n") if b.strip()] for page in text.split("\f")]
+        tables = []
+        for number, blocks in enumerate(pages, start=1):
+            for block in blocks:
+                if block.startswith("|"):
+                    rows = [[c.strip() for c in line.strip("|").split("|")] for line in block.splitlines()]
+                    cells = [
+                        TableCell(row=r, col=c, text=v, column_header=r == 0)
+                        for r, row in enumerate(rows)
+                        for c, v in enumerate(row)
+                    ]
+                    tables.append(
+                        ParsedTable(
+                            index=len(tables),
+                            ref=f"#/tables/{len(tables)}",
+                            page_start=number,
+                            page_end=number,
+                            bbox=(10.0, 20.0, 300.0, 120.0),
+                            heading_path=["Tables"],
+                            caption=None,
+                            num_rows=len(rows),
+                            num_cols=max(len(r) for r in rows),
+                            markdown=block,
+                            cells=cells,
+                        )
+                    )
+        doc = ParsedDocument(
+            source_name=path.name,
+            format=path.suffix.lstrip("."),
+            page_count=len(pages),
+            pages=[],
+            items=[],
+            tables=tables,
+            markdown=text,
+            language=detect_language(text),
+            parse_seconds=0.01,
+        )
+        self._pages[path.name] = pages
+        doc._native = path.name
+        return doc
+
+    async def chunk(self, document: ParsedDocument, *, project_id: str, document_id: str, version: int) -> list[Chunk]:
+        chunks = []
+        for number, blocks in enumerate(self._pages.pop(document._native), start=1):
+            for block in blocks:
+                index = len(chunks)
+                chunks.append(
+                    Chunk(
+                        chunk_id=chunk_id(document_id, version, index),
+                        project_id=project_id,
+                        document_id=document_id,
+                        version=version,
+                        chunk_index=index,
+                        chunking_version="v1",
+                        page_start=number,
+                        page_end=number,
+                        heading_path=["Body"],
+                        content_type="table" if block.startswith("|") else "paragraph",
+                        language=detect_language(block),
+                        text=block,
+                        token_count=len(block.split()),
+                    )
+                )
+        return chunks
+
+    def release(self) -> None:
+        self.release_calls += 1
+
+
+def keyword_scorer(query: str, passage: str) -> float:
+    """Reranker stand-in: the share of the query's longer words found in the passage (0..1)."""
+    words = {w.strip("?.,!").casefold() for w in query.split() if len(w.strip("?.,!")) > 3}
+    if not words:
+        return 0.0
+    text = passage.casefold()
+    return sum(1 for w in words if w in text) / len(words)
+
+
+class FakeLLM(LLMClient):
+    """Streams a scripted reply in small pieces and records every call. ``reply`` may be a function of the messages;
+    ``fail_with`` raises before (or, with ``fail_after`` pieces, during) the stream."""
+
+    name = "fake"
+
+    def __init__(self, reply: str | Callable[[list[LLMMessage]], str] = "The answer [S1].") -> None:
+        self.reply = reply
+        self.calls: list[dict[str, Any]] = []
+        self.fail_with: Exception | None = None
+        self.fail_after: int | None = None
+        self.piece_chars = 6
+        self.delay = 0.0  # seconds before each piece
+        self.sent = 0  # pieces yielded by the last stream
+        self.closed = False  # the last stream was closed before it finished (generation cancelled)
+
+    async def stream(  # type: ignore[override]
+        self,
+        messages: Sequence[LLMMessage],
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[str]:
+        self.calls.append(
+            {"messages": list(messages), "model": model, "temperature": temperature, "max_tokens": max_tokens}
+        )
+        if self.fail_with is not None and self.fail_after is None:
+            raise self.fail_with
+        text = self.reply(list(messages)) if callable(self.reply) else self.reply
+        self.sent, self.closed = 0, False
+        finished = False
+        try:
+            for i in range(0, len(text), self.piece_chars):
+                if self.fail_after is not None and i // self.piece_chars >= self.fail_after:
+                    raise self.fail_with or LLMError("stream broke")
+                if self.delay:
+                    await asyncio.sleep(self.delay)
+                self.sent += 1
+                yield text[i : i + self.piece_chars]
+            finished = True
+        finally:
+            self.closed = not finished

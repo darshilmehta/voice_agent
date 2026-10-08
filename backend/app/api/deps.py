@@ -6,8 +6,10 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from ..providers.storage import MetadataDB
-from ..services.base import InvalidInput, NotFound
+from ..services.base import InvalidInput, NotFound, Unavailable
+from ..services.chat_turns import ChatTurnService
 from ..services.chats import ChatService
+from ..services.document_pipeline import DocumentPipeline
 from ..services.documents import DocumentService
 from ..services.messages import MessageService
 from ..services.pins import PinService
@@ -44,15 +46,26 @@ def pin_service(db: DB) -> PinService:
     return PinService(db)
 
 
+def document_pipeline(request: Request) -> DocumentPipeline:
+    """The app's long-lived pipeline (created at startup: it owns the upload lock and the queue hook)."""
+    return request.app.state.document_pipeline
+
+
+def chat_turns(request: Request) -> ChatTurnService:
+    return ChatTurnService.from_container(request.app.state.container)
+
+
 Projects = Annotated[ProjectService, Depends(project_service)]
 Chats = Annotated[ChatService, Depends(chat_service)]
 Messages = Annotated[MessageService, Depends(message_service)]
 Documents = Annotated[DocumentService, Depends(document_service)]
 Pins = Annotated[PinService, Depends(pin_service)]
+Pipeline = Annotated[DocumentPipeline, Depends(document_pipeline)]
+ChatTurns = Annotated[ChatTurnService, Depends(chat_turns)]
 
 
 def install_error_handlers(app: FastAPI) -> None:
-    """NotFound → 404 and InvalidInput → 422, with FastAPI's usual ``{"detail": …}`` body."""
+    """NotFound → 404, InvalidInput → 422 and Unavailable → 503, with FastAPI's usual ``{"detail": …}`` body."""
 
     async def not_found(_: Request, exc: Exception) -> JSONResponse:
         return JSONResponse(status_code=404, content={"detail": str(exc)})
@@ -60,5 +73,9 @@ def install_error_handlers(app: FastAPI) -> None:
     async def invalid(_: Request, exc: Exception) -> JSONResponse:
         return JSONResponse(status_code=422, content={"detail": str(exc)})
 
+    async def unavailable(_: Request, exc: Exception) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
     app.add_exception_handler(NotFound, not_found)
     app.add_exception_handler(InvalidInput, invalid)
+    app.add_exception_handler(Unavailable, unavailable)

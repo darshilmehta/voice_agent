@@ -1,16 +1,21 @@
-"""Chats and their transcripts (docs/DESIGN.md §3.9). Messages are written by the chat pipeline, not over REST."""
+"""Chats, their transcripts, and new messages answered as a Server-Sent Events stream (docs/DESIGN.md §3.9)."""
 
 from __future__ import annotations
 
+import contextlib
+import json
+from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
-from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, StringConstraints
 
 from ..domain.projects import Chat, MessagePage
+from ..services.chat_turns import TEXT_MAX, ChatEvent
 from ..services.messages import PAGE_DEFAULT, PAGE_MAX
 from ..settings import Language
-from .deps import Chats, Messages
+from .deps import Chats, ChatTurns, Messages
 from .schemas import Body, Name, Patch
 
 router = APIRouter(tags=["chats"])
@@ -34,6 +39,36 @@ class ChatUpdate(Patch):
 
 class ChatList(BaseModel):
     items: list[Chat]
+
+
+class MessageCreate(Body):
+    text: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=TEXT_MAX)]
+    language: Language | None = None  # null: the language of the text (Devanagari → Hindi)
+
+
+SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+TEXT_ANSWER_LENGTH = "short"  # same style as voice for now; "full" gives text chats longer written answers
+
+_SSE_DOC = {
+    200: {
+        "description": (
+            "Server-Sent Events, in order: user_message (the saved user Message), sources ({sources: [Citation], "
+            "confidence, abstained}), delta ({text}) zero or more times, agent_message (the saved agent Message). "
+            "On failure: error ({detail, stage: retrieval | llm | storage}) and the stream ends. Closing the "
+            "connection mid-answer stops generation; the partial answer is saved with route.stopped = true."
+        ),
+        "content": {"text/event-stream": {"schema": {"type": "string"}}},
+    }
+}
+
+
+async def sse(events: AsyncGenerator[ChatEvent, None]) -> AsyncIterator[bytes]:
+    """``event: <name>`` + one ``data:`` line of compact JSON + a blank line, per event. When the client disconnects
+    the response is cancelled or closed, and so is the pipeline: it stops generating and keeps the partial answer."""
+    async with contextlib.aclosing(events):
+        async for e in events:
+            data = json.dumps(e.payload(), ensure_ascii=False, separators=(",", ":"))
+            yield f"event: {e.name}\ndata: {data}\n\n".encode()
 
 
 @router.get("/api/projects/{project_id}/chats")
@@ -79,3 +114,12 @@ async def list_messages(
     if after is not None and before is not None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "pass either 'after' or 'before', not both")
     return await messages.list(chat_id, after=after, before=before, limit=limit)
+
+
+@router.post("/api/chats/{chat_id}/messages", response_class=StreamingResponse, responses=_SSE_DOC)
+async def post_message(chat_id: str, body: MessageCreate, turns: ChatTurns) -> StreamingResponse:
+    """Send a text message and stream the answer. Unknown chat → 404 and invalid text → 422 before the stream
+    starts; after that, failures arrive as an ``error`` event (the user message stays saved). The turn itself is
+    ``ChatTurnService`` (shared with voice); this endpoint only serialises its events."""
+    turn = await turns.begin(chat_id, body.text, language=body.language, modality="text", length=TEXT_ANSWER_LENGTH)
+    return StreamingResponse(sse(turns.run(turn)), media_type="text/event-stream", headers=SSE_HEADERS)
