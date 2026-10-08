@@ -1,6 +1,6 @@
 """Text on its way to and from the speaker (docs/DESIGN.md §3.3 b-c): speakable chunks, what was heard, backchannels.
 
-    answer deltas → SpeechChunker → chunks for TTS: the first at the first clause boundary (or after 8 words, so audio
+    answer deltas → SpeechChunker → chunks for TTS: the first at the first clause boundary (or after 5 words, so audio
                     starts early, §9.5), then whole sentences; [S#] markers and markdown removed; at most
                     voice.max_spoken_sentences sentences are spoken (the rest stays on screen)
     chunks + played_ms → heard_text: fully played chunks + the share (by words) of the chunk playing at played_ms
@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from ..sources import strip_markers, trim_open_marker
 
-FIRST_CHUNK_MAX_WORDS = 8  # the first chunk is short so the first audio comes early (§9.5)
+FIRST_CHUNK_MAX_WORDS = 5  # a short first chunk starts audio early: 5 words ≈ 0.5 s of Kokoro on CPU, 8 ≈ 0.63 s (§9.5)
 FIRST_CHUNK_MIN_WORDS = 2  # ... but a clause boundary after one word ("So,") doesn't end it
 CHUNK_MAX_WORDS = 30  # a longer sentence is cut at its last clause boundary (or here) so speech keeps flowing
 
@@ -142,7 +142,7 @@ class SpeechChunker:
                     break
                 if n >= (1 if b.sentence else FIRST_CHUNK_MIN_WORDS):
                     return b
-            if len(words) > FIRST_CHUNK_MAX_WORDS:  # the 8th word is complete once a 9th has started
+            if len(words) > FIRST_CHUNK_MAX_WORDS:  # the last word is complete once the next has started
                 return _Boundary(words[FIRST_CHUNK_MAX_WORDS - 1].end(), False)
             return None
         boundaries = self._boundaries(text)

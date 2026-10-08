@@ -27,22 +27,20 @@ def chunk_stream(text: str, piece: int = 3, **kw) -> list[str]:
 
 
 def test_first_chunk_is_the_first_clause_then_whole_sentences():
-    text = "Yes, the EBITDA margin was 18.2% [S1]. Revenue grew 34% in FY24 [S2]. Margins improved."
+    text = "Yes, margin was 18.2% [S1]. Revenue grew 34% in FY24 [S2]. Margins improved."
     assert chunk_stream(text) == [
-        "Yes, the EBITDA margin was 18.2%.",  # "Yes," alone is too short to be the first chunk
+        "Yes, margin was 18.2%.",  # "Yes," alone is too short to be the first chunk
         "Revenue grew 34% in FY24.",
         "Margins improved.",
     ]
 
 
-def test_first_chunk_is_cut_after_eight_words_without_a_boundary():
-    text = "The company reported an EBITDA margin of eighteen point two percent in FY24."
-    chunks = chunk_stream(text)
-    assert chunks[0] == "The company reported an EBITDA margin of eighteen"
-    assert chunks[1:] == ["point two percent in FY24."]
+def test_first_chunk_is_cut_after_five_words_without_an_earlier_boundary():
+    text = "The company reported an EBITDA margin of 18.2% in FY24 [S1]. Next."
+    assert chunk_stream(text) == ["The company reported an EBITDA", "margin of 18.2% in FY24.", "Next."]
 
 
-def test_clause_boundary_within_eight_words_ends_the_first_chunk():
+def test_clause_boundary_within_five_words_ends_the_first_chunk():
     assert chunk_stream("In FY24, revenue grew 34% to 4,210 crore. Done.") == [
         "In FY24,",
         "revenue grew 34% to 4,210 crore.",
@@ -73,7 +71,7 @@ def test_markers_are_never_spoken_even_when_split_across_deltas():
 
 def test_hindi_sentences_end_at_the_danda():
     text = "वित्त वर्ष 2024 में EBITDA मार्जिन 18.2% था [S1]। राजस्व 34% बढ़ा।"
-    assert chunk_stream(text) == ["वित्त वर्ष 2024 में EBITDA मार्जिन 18.2% था।", "राजस्व 34% बढ़ा।"]
+    assert chunk_stream(text) == ["वित्त वर्ष 2024 में EBITDA", "मार्जिन 18.2% था।", "राजस्व 34% बढ़ा।"]
 
 
 def test_markdown_is_not_spoken():
