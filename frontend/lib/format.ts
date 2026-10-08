@@ -79,7 +79,7 @@ export function formatBytes(bytes: number): string {
   return `${value >= 10 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
 }
 
-export const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+export const plural = (n: number, one: string, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
 
 /** Case-insensitive search key. Kept length-preserving for the common case so match offsets map back. */
 export const searchKey = (s: string) => s.normalize("NFC").toLocaleLowerCase();

@@ -1,28 +1,30 @@
 "use client";
 
 /**
- * Everything a user can do to a project or chat, in one place, so the sidebar, page headers and lists offer the
- * same actions with the same dialogs and feedback. Dialogs: new project, rename, delete (confirm). Pin and archive
- * act at once and report through a toast (archive offers Undo).
+ * Everything a user can do to a project, chat or document, in one place, so the sidebar, page headers and lists
+ * offer the same actions with the same dialogs and feedback. Dialogs: new project, rename, delete (confirm). Pin and
+ * archive act at once and report through a toast (archive offers Undo).
  */
 
 import { useParams, useRouter } from "next/navigation";
 import { createContext, useCallback, useContext, useMemo, useState, type FormEvent, type ReactNode } from "react";
 
-import { errorMessage, type Chat, type Project } from "@/lib/api";
+import { errorMessage, type Chat, type Project, type ProjectDocument } from "@/lib/api";
 import { plural } from "@/lib/format";
 import { useWorkspace, useWorkspaceActions } from "@/lib/workspace";
 
 import { Dialog } from "./Dialog";
 import type { MenuItem } from "./Menu";
 import { useToast } from "./Toast";
+import { useUploads } from "./Uploads";
 
 type DialogState =
   | { kind: "newProject" }
   | { kind: "renameProject"; project: Project }
   | { kind: "deleteProject"; project: Project }
   | { kind: "renameChat"; chat: Chat }
-  | { kind: "deleteChat"; chat: Chat };
+  | { kind: "deleteChat"; chat: Chat }
+  | { kind: "deleteDocument"; document: ProjectDocument };
 
 export interface EntityActions {
   newProject: () => void;
@@ -35,6 +37,7 @@ export interface EntityActions {
   deleteChat: (c: Chat) => void;
   setChatPinned: (c: Chat, pinned: boolean) => Promise<void>;
   setChatArchived: (c: Chat, archived: boolean) => Promise<void>;
+  deleteDocument: (d: ProjectDocument) => void;
   /** The "⋯" menu items for a project / chat. */
   projectMenu: (p: Project) => MenuItem[];
   chatMenu: (c: Chat) => MenuItem[];
@@ -47,6 +50,7 @@ export function ActionsProvider({ children }: { children: ReactNode }) {
   const ws = useWorkspaceActions();
   const state = useWorkspace();
   const toast = useToast();
+  const { pick: pickFiles } = useUploads();
   const router = useRouter();
   const params = useParams<{ projectId?: string; chatId?: string }>();
   const [dialog, setDialog] = useState<DialogState | null>(null);
@@ -146,8 +150,10 @@ export function ActionsProvider({ children }: { children: ReactNode }) {
       deleteChat,
       setChatPinned,
       setChatArchived,
+      deleteDocument: (document) => setDialog({ kind: "deleteDocument", document }),
       creatingChatIn,
       projectMenu: (p) => [
+        { id: "upload", label: "Upload documents…", icon: "upload", onSelect: () => pickFiles(p.id) },
         { id: "rename", label: "Rename…", icon: "pencil", onSelect: () => renameProject(p) },
         {
           id: "pin",
@@ -175,7 +181,7 @@ export function ActionsProvider({ children }: { children: ReactNode }) {
         { id: "delete", label: "Delete…", icon: "trash", danger: true, separated: true, onSelect: () => deleteChat(c) },
       ],
     };
-  }, [setProjectPinned, setProjectArchived, newChat, setChatPinned, setChatArchived, creatingChatIn]);
+  }, [setProjectPinned, setProjectArchived, newChat, setChatPinned, setChatArchived, creatingChatIn, pickFiles]);
 
   return (
     <ActionsContext value={value}>
@@ -250,6 +256,25 @@ export function ActionsProvider({ children }: { children: ReactNode }) {
               : ". It has no messages yet."}
           </p>
           <p>This can't be undone.</p>
+        </ConfirmDeleteDialog>
+      )}
+      {dialog?.kind === "deleteDocument" && (
+        <ConfirmDeleteDialog
+          title="Delete document?"
+          confirmLabel="Delete document"
+          onClose={closeDialog}
+          onConfirm={async () => {
+            const { document } = dialog;
+            await ws.deleteDocument(document);
+            closeDialog();
+            toast({ message: `Deleted “${document.filename}”` });
+          }}
+        >
+          <p>
+            <strong>“{dialog.document.filename}”</strong> will be deleted from this machine and removed from search, so
+            chats can no longer answer from it. Chats limited to selected documents won't include it any more.
+          </p>
+          <p>Answers already given keep their text. This can't be undone.</p>
         </ConfirmDeleteDialog>
       )}
     </ActionsContext>

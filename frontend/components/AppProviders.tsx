@@ -1,6 +1,9 @@
 "use client";
 
-/** Client-side app state for every page: backend URL + config, health, the workspace store, toasts, actions. */
+/**
+ * Client-side app state for every page: backend URL + config, health, the workspace store, toasts, uploads,
+ * actions.
+ */
 
 import type { ReactNode } from "react";
 
@@ -12,6 +15,7 @@ import { ActionsProvider } from "./Actions";
 import { AppFrame } from "./AppFrame";
 import { AutoReconnect } from "./States";
 import { ToastProvider } from "./Toast";
+import { UploadsProvider } from "./Uploads";
 
 export function AppProviders({ backendUrl, children }: { backendUrl: string; children: ReactNode }) {
   return (
@@ -19,10 +23,12 @@ export function AppProviders({ backendUrl, children }: { backendUrl: string; chi
       <HealthProvider>
         <WorkspaceProvider>
           <ToastProvider>
-            <ActionsProvider>
-              <AutoReconnect />
-              <AppFrame>{children}</AppFrame>
-            </ActionsProvider>
+            <UploadsProvider>
+              <ActionsProvider>
+                <AutoReconnect />
+                <AppFrame>{children}</AppFrame>
+              </ActionsProvider>
+            </UploadsProvider>
           </ToastProvider>
         </WorkspaceProvider>
       </HealthProvider>

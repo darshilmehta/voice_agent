@@ -1,4 +1,4 @@
-/* Things that float above the page: dialogs, menus, toasts. */
+/* Things that float above the page: dialogs, menus, citation popovers, toasts. */
 
 .dialog {
   width: min(440px, calc(100vw - 32px));
@@ -136,6 +136,84 @@
   margin-top: 4px;
   padding-top: 4px;
   border-top: 1px solid var(--border);
+}
+
+/* ------------------------------------------------------------------ citation popover */
+
+.cite-pop {
+  position: fixed;
+  z-index: 65;
+  width: min(360px, calc(100vw - 16px));
+  padding: 11px 13px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow-lg);
+  font-size: 13.5px;
+  line-height: 1.45;
+  animation: menu-in 0.1s ease-out;
+}
+
+.cite-pop-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.cite-pop-num {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.cite-pop-icon {
+  color: var(--text-muted);
+}
+
+.cite-pop-name {
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cite-pop-pages {
+  margin: 3px 0 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.cite-pop-snippet {
+  max-height: 220px;
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border-left: 3px solid var(--accent);
+  border-radius: 0 8px 8px 0;
+  background: var(--surface-muted);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.cite-pop-empty {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-style: italic;
 }
 
 /* ------------------------------------------------------------------ toast */
