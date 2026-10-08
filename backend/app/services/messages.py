@@ -1,18 +1,45 @@
-"""Messages: append (used by the chat pipeline) and read a transcript page by page (docs/DESIGN.md §3.9)."""
+"""Messages: append (used by the chat pipeline) and read a transcript page by page (docs/DESIGN.md §3.9).
+
+Work that should follow a saved agent answer (the automatic chat title) subscribes with ``add_agent_message_hook``
+instead of being called from the chat pipeline: hooks are registered per metadata database, so every
+``MessageService`` on that database fires them, whoever created it (text turns, voice turns, tests).
+"""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import logging
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, get_args
+from weakref import WeakKeyDictionary
 
 from sqlalchemy import select, update
 
 from ..db import models as orm
 from ..domain.projects import Citation, Message, MessagePage, Modality, Role, coerce_citations
+from ..providers.storage import MetadataDB
 from .base import InvalidInput, NotFound, Service
+
+log = logging.getLogger(__name__)
 
 PAGE_DEFAULT = 50
 PAGE_MAX = 200
+
+AgentMessageHook = Callable[[Message], Awaitable[None]]
+_AGENT_HOOKS: WeakKeyDictionary[MetadataDB, list[AgentMessageHook]] = WeakKeyDictionary()
+
+
+def add_agent_message_hook(db: MetadataDB, hook: AgentMessageHook) -> Callable[[], None]:
+    """Call ``await hook(message)`` after every agent message saved through ``db``, once its transaction has
+    committed. Hooks must be quick (they run before the saver continues): anything slow goes to the job queue. A hook
+    that raises is logged and ignored, so it can never fail a chat turn. Returns a function that removes the hook."""
+    _AGENT_HOOKS.setdefault(db, []).append(hook)
+
+    def remove() -> None:
+        hooks = _AGENT_HOOKS.get(db, [])
+        if hook in hooks:
+            hooks.remove(hook)
+
+    return remove
 
 
 class MessageService(Service):
@@ -73,7 +100,17 @@ class MessageService(Service):
                 .values(updated_at=now)
                 .execution_options(synchronize_session=False)
             )
-        return Message.model_validate(message)
+        saved = Message.model_validate(message)
+        if role == "agent":
+            await self._run_agent_hooks(saved)
+        return saved
+
+    async def _run_agent_hooks(self, message: Message) -> None:
+        for hook in list(_AGENT_HOOKS.get(self.db, ())):
+            try:
+                await hook(message)
+            except Exception:
+                log.exception("agent-message hook %r failed (chat %s)", hook, message.chat_id)
 
     async def record_interruption(self, message_id: str, *, heard_text: str, reason: str) -> Message:
         """Mark an agent answer as cut short after it was saved (voice: the user barged in or said stop while it was

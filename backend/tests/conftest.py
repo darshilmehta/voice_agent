@@ -246,12 +246,15 @@ def fakes() -> Fakes:
 
 @pytest.fixture
 def make_app(load_local, fakes) -> Callable[..., TestClient]:
-    """``with make_app(**env) as api``: the app with the fakes installed, on the tmp_path database and uploads."""
+    """``with make_app(**env) as api``: the app with the fakes installed, on the tmp_path database and uploads.
 
-    def make(fakes_: Fakes | None = None, **env: str) -> TestClient:
+    Automatic chat titles are off unless ``auto_titles=True``: their background model call would otherwise show up in
+    ``fakes.llm.calls`` of every test that counts the LLM calls of a turn."""
+
+    def make(fakes_: Fakes | None = None, *, auto_titles: bool = False, **env: str) -> TestClient:
         settings = load_local(**env)
         container = (fakes_ or fakes).install(build_container(settings, http=mock_http()))
-        return TestClient(create_app(settings, container))
+        return TestClient(create_app(settings, container, auto_titles=auto_titles))
 
     return make
 
