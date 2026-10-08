@@ -180,7 +180,9 @@ class Turn:
     input_latency: dict[str, Any] | None = None  # saved as the user message's latency (voice: VAD and STT timings)
 
 
-InterruptReason = Literal["barge_in", "stop"]
+# Why a voice answer was cut short: the user talked over it, pressed stop, or the session ended (client gone, replaced
+# by a newer session for the chat, server shutdown).
+InterruptReason = Literal["barge_in", "stop", "disconnect"]
 
 
 @dataclass(eq=False)
@@ -192,8 +194,8 @@ class AnswerStop:
     voice turn always ends with an agent message), and once the cancelled consumer has finished:
 
     - ``saved`` is that message (None if the save failed or the answer had already been saved complete);
-    - ``completed`` is the complete answer when it was saved before the stop took effect;
-    - ``user`` is the turn's user message (set as soon as it is saved), even if its event was never consumed.
+    - ``completed`` is the complete answer when it was saved (or its save had already started) before the stop;
+    - ``user`` is the turn's user message (set as soon as it is saved, or passed to ``run``).
     """
 
     heard_text: str | None = None
@@ -229,6 +231,7 @@ class _Progress:
     first_delta_ms: float | None = None
     llm_start: float | None = None
     saving: bool = False  # the complete answer is being saved: a stop must not save a second copy
+    final_save: asyncio.Task[Message] | None = None  # that save, as its own task: a stop waits for it
     final: Message | None = None  # the complete answer, saved
 
 
@@ -320,26 +323,56 @@ class ChatTurnService:
         language_ = choose_language(text, language, fallback)
         return Turn(chat, text, language_, language, modality, length, input_language, input_latency)
 
-    async def run(self, turn: Turn, *, stop: AnswerStop | None = None) -> AsyncGenerator[ChatEvent, None]:
-        """The turn's events. ``stop``: see ``AnswerStop`` (callers that know what was heard of a stopped answer)."""
+    async def save_user_message(self, turn: Turn) -> Message:
+        """Save the turn's user message. ``run`` does it itself unless the caller saved it first (voice: so that a
+        stop arriving while the turn starts can't lose it)."""
+        return await self.messages.append(
+            turn.chat.id,
+            role="user",
+            text=turn.text,
+            modality=turn.modality,
+            language=turn.input_language or message_language(turn.text) or turn.language,
+            latency=turn.input_latency,
+        )
+
+    async def save_unanswered(self, turn: Turn, *, heard_text: str, reason: InterruptReason) -> Message:
+        """Close a turn that was stopped before its answer had any text (voice): an empty agent message with
+        ``route.stopped``, so the transcript shows the question was stopped, not lost."""
+        plan = TurnPlan(query=turn.text, language=turn.language)
+        route = self._route(turn, plan, None, abstained=False, reason=None, sources=0, stopped=True)
+        route["interrupted"] = reason
+        return await self.messages.append(
+            turn.chat.id,
+            role="agent",
+            text="",
+            modality=turn.modality,
+            heard_text=heard_text,
+            language=turn.language,
+            route=route,
+        )
+
+    async def run(
+        self, turn: Turn, *, stop: AnswerStop | None = None, user: Message | None = None
+    ) -> AsyncGenerator[ChatEvent, None]:
+        """The turn's events. ``stop``: see ``AnswerStop`` (callers that know what was heard of a stopped answer).
+        ``user``: the user message, if the caller already saved it with ``save_user_message``."""
         clock = _Clock()
         chat = turn.chat
-        try:
-            user = await self.messages.append(
-                chat.id,
-                role="user",
-                text=turn.text,
-                modality=turn.modality,
-                language=turn.input_language or message_language(turn.text) or turn.language,
-                latency=turn.input_latency,
-            )
-            history = await self._history(chat.id, before=user.seq)
-        except Exception as e:
-            log.exception("chat %s: saving the user message failed", chat.id)
-            yield ErrorEvent("storage", f"could not save the message: {_describe(e)}")
-            return
+        if user is None:
+            try:
+                user = await self.save_user_message(turn)
+            except Exception as e:
+                log.exception("chat %s: saving the user message failed", chat.id)
+                yield ErrorEvent("storage", f"could not save the message: {_describe(e)}")
+                return
         if stop is not None:
             stop.user = user
+        try:
+            history = await self._history(chat.id, before=user.seq)
+        except Exception as e:
+            log.exception("chat %s: reading the chat history failed", chat.id)
+            yield ErrorEvent("storage", f"could not read the chat history: {_describe(e)}")
+            return
         p = _Progress(TurnPlan(query=turn.text, language=turn.language))
         try:
             yield UserMessageEvent(user)
@@ -347,9 +380,14 @@ class ChatTurnService:
                 async for event in answer:
                     yield event
         except (asyncio.CancelledError, GeneratorExit):
-            # Stopped (client gone, barge-in, "stop"): keep what was generated. The save runs as its own task, so a
-            # consumer whose cancellation keeps re-firing (anyio cancel scopes) can't interrupt it; this frame waits if
-            # it can. A caller passing ``stop`` (voice) always gets a saved answer, even an empty one.
+            # Stopped (client gone, barge-in, "stop"): keep what was generated. Saves run as their own tasks, so a
+            # consumer whose cancellation keeps re-firing (anyio cancel scopes) can't interrupt them; this frame waits
+            # if it can. A caller passing ``stop`` (voice) always gets a saved answer, even an empty one.
+            if p.final_save is not None:  # the complete answer was being saved: wait for it instead
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(p.final_save)
+                if p.final_save.done() and not p.final_save.cancelled() and p.final_save.exception() is None:
+                    p.final = p.final_save.result()
             if p.final is not None:
                 if stop is not None:
                     stop.completed = p.final
@@ -442,7 +480,8 @@ class ChatTurnService:
     ) -> list[LLMMessage]:
         messages = [LLMMessage("system", answer_system_prompt(plan.language, turn.length))]
         for m in history:
-            text = strip_markers(m.heard_text or m.text)[:HISTORY_CHARS]  # interrupted voice answers: what was heard
+            # Interrupted voice answers: only what was heard ("" when nothing was: the answer is left out).
+            text = strip_markers(m.heard_text if m.heard_text is not None else m.text)[:HISTORY_CHARS]
             if text:
                 messages.append(LLMMessage("user" if m.role == "user" else "assistant", text))
         messages.append(LLMMessage("user", answer_user_prompt(plan.query, sources, plan.language)))
@@ -505,8 +544,9 @@ class ChatTurnService:
         p: _Progress,
     ) -> AsyncGenerator[ChatEvent, None]:
         p.saving = True  # from here on a stop must not save a second copy
-        try:
-            agent = await self.messages.append(
+        # Its own task: a stop arriving mid-save can't roll it back, and run's stop handler waits for it.
+        p.final_save = detach(
+            self.messages.append(
                 turn.chat.id,
                 role="agent",
                 text=answer,
@@ -516,6 +556,9 @@ class ChatTurnService:
                 route=route,
                 latency=latency,
             )
+        )
+        try:
+            agent = await asyncio.shield(p.final_save)
         except Exception as e:
             log.exception("chat %s: saving the answer failed", turn.chat.id)
             yield ErrorEvent("storage", f"could not save the answer: {_describe(e)}")

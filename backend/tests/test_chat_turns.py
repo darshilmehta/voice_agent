@@ -217,3 +217,61 @@ async def test_voice_spoken_language_and_stt_timings_are_saved_on_the_user_messa
     [e async for e in pipeline.run(turn)]
     user, agent = await transcript(db, chat_id)
     assert (user.language, user.latency, agent.language) == ("hi", stt, "hi")  # Hinglish, spoken as Hindi
+
+
+async def test_an_answer_nobody_heard_is_left_out_of_the_next_prompt(setup, db, fakes):
+    """Review item 12: heard_text "" (cut before any audio played) means nothing was heard, not "not interrupted"."""
+    pipeline, chat_id = setup
+    fakes.llm.delay = 0.0
+    messages = MessageService(db)
+    await messages.append(chat_id, role="user", text="First question?", modality="voice")
+    await messages.append(chat_id, role="agent", text="An answer nobody heard [S1].", modality="voice", heard_text="")
+    await messages.append(chat_id, role="user", text="Second question?", modality="voice")
+    await messages.append(chat_id, role="agent", text="Partly heard answer.", modality="voice", heard_text="Partly")
+    turn = await pipeline.begin(chat_id, "What was the EBITDA margin in FY24?", modality="voice")
+    [e async for e in pipeline.run(turn)]
+    history = [(m.role, m.content) for m in fakes.llm.calls[-1]["messages"][1:-1]]
+    assert history == [("user", "First question?"), ("user", "Second question?"), ("assistant", "Partly")]
+
+
+async def test_the_caller_can_save_the_user_message_first(setup, db, fakes):
+    """Review item 2: the voice session saves the user message before the answer task, so a stop can't lose it."""
+    pipeline, chat_id = setup
+    fakes.llm.delay = 0.0
+    turn = await pipeline.begin(chat_id, "What was the EBITDA margin in FY24?", modality="voice")
+    user = await pipeline.save_user_message(turn)
+    stop = AnswerStop()
+    events = [e async for e in pipeline.run(turn, stop=stop, user=user)]
+    assert events[0].name == "user_message" and events[0].message == user and stop.user == user
+    assert [m.role for m in await transcript(db, chat_id)] == ["user", "agent"]  # saved once, not twice
+
+
+async def test_a_stop_during_the_final_save_waits_for_it_and_hands_the_answer_back(setup, db, fakes, monkeypatch):
+    """Review item 3: the complete answer's save can't be rolled back by a stop; the stop gets it as ``completed``."""
+    pipeline, chat_id = setup
+    fakes.llm.delay = 0.0
+    original = MessageService.append
+    saving = asyncio.Event()
+
+    async def slow_append(self, chat_id_, **kw):
+        if kw.get("role") == "agent":
+            saving.set()
+            await asyncio.sleep(0.2)
+        return await original(self, chat_id_, **kw)
+
+    monkeypatch.setattr(MessageService, "append", slow_append)
+    turn = await pipeline.begin(chat_id, "What was the EBITDA margin in FY24?", modality="voice")
+    stop = AnswerStop(heard_text="Margin", reason="stop")
+
+    async def consume() -> None:
+        async with contextlib.aclosing(pipeline.run(turn, stop=stop)) as events:
+            async for _ in events:
+                pass
+
+    task = asyncio.create_task(consume())
+    await saving.wait()
+    task.cancel()
+    await asyncio.wait([task])
+    assert stop.saved is None and stop.completed is not None and stop.completed.text == REPLY
+    _, agent = await transcript(db, chat_id)
+    assert agent == stop.completed  # saved once, complete (the session then records what was heard)

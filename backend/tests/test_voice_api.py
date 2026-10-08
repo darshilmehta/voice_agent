@@ -219,16 +219,16 @@ def test_audio_before_start_and_malformed_input_are_errors_but_the_session_stays
             "stage": "audio",
         }
         c.start()
-        ws.send_bytes(b"\x00\x01\x02")  # odd length: not PCM16
-        assert c.next()["stage"] == "audio"
+        for _ in range(5):
+            ws.send_bytes(b"\x00\x01\x02")  # odd length: not PCM16
         ws.send_text("not json")
-        assert c.next() == {
-            "type": "error",
-            "detail": "control messages must be JSON: Expecting value",
-            "stage": "audio",
-        }
         c.send("dance")
-        assert c.next()["stage"] == "audio"
+        errors = c.quiet(0.5)
+        assert [e["detail"] for e in of(errors, "error")] == [  # one error per kind, not one per bad message
+            "audio frames must be PCM16 mono 16 kHz, at most 1 s (got 3 bytes)",
+            "control messages must be JSON: Expecting value",
+        ]
+        assert {e["stage"] for e in of(errors, "error")} == {"audio"}
         c.say(QUESTION)
         assert one(c.until("agent_message"), "agent_message")["message"]["role"] == "agent"
 
@@ -250,7 +250,8 @@ def test_a_spoken_question_is_answered_in_order_with_audio(voice):
         assert one(items, "turn") == {"type": "turn", "turn_id": 1}
         assert kinds(main)[-1] == "agent_message"
 
-        # every chunk is announced, then its frames follow contiguously, in order, headed (turn, chunk, seq)
+        # every chunk is announced, then its frames follow in order (other messages may come in between), headed
+        # (turn, chunk, seq), before the next chunk is announced
         chunks = of(items, "audio_chunk")
         assert [ch["text"] for ch in chunks] == SPOKEN
         assert [(ch["turn_id"], ch["chunk_index"], ch["duration_ms"]) for ch in chunks] == [
@@ -258,9 +259,9 @@ def test_a_spoken_question_is_answered_in_order_with_audio(voice):
             (1, 1, 500.0),
             (1, 2, 500.0),
         ]
-        for ch in chunks:
-            at = main.index(ch)
-            frames = [parse_frame(f) for f in main[at + 1 : at + 4]]
+        for ch, following in zip(chunks, [*chunks[1:], None], strict=True):
+            at, until = main.index(ch), (main.index(following) if following else len(main))
+            frames = [parse_frame(f) for f in main[at + 1 : until] if isinstance(f, bytes)]
             assert [(t, i, s) for t, i, s, _ in frames] == [(1, ch["chunk_index"], s) for s in range(3)]
             assert sum(len(pcm) for *_, pcm in frames) == ch["duration_ms"] * OUT_RATE // 1000 * 2
         assert main.index(chunks[0]) > main.index(of(items, "delta")[0])
@@ -430,8 +431,7 @@ def test_an_utterance_while_thinking_cancels_the_answer_even_without_barge_in_st
             "barge_in",
             "state",  # interrupted
             "agent_message",  # turn 1, closed before anything of turn 2
-            "state",  # listening
-            "state",  # thinking
+            "state",  # thinking: the correction is being answered
             "user_message",
         ]
         assert one(items, "barge_in") == {"type": "barge_in", "turn_id": 1, "decision": "stop"}
@@ -517,7 +517,7 @@ def test_ending_the_session_mid_answer_saves_it_and_closes_normally(voice):
         assert c.until(lambda m: isinstance(m, Closed))[-1] == Closed(1000)
     agent = voice.transcript()[-1]
     assert agent["heard_text"] == "The EBITDA margin was 18.2%. Revenue grew 34% in FY24."
-    assert agent["route"]["interrupted"] == "stop"
+    assert agent["route"]["interrupted"] == "disconnect" and agent["route"]["stopped"] is True
 
 
 # ------------------------------------------------------------------ failures keep the session open

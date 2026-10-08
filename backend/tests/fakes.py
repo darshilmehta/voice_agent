@@ -394,19 +394,26 @@ class FakeSTT(SpeechRecognizer):
     name = "fake"
 
     def __init__(self) -> None:
-        self.scripts: dict[int, str] = {}
+        self.scripts: dict[int, str | Callable[[float], str]] = {}  # a callable gets the audio's length in ms
         self.calls: list[dict[str, Any]] = []
+        self.cancelled = 0  # transcriptions cancelled while running (stale speculative jobs)
         self.fail_with: Exception | None = None
         self.delay = 0.0
 
     async def transcribe(self, pcm16k: np.ndarray, languages: Sequence[str]) -> Transcript:  # type: ignore[override]
         tone = round(float(np.abs(pcm16k).max()) * 100) if pcm16k.size else 0
-        self.calls.append({"tone": tone, "ms": len(pcm16k) * 1000 / IN_RATE, "languages": list(languages)})
+        ms = len(pcm16k) * 1000 / IN_RATE
+        self.calls.append({"tone": tone, "ms": ms, "languages": list(languages)})
         if self.delay:
-            await asyncio.sleep(self.delay)
+            try:
+                await asyncio.sleep(self.delay)
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
         if self.fail_with is not None:
             raise self.fail_with
-        text = self.scripts.get(tone, "")
+        script = self.scripts.get(tone, "")
+        text = script(ms) if callable(script) else script
         language = languages[0] if len(languages) == 1 else (message_language(text) or "en")
         return Transcript(text, language)  # type: ignore[arg-type]
 

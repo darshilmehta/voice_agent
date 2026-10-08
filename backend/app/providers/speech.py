@@ -21,8 +21,6 @@ Heavy libraries come from the optional ``ml`` group and are imported lazily; inf
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import hashlib
 import importlib.util
 import os
 import tempfile
@@ -341,7 +339,8 @@ def shorten_espeak_data_path() -> None:
     """espeak-ng (Kokoro's Hindi G2P, via misaki) keeps its data path in a 160-byte buffer. A longer path, as in a deep
     virtualenv (git worktrees), is cut silently; espeak then falls back to a path compiled into the wheel and *exits
     the process*. When the bundled data path is that long, point ``ESPEAK_DATA_PATH`` (espeak's next choice, which
-    phonemizer doesn't resolve) at a short symlink to it."""
+    phonemizer doesn't resolve) at a short symlink to it, made in a fresh private directory (``mkdtemp``: mode 0700,
+    unpredictable name), so no other user can plant or swap the link."""
     if "ESPEAK_DATA_PATH" in os.environ:
         return
     spec = importlib.util.find_spec("espeakng_loader")
@@ -350,10 +349,10 @@ def shorten_espeak_data_path() -> None:
     data = Path(spec.origin).parent / "espeak-ng-data"
     if len(str(data)) < ESPEAK_PATH_MAX or not data.is_dir():
         return
-    link = Path(tempfile.gettempdir()) / f"espeak-ng-data-{hashlib.sha256(str(data).encode()).hexdigest()[:12]}"
-    if not link.exists():
-        with contextlib.suppress(FileExistsError):  # created concurrently
-            link.symlink_to(data, target_is_directory=True)
+    link = Path(tempfile.mkdtemp(prefix="espeak-")) / "data"
+    link.symlink_to(data, target_is_directory=True)
+    if len(str(link)) >= ESPEAK_PATH_MAX:  # an unusually long TMPDIR: nothing short to point at
+        return
     os.environ["ESPEAK_DATA_PATH"] = str(link)
 
 

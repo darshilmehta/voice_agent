@@ -1,5 +1,5 @@
 """A live voice conversation in one chat: the state machine behind ``WS /ws/chats/{chat_id}/voice`` (docs/DESIGN.md
-§3.3, §3.5, §3.9).
+§3.3, §3.5, §3.9, §3.10).
 
     LISTENING ──end of turn (server VAD)──► THINKING ──first audio chunk──► SPEAKING ──playback done──► LISTENING
         ▲                                     │   ▲                            │
@@ -7,18 +7,23 @@
         └──────────── INTERRUPTED ◄───────────┴────────────────────────────────┘ answer cut, what was heard saved
 
 - Audio in: PCM16 16 kHz → Silero (this session's state) → ``Endpointer``. At half the end-of-turn silence the
-  utterance is transcribed speculatively; at the end of the turn that transcript is reused unless speech resumed.
+  utterance is transcribed speculatively; at the end of the turn that transcript is reused unless speech resumed (a
+  stale speculative job is cancelled, so it never queues in front of the next one).
 - A user turn is ``ChatTurnService`` with ``modality="voice"``, ``length="short"``: the same pipeline as text chat.
-  Its deltas go to the client and through ``SpeechChunker`` to TTS; each chunk is announced (``audio_chunk``) and
-  followed by its binary frames. ``agent_message`` is sent once the last chunk is out.
+  The session saves the user message first (so a stop can't lose it), then runs the answer as a task. Deltas go to
+  the client and through ``SpeechChunker`` to TTS; each chunk is announced (``audio_chunk``), then its binary frames
+  follow (one send-lock acquisition per frame, so control messages aren't held up). ``agent_message`` is sent once the
+  last frame is out.
 - Barge-in, duck-then-decide: the client ducks and sends ``barge_in_start``; the server decides within
-  ``voice.barge_in.decision_timeout_ms`` from its own VAD and a transcript of the new speech (``barge_in_verdict``).
-  On "stop" the answer is cancelled (LLM stream closed, queued TTS dropped) and saved with ``heard_text``; the new
-  utterance becomes the next user turn when it ends. An utterance that ends while the agent is answering and isn't a
-  backchannel stops the answer too, even without ``barge_in_start``.
-- One utterance is processed at a time (STT, then the turn), in order; transcript order is preserved by
-  ``_turn_lock`` (an interrupted answer is saved before the next user message).
-- Failures are reported as ``error {stage}`` and the session goes on.
+  ``voice.barge_in.decision_timeout_ms`` from its own VAD and transcripts of the new speech (``barge_in_verdict``).
+  On "stop" the turn is muted and its task cancelled at once, then the turn is *settled* by its own task: the
+  decision is sent, the stopped answer saved with ``heard_text`` (an empty one if nothing had been generated) and sent
+  as ``agent_message``. The next turn waits for pending settles, so the cut answer always precedes the next
+  ``user_message``. An utterance that ends while the agent is answering and isn't a backchannel stops the answer too,
+  even without ``barge_in_start``.
+- An utterance that is ignored (too short, a backchannel, hums, noise, failed STT) still leaves the client in a known
+  state: ``user_speech end``, ``barge_in resume`` if a decision was pending, and the current ``state`` again.
+- Failures are reported as ``error {stage}`` and the session goes on; repeated input errors at most every few seconds.
 """
 
 from __future__ import annotations
@@ -76,7 +81,15 @@ from .protocol import (
     dumps,
     parse_client_message,
 )
-from .speech_text import SpeechChunker, SpokenChunk, heard_text, is_backchannel, is_filler, normalize_utterance
+from .speech_text import (
+    SpeechChunker,
+    SpokenChunk,
+    heard_text,
+    is_backchannel,
+    is_filler,
+    normalize_utterance,
+    real_words,
+)
 from .turn_taking import (
     FRAME_SAMPLES,
     BargeInEvidence,
@@ -96,6 +109,8 @@ log = logging.getLogger(__name__)
 
 PLAYBACK_GRACE_S = 2.0  # a turn whose client never says playback_done ends this long after its audio should have
 CLOSE_WAIT_S = 10.0  # how long a replaced session may take to save its state and close
+ERROR_REPEAT_S = 5.0  # the same kind of input error (bad frames, VAD, bad control messages) at most this often
+BARGE_IN_MATCH_S = 0.5  # a barge_in_start belongs to an utterance that started at most this long before it
 
 
 class Transport(Protocol):
@@ -130,9 +145,12 @@ class AgentTurn:
     stop: AnswerStop = field(default_factory=AnswerStop)
     task: asyncio.Task[None] | None = None
     chunks: list[SpokenChunk] = field(default_factory=list)  # announced to the client, in order
+    play_starts: list[float] = field(default_factory=list)  # when the client should start playing each chunk
+    play_end: float = 0.0  # perf_counter when the client should have played everything sent so far
     sent_ms: float = 0.0  # audio sent so far
     message: Message | None = None  # the saved, complete answer
     audio_done: bool = False  # generation finished and every chunk was sent
+    errored: bool = False  # the pipeline reported an error: the cut-off fragment is not spoken
     cut: bool = False  # stopped or barged in: nothing more of this turn (sources, deltas, audio) is sent
     interrupted: bool = False  # the interruption has been handled (or is being handled)
     user_sent: bool = False  # user_message sent to the client
@@ -141,7 +159,8 @@ class AgentTurn:
     first_audio_at: float | None = None
     reported_ms: float | None = None  # last playback progress from the client
     reported_at: float = 0.0
-    barge_in_ms: float | None = None  # played_ms when the user started talking over the answer
+    barge_in_ms: float | None = None  # played_ms of the latest barge_in_start
+    barge_in_at: float | None = None  # when it arrived (perf_counter)
     playback_timer: asyncio.TimerHandle | None = None
     marks: dict[str, float] = field(default_factory=dict)  # perf_counter timestamps for the latency log
 
@@ -154,6 +173,7 @@ class PendingBargeIn:
     stt: asyncio.Task[None] | None = None
     transcript: str | None = None
     backchannel: bool | None = None
+    real_words: int = 0
 
 
 @dataclass(eq=False)
@@ -161,6 +181,11 @@ class _EndedUtterance:
     utterance: Utterance
     speculative: asyncio.Task[Transcript | None] | None
     ended_at: float  # perf_counter at the end of turn
+
+    @property
+    def started_at(self) -> float:
+        """When the speech began (audio arrives in real time, so audio time is wall time)."""
+        return self.ended_at - (self.utterance.speech_ms + self.utterance.silence_ms) / 1000
 
 
 class VoiceSession:
@@ -197,10 +222,13 @@ class VoiceSession:
         self._rest = np.zeros(0, dtype=np.float32)
         self._turn: AgentTurn | None = None
         self._turn_ids = 0
-        self._turn_lock = asyncio.Lock()
+        self._turn_lock = asyncio.Lock()  # one settle at a time
+        self._settling: set[asyncio.Task[None]] = set()  # interrupted turns being saved; the next turn waits for them
         self._pending: PendingBargeIn | None = None
         self._speculative: asyncio.Task[Transcript | None] | None = None
         self._utterances: asyncio.Queue[_EndedUtterance] = asyncio.Queue()
+        self._processing = False  # the worker is transcribing or starting a turn for an utterance
+        self._stop_at: float | None = None  # the last "stop": utterances that ended before it are not answered
         self._send_lock = asyncio.Lock()
         self._open = True  # the transport can still be written to
         self._close_requested = asyncio.Event()
@@ -209,7 +237,7 @@ class VoiceSession:
         self._finished = asyncio.Event()
         self._tasks: set[asyncio.Task[Any]] = set()
         self._state: AgentState | None = None
-        self._warned_early_audio = False
+        self._errors_sent: dict[str, float] = {}
 
     @classmethod
     def from_container(cls, chat: Chat, transport: Transport, container: Container) -> VoiceSession:
@@ -271,7 +299,9 @@ class VoiceSession:
             if pending is not None and pending.deadline is not None:
                 pending.deadline.cancel()
             if self._turn is not None:
-                await self._interrupt(self._turn, "stop", None)
+                await self._interrupt(self._turn, "disconnect", None)
+            if self._settling:  # interruptions started before (they save what was heard): let them finish
+                await asyncio.wait(set(self._settling))
             tasks = list(self._tasks)
             for task in tasks:
                 task.cancel()
@@ -322,13 +352,41 @@ class VoiceSession:
             self._open = False
             self._close_requested.set()
 
-    async def _error(self, stage: ErrorStage, detail: str) -> None:
+    async def _send_for(self, agent: AgentTurn, message: dict[str, Any]) -> None:
+        """Send a message of a turn unless the turn has been cut (checked under the send lock, so nothing of a cut
+        turn follows the barge_in decision or the reaction to stop)."""
+        async with self._send_lock:
+            if not agent.cut:
+                await self._send_text_unlocked(dumps(message))
+
+    async def _error(self, stage: ErrorStage, detail: str, *, repeat_key: str | None = None) -> None:
+        """Report a failure. With ``repeat_key``, errors of that kind are sent at most every ERROR_REPEAT_S (a client
+        sending bad frames 30 times a second gets one error, not 30)."""
+        if repeat_key is not None:
+            now = time.monotonic()
+            last = self._errors_sent.get(repeat_key)
+            if last is not None and now - last < ERROR_REPEAT_S:
+                return
+            self._errors_sent[repeat_key] = now
         await self._send({"type": "error", "detail": detail, "stage": stage})
 
     async def _set_state(self, state: AgentState) -> None:
         if state != self._state:
             self._state = state
             await self._send({"type": "state", "state": state})
+
+    def _current_state(self) -> AgentState:
+        agent = self._turn
+        if agent is not None:
+            return "speaking" if agent.chunks else "thinking"
+        if self._processing or not self._utterances.empty():
+            return "thinking"
+        return "listening"
+
+    async def _resend_state(self) -> None:
+        """Send the current state again, even if unchanged (after an utterance that was ignored)."""
+        self._state = None
+        await self._set_state(self._current_state())
 
     # -------------------------------------------------------------- receiving
 
@@ -344,7 +402,7 @@ class VoiceSession:
             try:
                 message = parse_client_message(data)
             except ProtocolError as e:
-                await self._error("audio", str(e))
+                await self._error("audio", str(e), repeat_key="control")
                 continue
             if isinstance(message, End):
                 return
@@ -363,27 +421,28 @@ class VoiceSession:
                         "language": language,
                     }
                 )
-                self._state = None  # always (re)announce the state after ready
-                await self._set_state(self._current_state())
+                await self._resend_state()
             case BargeInStart():
                 await self._on_barge_in_start(message)
             case Playback(turn_id=turn_id, played_ms=played_ms):
                 agent = self._turn
                 if agent is not None and agent.id == turn_id:
-                    agent.reported_ms, agent.reported_at = played_ms, time.perf_counter()
+                    now = time.perf_counter()
+                    agent.reported_ms, agent.reported_at = played_ms, now
+                    # The client tells how far it is: the rest can't finish before now + what is left to play.
+                    agent.play_end = max(agent.play_end, now + max(0.0, agent.sent_ms - played_ms) / 1000)
             case PlaybackDone(turn_id=turn_id):
                 agent = self._turn
                 if agent is not None and agent.id == turn_id and agent.audio_done:
                     await self._finish_turn(agent)
             case Stop():
+                # Utterances that ended before this are not answered either (one may be in STT while the client
+                # already shows "thinking"): they are saved with an empty, stopped answer (§3.10).
+                self._stop_at = time.perf_counter()
                 if self._turn is not None:
                     await self._interrupt(self._turn, "stop", None)
-
-    def _current_state(self) -> AgentState:
-        agent = self._turn
-        if agent is None:
-            return "listening"
-        return "speaking" if agent.chunks else "thinking"
+                elif self._processing or not self._utterances.empty():
+                    await self._set_state("interrupted")
 
     def _languages(self) -> list[Language]:
         return [self._language] if self._language else list(self.settings.stt.languages)
@@ -392,12 +451,16 @@ class VoiceSession:
 
     async def _on_audio(self, data: bytes) -> None:
         if not self._started:
-            if not self._warned_early_audio:
-                self._warned_early_audio = True
-                await self._error("audio", 'audio before start is ignored: send {"type": "start"} first')
+            await self._error(
+                "audio", 'audio before start is ignored: send {"type": "start"} first', repeat_key="early-audio"
+            )
             return
         if len(data) % 2 or len(data) > MAX_INPUT_FRAME_BYTES:
-            await self._error("audio", f"audio frames must be PCM16 mono 16 kHz, at most 1 s (got {len(data)} bytes)")
+            await self._error(
+                "audio",
+                f"audio frames must be PCM16 mono 16 kHz, at most 1 s (got {len(data)} bytes)",
+                repeat_key="frame",
+            )
             return
         samples = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
         buffer = np.concatenate([self._rest, samples]) if self._rest.size else samples
@@ -410,7 +473,7 @@ class VoiceSession:
             probabilities = await self._vad_stream(frames)
         except Exception as e:
             log.exception("voice session %s: VAD failed", self.id)
-            await self._error("audio", f"voice activity detection failed: {_describe(e)}")
+            await self._error("audio", f"voice activity detection failed: {_describe(e)}", repeat_key="vad")
             return
         for frame, probability in zip(frames, probabilities, strict=True):
             for event in self._endpointer.push(frame, probability):
@@ -423,11 +486,11 @@ class VoiceSession:
                 await self._send({"type": "user_speech", "phase": "start"})
             case SpeechPaused(audio=audio):
                 self._drop_speculative()
-                self._speculative = self._spawn(self._transcribe(audio, partial=True), f"{self.id}-speculative-stt")
+                self._speculative = self._spawn(self._speculate(audio), f"{self.id}-speculative-stt")
             case SpeechResumed():
                 self._drop_speculative()
             case SpeechEnded(utterance=utterance):
-                speculative, self._speculative = self._speculative, None
+                speculative, self._speculative = self._speculative, None  # handed to the worker, still valid
                 await self._send({"type": "user_speech", "phase": "end"})
                 if self._turn is None:
                     await self._set_state("thinking")
@@ -435,23 +498,33 @@ class VoiceSession:
             case SpeechDiscarded():
                 self._drop_speculative()
                 await self._send({"type": "user_speech", "phase": "end"})
-                if self._pending is not None:
-                    await self._decide(self._pending, "resume")
+                await self._ignored_utterance()
 
     def _drop_speculative(self) -> None:
-        # A running transcription can't be interrupted (it runs in a thread); its result is simply not used.
-        self._speculative = None
+        """Speech resumed (or a new pause): the speculative transcript is stale. Cancelling it also takes a job that
+        hasn't started off the STT thread's queue, so it can't delay the next transcription."""
+        if self._speculative is not None:
+            self._speculative.cancel()
+            self._speculative = None
 
-    async def _transcribe(self, audio: np.ndarray, *, partial: bool) -> Transcript | None:
+    async def _transcribe(self, audio: np.ndarray, *, report: bool) -> Transcript | None:
         try:
-            transcript = await self.stt.transcribe(audio, self._languages())
+            return await self.stt.transcribe(audio, self._languages())
         except Exception as e:
             log.warning("voice session %s: transcription failed: %s", self.id, _describe(e))
-            if not partial:
+            if report:
                 await self._error("stt", f"transcription failed: {_describe(e)}")
             return None
-        if partial and transcript.text:
+
+    async def _speculate(self, audio: np.ndarray) -> Transcript | None:
+        """Transcribe the utterance during the end-of-turn silence (§9.4); also evidence for a pending barge-in."""
+        transcript = await self._transcribe(audio, report=False)
+        if transcript is not None and transcript.text:
             await self._send({"type": "transcript_partial", "text": transcript.text})
+            pending = self._pending
+            if pending is not None:  # a fuller transcript than the barge-in snapshot
+                self._note_transcript(pending, transcript.text)
+                await self._evaluate(pending, deadline_passed=False)
         return transcript
 
     # -------------------------------------------------------------- utterances → turns
@@ -459,7 +532,28 @@ class VoiceSession:
     async def _utterance_worker(self) -> None:
         while True:
             ended = await self._utterances.get()
-            await self._handle_utterance(ended)
+            self._processing = True
+            try:
+                await self._handle_utterance(ended)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # e.g. "database is locked": report it and keep the session going
+                log.exception("voice session %s: handling an utterance failed", self.id)
+                self._processing = False
+                await self._error("storage", f"could not handle what was said: {_describe(e)}")
+                await self._resend_state()
+            finally:
+                self._processing = False
+
+    async def _ignored_utterance(self, *, done_processing: bool = False) -> None:
+        """An utterance that won't be answered (too short, backchannel, hums, noise, failed STT): resolve a pending
+        barge-in as "resume" and send the current state again, so the client knows what happens next.
+        ``done_processing``: called by the worker for the utterance it was handling."""
+        if done_processing:
+            self._processing = False
+        if self._pending is not None:
+            await self._decide(self._pending, "resume")
+        await self._resend_state()
 
     async def _handle_utterance(self, ended: _EndedUtterance) -> None:
         transcript: Transcript | None = None
@@ -470,34 +564,34 @@ class VoiceSession:
                 transcript = ended.speculative.result()
             speculative = transcript is not None
         if transcript is None:
-            transcript = await self._transcribe(ended.utterance.audio, partial=False)
+            transcript = await self._transcribe(ended.utterance.audio, report=True)
         stt_ms = (time.perf_counter() - ended.ended_at) * 1000
-        agent = self._turn
         if transcript is None:  # STT failed (reported)
-            if self._pending is not None:
-                await self._decide(self._pending, "resume")
-            if agent is None:
-                await self._set_state("listening")
+            await self._ignored_utterance(done_processing=True)
             return
 
         text = transcript.text.strip()
+        agent = self._turn
         if agent is not None and not agent.interrupted:
             # The agent is answering: is this an interruption?
             if is_backchannel(text, self.barge_in.backchannel_max_words):
-                if self._pending is not None:
-                    await self._decide(self._pending, "resume")
-                return  # "mm-hmm", "okay": the agent goes on
-            if self._pending is not None and self._pending.agent is agent:
-                await self._decide(self._pending, "stop")
-            else:
-                self._cut(agent)  # nothing more of it is sent once the decision is out
-                await self._send({"type": "barge_in", "turn_id": agent.id, "decision": "stop"})
-                await self._interrupt(agent, "barge_in", agent.barge_in_ms)
-        if not normalize_utterance(text) or is_filler(text):  # noise, or only "hmm"/"mm-hmm": nothing to answer
-            if self._turn is None:
-                await self._set_state("listening")
+                await self._ignored_utterance(done_processing=True)  # "mm-hmm", "okay", "M M": the agent goes on
+                return
+            pending = self._pending if self._pending is not None and self._pending.agent is agent else None
+            if pending is not None:
+                await self._decide(pending, "stop")
+            else:  # no barge_in_start (or it was resolved already): use its played_ms only if it was this speech
+                await self._interrupt(agent, "barge_in", self._barge_in_played(agent, ended), decision=True)
+        if not normalize_utterance(text) or is_filler(text):  # noise, or only "hmm"/"M M": nothing to answer
+            await self._ignored_utterance(done_processing=True)
             return
         await self._start_turn(transcript, ended, stt_ms, speculative)
+
+    @staticmethod
+    def _barge_in_played(agent: AgentTurn, ended: _EndedUtterance) -> float | None:
+        if agent.barge_in_at is None or agent.barge_in_at < ended.started_at - BARGE_IN_MATCH_S:
+            return None
+        return agent.barge_in_ms
 
     async def _start_turn(
         self, transcript: Transcript, ended: _EndedUtterance, stt_ms: float, speculative: bool
@@ -509,48 +603,88 @@ class VoiceSession:
             "stt_ms": round(stt_ms, 1),
             "speculative_stt": speculative,
         }
-        async with self._turn_lock:  # an interrupted answer is saved before this user message
-            try:
-                turn = await self.turns.begin(
-                    self.chat.id,
-                    transcript.text,
-                    language=transcript.language,
-                    modality="voice",
-                    length="short",
-                    input_language=transcript.language,
-                    input_latency=latency,
-                )
-            except NotFound:
-                await self._error("storage", "this chat no longer exists")
-                self.close(CLOSE_CHAT_NOT_FOUND, "chat not found")
-                return
-            except InvalidInput as e:
-                await self._error("stt", f"transcript not usable: {e}")
-                await self._set_state("listening")
-                return
-            self._turn_ids += 1
-            agent = AgentTurn(self._turn_ids, turn)
-            agent.marks.update(
-                speech_end=ended.ended_at - utterance.silence_ms / 1000,
-                end_of_turn=ended.ended_at,
-                transcript=ended.ended_at + stt_ms / 1000,
+        while self._settling:  # an interrupted answer is saved and sent before this user message
+            await asyncio.wait(set(self._settling))
+        try:
+            turn = await self.turns.begin(
+                self.chat.id,
+                transcript.text,
+                language=transcript.language,
+                modality="voice",
+                length="short",
+                input_language=transcript.language,
+                input_latency=latency,
             )
-            self._turn = agent
-            await self._set_state("thinking")
-            agent.task = asyncio.create_task(self._run_turn(agent), name=f"{self.id}-turn-{agent.id}")
+        except NotFound:
+            await self._error("storage", "this chat no longer exists")
+            self.close(CLOSE_CHAT_NOT_FOUND, "chat not found")
+            return
+        except InvalidInput as e:
+            await self._error("stt", f"transcript not usable: {e}")
+            await self._ignored_utterance(done_processing=True)
+            return
+        try:
+            user = await self.turns.save_user_message(turn)  # before the task: a stop can't lose it
+        except Exception as e:
+            log.exception("voice session %s: saving the user message failed", self.id)
+            await self._error("storage", f"could not save the message: {_describe(e)}")
+            await self._ignored_utterance(done_processing=True)
+            return
+        self._turn_ids += 1
+        agent = AgentTurn(self._turn_ids, turn)
+        agent.stop.user = user
+        agent.marks.update(
+            speech_end=ended.ended_at - utterance.silence_ms / 1000,
+            end_of_turn=ended.ended_at,
+            transcript=ended.ended_at + stt_ms / 1000,
+        )
+        # "stop" came after this utterance ended (while it was transcribed, or its message saved): it is saved, not
+        # answered (§3.10). Checked after the last await before the turn becomes active, so no stop can slip through.
+        if self._stop_at is not None and ended.ended_at <= self._stop_at:
+            agent.interrupted = agent.cut = True
+            message: Message | None = None
+            try:
+                message = await self.turns.save_unanswered(turn, heard_text="", reason="stop")
+            except Exception as e:
+                log.exception("voice session %s: saving the stopped turn failed", self.id)
+                await self._error("storage", f"could not save the stopped answer: {_describe(e)}")
+            await self._announce(agent, user)
+            if message is not None:
+                await self._send({"type": "agent_message", "message": _message_json(message)})
+            self._processing = False
+            await self._set_state(self._current_state())
+            return
+        self._turn = agent
+        await self._set_state("thinking")
+        agent.task = self._spawn(self._run_turn(agent), f"{self.id}-turn-{agent.id}")
 
     # -------------------------------------------------------------- the answer
 
     async def _run_turn(self, agent: AgentTurn) -> None:
+        try:
+            await self._answer(agent)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # a bug or an unexpected failure: report it and free the session for the next turn
+            log.exception("voice session %s: turn %d failed", self.id, agent.id)
+            await self._send_for(
+                agent, {"type": "error", "detail": f"the answer failed: {_describe(e)}", "stage": "llm"}
+            )
+            agent.audio_done = True
+            await self._finish_turn(agent)
+
+    async def _answer(self, agent: AgentTurn) -> None:
         chunker = SpeechChunker(max_sentences=self.settings.voice.max_spoken_sentences)
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         speaker = asyncio.create_task(self._speak(agent, queue), name=f"{self.id}-tts-{agent.id}")
         try:
-            async with contextlib.aclosing(self.turns.run(agent.turn, stop=agent.stop)) as events:
+            events = self.turns.run(agent.turn, stop=agent.stop, user=agent.stop.user)
+            async with contextlib.aclosing(events):
                 async for event in events:
                     await self._on_turn_event(agent, event, chunker, queue)
-            for text in chunker.flush():
-                queue.put_nowait(text)
+            if not agent.errored:  # after an error the cut-off fragment isn't spoken
+                for text in chunker.flush():
+                    queue.put_nowait(text)
             queue.put_nowait(None)
             await speaker
         finally:
@@ -563,7 +697,7 @@ class VoiceSession:
             await self._send_for(agent, {"type": "agent_message", "message": _message_json(agent.message)})
         self._log_latency(agent)
         if agent.chunks:
-            self._schedule_playback_end(agent)
+            self._arm_playback_timer(agent)
         else:
             await self._finish_turn(agent)
 
@@ -584,6 +718,7 @@ class VoiceSession:
             case AgentMessageEvent(message=message):
                 agent.message = message
             case ErrorEvent(stage=stage, detail=detail):
+                agent.errored = True
                 await self._send_for(agent, {"type": "error", "detail": detail, "stage": stage})
 
     async def _announce(self, agent: AgentTurn, user: Message) -> None:
@@ -596,15 +731,9 @@ class VoiceSession:
                 agent.turn_sent = True
                 await self._send_text_unlocked(dumps({"type": "turn", "turn_id": agent.id}))
 
-    async def _send_for(self, agent: AgentTurn, message: dict[str, Any]) -> None:
-        """Send a message of a turn unless the turn has been cut (checked under the send lock, so nothing of a cut
-        turn follows the barge_in decision or the reaction to stop)."""
-        async with self._send_lock:
-            if not agent.cut:
-                await self._send_text_unlocked(dumps(message))
-
     async def _speak(self, agent: AgentTurn, queue: asyncio.Queue[str | None]) -> None:
-        """Synthesize chunks in order and send each: ``audio_chunk`` then its frames, as one unit."""
+        """Synthesize chunks in order and send each: ``audio_chunk``, then its frames, one send-lock acquisition per
+        frame (control messages and speech events aren't held up behind a whole chunk)."""
         rate = self.tts.sample_rate
         while (text := await queue.get()) is not None:
             if agent.tts_failed or agent.cut:
@@ -620,117 +749,158 @@ class VoiceSession:
                 continue
             if not pcm:
                 continue
-            index = len(agent.chunks)
-            chunk = SpokenChunk(index, text, agent.sent_ms, len(pcm) / 2 / rate * 1000)
-            frames = audio_frames(agent.id, index, pcm, sample_rate=rate)
-            announce = {
-                "type": "audio_chunk",
-                "turn_id": agent.id,
-                "chunk_index": index,
-                "text": text,
-                "duration_ms": round(chunk.duration_ms, 1),
-            }
+            duration_ms = len(pcm) / 2 / rate * 1000
             async with self._send_lock:
                 if agent.cut:  # synthesized after the decision: dropped
                     continue
+                index = len(agent.chunks)
+                chunk = SpokenChunk(index, text, agent.sent_ms, duration_ms)
+                announce = {
+                    "type": "audio_chunk",
+                    "turn_id": agent.id,
+                    "chunk_index": index,
+                    "text": text,
+                    "duration_ms": round(duration_ms, 1),
+                }
                 await self._send_text_unlocked(dumps(announce))
                 agent.chunks.append(chunk)
                 agent.sent_ms = chunk.end_ms
+                # The client plays a chunk when it arrives or when the previous one ends, whichever is later.
+                now = time.perf_counter()
+                start = max(agent.play_end, now)
+                agent.play_starts.append(start)
+                agent.play_end = start + duration_ms / 1000
                 if agent.first_audio_at is None:
-                    agent.first_audio_at = agent.marks["first_audio"] = time.perf_counter()
-                for frame in frames:
+                    agent.first_audio_at = agent.marks["first_audio"] = now
+            for frame in audio_frames(agent.id, index, pcm, sample_rate=rate):
+                async with self._send_lock:
                     if agent.cut:
                         break
                     await self._send_bytes_unlocked(frame)
             if index == 0 and not agent.cut:
                 await self._set_state("speaking")
 
-    def _schedule_playback_end(self, agent: AgentTurn) -> None:
-        """End the turn when the client says playback_done, or soon after its audio should have finished playing."""
-        now = time.perf_counter()
-        start = agent.first_audio_at or now
-        remaining = max(0.0, start + agent.sent_ms / 1000 - now)
-        loop = asyncio.get_running_loop()
-        agent.playback_timer = loop.call_later(
-            remaining + PLAYBACK_GRACE_S, lambda: self._spawn(self._finish_turn(agent), f"{self.id}-playback-end")
-        )
+    def _arm_playback_timer(self, agent: AgentTurn) -> None:
+        """End the turn when the client says playback_done, or PLAYBACK_GRACE_S after its audio should have finished
+        playing: the expected end follows the chunks as they were sent (gaps included) and the client's progress."""
+        if agent.playback_timer is not None:
+            agent.playback_timer.cancel()
+        delay = max(0.0, agent.play_end + PLAYBACK_GRACE_S - time.perf_counter())
+        agent.playback_timer = asyncio.get_running_loop().call_later(delay, self._playback_timer_fired, agent)
+
+    def _playback_timer_fired(self, agent: AgentTurn) -> None:
+        agent.playback_timer = None
+        if self._turn is not agent:
+            return
+        if time.perf_counter() < agent.play_end + PLAYBACK_GRACE_S - 0.01:  # a progress report moved the end
+            self._arm_playback_timer(agent)
+            return
+        self._spawn(self._finish_turn(agent), f"{self.id}-playback-end")
 
     async def _finish_turn(self, agent: AgentTurn) -> None:
         if agent.playback_timer is not None:
             agent.playback_timer.cancel()
+            agent.playback_timer = None
         if self._turn is not agent:
             return
         self._turn = None
         if self._pending is not None and self._pending.agent is agent:
             await self._decide(self._pending, "resume")  # the answer finished while deciding: nothing to stop
-        await self._set_state("listening")
+        await self._set_state(self._current_state())
 
     def _played_ms(self, agent: AgentTurn, explicit: float | None) -> float:
         """How much of the turn's audio the user heard: the client's number when it gave one, else its last progress
-        report plus the time since, else the time since the first audio was sent; never more than was sent."""
+        report plus the time since, else what the client should have played by now (each chunk from when it arrived
+        or the previous one ended); never more than was sent."""
         if explicit is not None:
             return min(explicit, agent.sent_ms)
         now = time.perf_counter()
         if agent.reported_ms is not None:
             return min(agent.sent_ms, agent.reported_ms + (now - agent.reported_at) * 1000)
-        if agent.first_audio_at is None:
-            return 0.0
-        return min(agent.sent_ms, (now - agent.first_audio_at) * 1000)
+        played = sum(
+            min(max(0.0, (now - start) * 1000), chunk.duration_ms)
+            for start, chunk in zip(agent.play_starts, agent.chunks, strict=True)
+        )
+        return min(agent.sent_ms, played)
 
-    def _cut(self, agent: AgentTurn) -> None:
-        """Mute a turn at once (synchronously, before the decision is announced): from now on none of its sources,
-        deltas, audio chunks or frames are sent, and it is no longer the active turn."""
+    # -------------------------------------------------------------- interruptions
+
+    def _cut(self, agent: AgentTurn) -> bool:
+        """Mute a turn at once (synchronously, before anything is announced): from now on none of its sources,
+        deltas, audio chunks or frames are sent, and it is no longer the active turn. True if a barge-in decision for
+        it was pending (the client is waiting for one)."""
         agent.cut = True
         if agent.playback_timer is not None:
             agent.playback_timer.cancel()
+            agent.playback_timer = None
         if self._turn is agent:
             self._turn = None
         pending = self._pending
-        if pending is not None and pending.agent is agent:  # e.g. "stop" while a barge-in was being decided
-            self._pending = None
-            if pending.deadline is not None and pending.deadline is not asyncio.current_task():
-                pending.deadline.cancel()
+        if pending is None or pending.agent is not agent:
+            return False
+        self._pending = None
+        if pending.deadline is not None and pending.deadline is not asyncio.current_task():
+            pending.deadline.cancel()
+        return True
 
-    async def _interrupt(self, agent: AgentTurn, reason: InterruptReason, played_ms: float | None) -> None:
-        """Cut an answer short: cancel generation and speech, save what was heard, back to listening.
+    async def _interrupt(
+        self, agent: AgentTurn, reason: InterruptReason, played_ms: float | None, *, decision: bool = False
+    ) -> None:
+        """Cut an answer short: mute it, cancel generation and speech, then settle it (the decision if one is owed,
+        the answer saved with what was heard, ``agent_message``) in its own task that the next turn waits for.
 
-        The turn's ``agent_message`` (with ``heard_text``; empty text if nothing was generated yet) is sent before
-        anything of the next turn: ``_start_turn`` waits for ``_turn_lock``."""
+        Everything up to starting that task is synchronous, so no other task can slip in between the cut and the
+        settle: neither another frame of this turn nor the next turn's user message."""
         if agent.interrupted:
             return
         agent.interrupted = True
-        self._cut(agent)
+        decision = (
+            self._cut(agent) or decision
+        )  # e.g. "stop" while a barge-in was being decided: the client is owed one
+        played = self._played_ms(agent, played_ms)
+        heard = heard_text(agent.chunks, played)
+        agent.stop.heard_text, agent.stop.reason = heard, reason
+        if agent.task is not None and not agent.task.done():
+            agent.task.cancel()  # generation and speech stop now, whatever happens to the rest
+        settle = asyncio.ensure_future(self._settle(agent, reason, played, heard, decision))
+        self._settling.add(settle)
+        settle.add_done_callback(self._settling.discard)
+        await asyncio.shield(settle)
+
+    async def _settle(
+        self, agent: AgentTurn, reason: InterruptReason, played: float, heard: str, decision: bool
+    ) -> None:
         async with self._turn_lock:
-            played = self._played_ms(agent, played_ms)
-            heard = heard_text(agent.chunks, played)
-            agent.stop.heard_text, agent.stop.reason = heard, reason
+            if decision:
+                await self._send({"type": "barge_in", "turn_id": agent.id, "decision": "stop"})
             await self._set_state("interrupted")
-            if agent.task is not None and not agent.task.done():
-                agent.task.cancel()
+            if agent.task is not None:
                 await asyncio.wait([agent.task])  # the pipeline saves the stopped answer before the task ends
             message = agent.stop.saved
             complete = agent.message or agent.stop.completed
             fully_heard = agent.audio_done and played >= agent.sent_ms
-            if message is None and complete is not None and not fully_heard:  # fully heard: already sent, not cut
-                message = complete
-                try:
-                    message = await self.messages.record_interruption(complete.id, heard_text=heard, reason=reason)
-                except Exception as e:
-                    log.exception("voice session %s: saving the interruption failed", self.id)
-                    await self._error("storage", f"could not save the interrupted answer: {_describe(e)}")
+            try:
+                if message is None and complete is not None:
+                    if not fully_heard:  # fully heard: it was sent complete already and nothing was cut
+                        message = await self.messages.record_interruption(complete.id, heard_text=heard, reason=reason)
+                elif message is None and agent.stop.user is not None:  # stopped before the answer had any text
+                    message = await self.turns.save_unanswered(agent.turn, heard_text=heard, reason=reason)
+            except Exception as e:
+                log.exception("voice session %s: saving the interrupted answer failed", self.id)
+                await self._error("storage", f"could not save the interrupted answer: {_describe(e)}")
             if message is not None:
                 if agent.stop.user is not None:
                     await self._announce(agent, agent.stop.user)  # if the cut came before they went out
                 await self._send({"type": "agent_message", "message": _message_json(message)})
             log.info(
-                "voice session %s: turn %d %s after %.0f ms of audio (heard %d words)",
+                "voice session %s: turn %d cut (%s) after %.0f ms of audio (heard %d words)",
                 self.id,
                 agent.id,
-                "stopped" if reason == "stop" else "interrupted",
+                reason,
                 played,
                 len(heard.split()),
             )
-        await self._set_state("listening" if self._turn is None else self._current_state())
+        await self._set_state(self._current_state())
 
     # -------------------------------------------------------------- barge-in
 
@@ -741,7 +911,7 @@ class VoiceSession:
             return
         if self._pending is not None:
             return  # already deciding
-        agent.barge_in_ms = message.played_ms
+        agent.barge_in_ms, agent.barge_in_at = message.played_ms, time.perf_counter()
         pending = PendingBargeIn(agent, message.played_ms)
         self._pending = pending
         pending.deadline = self._spawn(self._barge_in_deadline(pending), f"{self.id}-barge-in-deadline")
@@ -762,11 +932,18 @@ class VoiceSession:
         await self._evaluate(pending, deadline_passed=False)
 
     async def _barge_in_transcript(self, pending: PendingBargeIn, audio: np.ndarray) -> None:
-        transcript = await self._transcribe(audio, partial=True)
-        if transcript is not None and self._pending is pending:
-            pending.transcript = transcript.text
-            pending.backchannel = is_backchannel(transcript.text, self.barge_in.backchannel_max_words)
-            await self._evaluate(pending, deadline_passed=False)
+        transcript = await self._transcribe(audio, report=False)
+        if transcript is None or self._pending is not pending:
+            return
+        if transcript.text:
+            await self._send({"type": "transcript_partial", "text": transcript.text})
+        self._note_transcript(pending, transcript.text)
+        await self._evaluate(pending, deadline_passed=False)
+
+    def _note_transcript(self, pending: PendingBargeIn, text: str) -> None:
+        pending.transcript = text
+        pending.backchannel = is_backchannel(text, self.barge_in.backchannel_max_words)
+        pending.real_words = real_words(text)
 
     async def _evaluate(self, pending: PendingBargeIn, *, deadline_passed: bool) -> None:
         if self._pending is not pending:
@@ -778,6 +955,7 @@ class VoiceSession:
             transcript=pending.transcript,
             ended=False,
             deadline_passed=deadline_passed,
+            real_words=pending.real_words,
         )
         verdict = barge_in_verdict(
             evidence, min_speech_ms=self.vad_settings.min_speech_ms, is_backchannel=pending.backchannel
@@ -791,11 +969,10 @@ class VoiceSession:
         self._pending = None
         if pending.deadline is not None and pending.deadline is not asyncio.current_task():
             pending.deadline.cancel()
-        if verdict == "stop":
-            self._cut(pending.agent)  # muted before the decision goes out: nothing of the turn follows it
-        await self._send({"type": "barge_in", "turn_id": pending.agent.id, "decision": verdict})
-        if verdict == "stop":
-            await self._interrupt(pending.agent, "barge_in", pending.played_ms)
+        if verdict == "stop":  # the decision is sent by the settle, after the turn is muted
+            await self._interrupt(pending.agent, "barge_in", pending.played_ms, decision=True)
+        else:
+            await self._send({"type": "barge_in", "turn_id": pending.agent.id, "decision": "resume"})
 
     # -------------------------------------------------------------- observability
 

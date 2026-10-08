@@ -10,6 +10,9 @@ JSON text frames (field ``type``)
                      playback_done {turn_id} · stop {} · end {}
     server → client  ready · state · user_speech · transcript_partial · user_message · turn · sources · delta ·
                      audio_chunk · agent_message · barge_in · error
+
+Close codes: 1000 end, 1001 server shutdown, 1011 internal error, 4403 origin not allowed (browser pages from origins
+outside server.cors_allowed_origins), 4404 unknown chat, 4409 replaced by a newer session for the chat.
 """
 
 from __future__ import annotations
@@ -25,11 +28,13 @@ from ...settings import Language
 INPUT_SAMPLE_RATE = 16_000
 OUTPUT_FRAME_MS = 200  # audio per server → client binary frame
 MAX_INPUT_FRAME_BYTES = INPUT_SAMPLE_RATE * 2  # 1 s of PCM16; clients send 20-64 ms
+MAX_MESSAGE_BYTES = 64 * 1024  # any WebSocket message (uvicorn ws_max_size); larger ones close the connection
 HEADER = struct.Struct("<III")  # turn_id, chunk_index, seq
 
 CLOSE_NORMAL = 1000
 CLOSE_GOING_AWAY = 1001  # server shutting down
 CLOSE_INTERNAL_ERROR = 1011
+CLOSE_FORBIDDEN_ORIGIN = 4403  # a browser page from an origin not in server.cors_allowed_origins
 CLOSE_CHAT_NOT_FOUND = 4404
 CLOSE_REPLACED = 4409  # another voice session opened for the same chat
 
