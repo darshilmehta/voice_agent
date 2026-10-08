@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
-from .api import chats, documents, health, pins, projects, public_config
+from .api import chats, documents, health, pins, projects, public_config, voice
 from .api.deps import install_error_handlers
 from .logging_setup import configure_logging
 from .offline import apply_runtime_env
@@ -24,6 +24,7 @@ from .providers.registry import Container, build_container
 from .services.chat_turns import wait_for_background
 from .services.document_pipeline import DocumentPipeline
 from .services.preload import ModelPreloader
+from .services.voice import VoiceSessions
 from .settings import Settings, load_settings
 
 log = logging.getLogger("app")
@@ -49,6 +50,7 @@ def create_app(
         app.state.container = container
         app.state.document_pipeline = DocumentPipeline.from_container(container)
         await app.state.document_pipeline.start()  # re-queues ingestions a restart interrupted
+        app.state.voice_sessions = VoiceSessions(container)
         app.state.preloader = ModelPreloader(container)
         if preload_models:
             app.state.preloader.start()
@@ -63,7 +65,8 @@ def create_app(
         try:
             yield
         finally:
-            with contextlib.suppress(TimeoutError):  # saves of stopped answers
+            await app.state.voice_sessions.close_all()
+            with contextlib.suppress(TimeoutError):  # saves of stopped answers, voice session clean-ups
                 await asyncio.wait_for(wait_for_background(), SHUTDOWN_SAVE_WAIT_S)
             await app.state.preloader.stop()
             await container.close()
@@ -76,6 +79,6 @@ def create_app(
         allow_headers=["Content-Type", "Authorization"],
     )
     install_error_handlers(app)
-    for module in (health, public_config, projects, documents, chats, pins):
+    for module in (health, public_config, projects, documents, chats, pins, voice):
         app.include_router(module.router)
     return app

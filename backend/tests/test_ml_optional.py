@@ -42,7 +42,7 @@ HEAVY = (
 
 def test_importing_the_app_loads_no_ml_library():
     code = (
-        "import sys, app.main, app.services.ingestion, app.services.retrieval\n"
+        "import sys, app.main, app.services.ingestion, app.services.retrieval, app.services.voice\n"
         "from app.providers import load_all; load_all()\n"
         f"print(','.join(m for m in {HEAVY!r} if m in sys.modules))"
     )
