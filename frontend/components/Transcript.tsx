@@ -72,9 +72,23 @@ interface TranscriptProps {
   onRetry?: (turnKey: string) => void;
   /** An answer is streaming: Retry waits. */
   busy?: boolean;
+  /** Messages the voice session saved while this page was open (the session's `user_message` / `agent_message`). */
+  voiceMessages?: Message[];
+  /** The voice turn in progress, before it is saved: what the user is saying, what the agent has written so far. */
+  voice?: { userText: string | null; agentText: string | null; sources: SourcesPayload | null } | null;
 }
 
-export function Transcript({ chat, docsById, turns = [], onRetry, busy = false }: TranscriptProps) {
+const NO_MESSAGES: Message[] = [];
+
+export function Transcript({
+  chat,
+  docsById,
+  turns = [],
+  onRetry,
+  busy = false,
+  voiceMessages = NO_MESSAGES,
+  voice = null,
+}: TranscriptProps) {
   const { api, config } = useBackend();
   const [s, setS] = useState<TranscriptState>(INITIAL);
   const [attempt, setAttempt] = useState(0);
@@ -251,12 +265,26 @@ export function Transcript({ chat, docsById, turns = [], onRetry, busy = false }
     }
     return ids;
   }, [turns]);
-  const history = turnMessageIds.size ? s.items.filter((m) => !turnMessageIds.has(m.id)) : s.items;
+  // Likewise for what the voice session saved on this page: shown after the history, in time order with the turns.
+  const voiceIds = useMemo(() => new Set(voiceMessages.map((m) => m.id)), [voiceMessages]);
+  const history =
+    turnMessageIds.size || voiceIds.size
+      ? s.items.filter((m) => !turnMessageIds.has(m.id) && !voiceIds.has(m.id))
+      : s.items;
   const savedInTurns = turns.reduce((n, t) => n + (t.user ? 1 : 0) + (t.agent ? 1 : 0), 0);
-  const total = s.total + savedInTurns - (s.items.length - history.length);
   const remaining = Math.max(0, s.total - s.items.length);
+  const total = remaining + history.length + savedInTurns + voiceMessages.length;
   const ready = s.status === "ready";
-  const hasContent = history.length > 0 || turns.length > 0;
+  const tail = useMemo(
+    () =>
+      [
+        ...turns.map((turn) => ({ kind: "turn" as const, at: Date.parse(turn.user?.created_at ?? turn.startedAt), turn })),
+        ...voiceMessages.map((message) => ({ kind: "voice" as const, at: Date.parse(message.created_at), message })),
+      ].sort((a, b) => a.at - b.at),
+    [turns, voiceMessages],
+  );
+  const liveVoice = voice && (voice.userText !== null || voice.agentText !== null) ? voice : null;
+  const hasContent = history.length > 0 || tail.length > 0 || liveVoice !== null;
 
   let lastDay = history.length ? dayKey(history[history.length - 1].created_at) : null;
 
@@ -339,7 +367,23 @@ export function Transcript({ chat, docsById, turns = [], onRetry, busy = false }
                   <MessageItem message={m} docsById={docsById} showDebug={showDebug} />
                 </Fragment>
               ))}
-              {turns.map((t) => {
+              {tail.map((item) => {
+                if (item.kind === "voice") {
+                  const m = item.message;
+                  const divider = dayKey(m.created_at) !== lastDay;
+                  lastDay = dayKey(m.created_at);
+                  return (
+                    <Fragment key={m.id}>
+                      {divider && (
+                        <li className="tx-day">
+                          <span>{dayLabel(m.created_at)}</span>
+                        </li>
+                      )}
+                      <MessageItem message={m} docsById={docsById} showDebug={showDebug} />
+                    </Fragment>
+                  );
+                }
+                const t = item.turn;
                 const when = t.user?.created_at ?? t.startedAt;
                 const divider = dayKey(when) !== lastDay;
                 lastDay = dayKey(when);
@@ -365,6 +409,22 @@ export function Transcript({ chat, docsById, turns = [], onRetry, busy = false }
                   </Fragment>
                 );
               })}
+              {liveVoice?.userText != null && (
+                <li className="msg msg-user" data-pending>
+                  <div className="msg-meta">
+                    <span className="msg-who">You</span>
+                    <span className="msg-mode">
+                      <Icon name="mic" size={13} />
+                      Voice
+                    </span>
+                    <span className="msg-status">Listening…</span>
+                  </div>
+                  <div className="bubble">{liveVoice.userText || "…"}</div>
+                </li>
+              )}
+              {liveVoice?.agentText != null && (
+                <LiveVoiceAnswer text={liveVoice.agentText} sources={liveVoice.sources} docsById={docsById} />
+              )}
             </ol>
           )}
 
@@ -557,6 +617,38 @@ function AbstainLabel() {
       <Icon name="info" size={14} />
       Not in your documents
     </span>
+  );
+}
+
+// ------------------------------------------------------------------ a voice answer being written
+
+/** The agent's answer to a spoken question while it is still being generated (the saved message replaces it). */
+function LiveVoiceAnswer({
+  text,
+  sources,
+  docsById,
+}: {
+  text: string;
+  sources: SourcesPayload | null;
+  docsById: Record<string, ProjectDocument>;
+}) {
+  const { map, listed } = useSources(text, NO_CITATIONS, sources, docsById);
+  if (!text) return null;
+  return (
+    <li className="msg msg-agent" aria-busy="true">
+      <div className="msg-meta">
+        <span className="msg-who">Agent</span>
+        <span className="msg-mode">
+          <Icon name="mic" size={13} />
+          Voice
+        </span>
+        <span className="msg-status">Answering…</span>
+      </div>
+      <div className="bubble">
+        <AnswerText text={text} sources={map} streaming />
+      </div>
+      <SourceList sources={listed} />
+    </li>
   );
 }
 
