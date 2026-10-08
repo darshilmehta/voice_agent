@@ -280,5 +280,7 @@ def test_openapi_lists_the_endpoints(api):
     assert set(paths["/api/projects/{project_id}"]) == {"get", "patch", "delete"}
     assert set(paths["/api/projects/{project_id}/chats"]) == {"get", "post"}
     assert set(paths["/api/chats/{chat_id}"]) == {"get", "patch", "delete"}
-    assert set(paths["/api/chats/{chat_id}/messages"]) == {"get"}
+    assert set(paths["/api/chats/{chat_id}/messages"]) == {"get", "post"}
+    assert set(paths["/api/projects/{project_id}/documents"]) == {"get", "post"}
+    assert set(paths["/api/documents/{document_id}"]) == {"get", "delete"}
     assert set(paths["/api/pins"]) == {"get"}

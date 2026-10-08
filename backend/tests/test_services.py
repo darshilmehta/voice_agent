@@ -252,7 +252,7 @@ async def test_append_numbers_messages_and_records_activity(svc):
     )
     assert (m1.seq, m2.seq) == (1, 2)
     assert m1.id.startswith("msg_") and m1.citations == [] and not m1.interrupted
-    assert m2.interrupted and m2.citations[0]["page"] == 46
+    assert m2.interrupted and (m2.citations[0].page_start, m2.citations[0].page_end) == (46, 46)  # legacy shape
     chat = await svc.chats.get(chat.id)
     assert chat.message_count == 2 and chat.last_message_at == m2.created_at
     assert (await svc.projects.get(p.id)).updated_at == m2.created_at

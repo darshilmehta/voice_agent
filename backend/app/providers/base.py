@@ -91,14 +91,40 @@ class Provider:
             return None, (time.perf_counter() - t0) * 1000, f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
 
 
+class _Unimplemented:
+    """Stands in for a capability method on a placeholder provider: reading the attribute raises."""
+
+    def __init__(self, attr: str) -> None:
+        self.attr = attr
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> Any:
+        if obj is None:
+            return self
+        raise NotImplementedError(
+            f"{obj.capability} provider {obj.name!r} is a placeholder: {self.attr!r} is not implemented"
+        )
+
+
 class PlaceholderProvider(Provider):
     """A provider that exists so configuration and wiring are real, but has no implementation yet.
 
-    Construction and health checks work; using any capability method raises NotImplementedError.
+    Construction and health checks work; using any capability method raises NotImplementedError, including the
+    methods its capability interface defines (e.g. ``ObjectStore.put`` on the ``s3`` placeholder).
     """
 
     is_remote = True
     implemented = False
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        lifecycle = set(dir(Provider))  # start, close, health, … keep working
+        for klass in cls.__mro__[1:]:
+            if klass in (PlaceholderProvider, Provider) or not issubclass(klass, Provider):
+                continue
+            for attr, value in vars(klass).items():
+                if attr.startswith("_") or attr in lifecycle or attr in vars(cls) or not callable(value):
+                    continue
+                setattr(cls, attr, _Unimplemented(attr))
 
     async def health(self) -> ProviderHealth:
         return self._health(

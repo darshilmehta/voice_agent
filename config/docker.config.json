@@ -104,7 +104,7 @@
   },
 
   "retrieval": {
-    "prefetch_k": 20,
+    "prefetch_k": 8,
     "fusion": "rrf",
     "rerank_top_n": 5,
     "min_rerank_score": 0.3,

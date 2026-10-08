@@ -1,7 +1,7 @@
 """SQLAlchemy models for projects, documents, chats, messages and summaries (docs/DESIGN.md §3.9).
 
 Every child row references its parent with ``ON DELETE CASCADE``, so deleting a project deletes its documents
-(with their versions and ingestion jobs) and its chats (with their messages and summaries) inside the database.
+(with their versions, ingestion jobs and tables) and its chats (with their messages and summaries) inside the database.
 On SQLite this needs ``PRAGMA foreign_keys=ON``, which the engine sets on every connection (``app.db.engine``).
 
 The models deliberately have no ORM ``relationship()``s: services query explicitly (no lazy loading under asyncio)
@@ -51,6 +51,7 @@ class Base(DeclarativeBase):
         datetime: UTCDateTime(),
         dict[str, Any]: JSONType,
         list[str]: JSONType,
+        list[float]: JSONType,
         list[dict[str, Any]]: JSONType,
     }
 
@@ -138,6 +139,35 @@ class IngestionJob(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     started_at: Mapped[datetime | None]
     finished_at: Mapped[datetime | None]
+
+
+class DocumentTable(Base):
+    """A table parsed from one document version, kept as a cell-level dataset (§3.1; §12.1 workstream 1), so later
+    features (visual canvas, calculator) never re-parse text.
+
+    ``cells`` is a JSON list of ``{row, col, row_span, col_span, text, column_header, row_header}`` (0-based, a
+    spanning cell appears once); ``markdown`` is the same table as it was indexed for retrieval. ``bbox`` is
+    ``[left, top, right, bottom]`` on ``page_start`` in points, top-left origin. Column typing (year, currency,
+    percent…) and unit detection are added by the canvas work; the raw cells here are what they start from.
+    """
+
+    __tablename__ = "document_tables"
+    __table_args__ = (UniqueConstraint("document_id", "version", "table_index"),)
+
+    id: Mapped[str] = mapped_column(ID, primary_key=True, default=lambda: new_id("tbl"))
+    document_id: Mapped[str] = mapped_column(ID, _parent("documents"))
+    version: Mapped[int]
+    table_index: Mapped[int]  # 0-based position among the version's tables
+    page_start: Mapped[int | None]
+    page_end: Mapped[int | None]
+    bbox: Mapped[list[float] | None]
+    heading_path: Mapped[list[str]] = mapped_column(default=list)
+    caption: Mapped[str | None] = mapped_column(Text)
+    num_rows: Mapped[int]
+    num_cols: Mapped[int]
+    markdown: Mapped[str] = mapped_column(Text)
+    cells: Mapped[list[dict[str, Any]]] = mapped_column(default=list)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
 class Chat(Base):

@@ -1,4 +1,4 @@
-"""Projects and their documents (docs/DESIGN.md §3.9). Document upload and deletion arrive with ingestion."""
+"""Projects (docs/DESIGN.md §3.9) and the listing of their documents; upload and deletion are in ``documents``."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from fastapi import APIRouter, Response, status
 from pydantic import BaseModel
 
 from ..domain.projects import Document, Project
-from .deps import Documents, Projects
+from .deps import Documents, Pipeline, Projects
 from .schemas import Body, LongText, Name, Patch
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -58,9 +58,9 @@ async def update_project(project_id: str, body: ProjectUpdate, projects: Project
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_project(project_id: str, projects: Projects) -> Response:
-    """Delete the project with its documents, chats, messages and summaries."""
-    await projects.delete(project_id)
+async def delete_project(project_id: str, pipeline: Pipeline) -> Response:
+    """Delete the project with its documents (their vectors and stored files too), chats, messages and summaries."""
+    await pipeline.delete_project(project_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

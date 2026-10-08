@@ -69,8 +69,9 @@ def loop() -> Iterator[asyncio.AbstractEventLoop]:
     lp.close()
 
 
-@pytest.fixture(scope="session")
-def settings(models_root: Path, tmp_path_factory: pytest.TempPathFactory) -> Settings:
+def integration_settings(models_root: Path, root: Path) -> Settings:
+    """Local config with the project root at ``root`` (fresh database and uploads), models from ``models_root`` and a
+    new, uniquely named Qdrant collection (the caller drops it). Skips when Qdrant isn't reachable."""
     qdrant = os.environ.get("QDRANT_URL", "http://127.0.0.1:6333")
     try:
         httpx.get(f"{qdrant}/readyz", timeout=2).raise_for_status()
@@ -78,7 +79,7 @@ def settings(models_root: Path, tmp_path_factory: pytest.TempPathFactory) -> Set
         pytest.skip(f"Qdrant not reachable at {qdrant}: {e}")
     env = {
         **os.environ,  # lets EMBEDDINGS__DEVICE=cpu etc. through
-        "APP_ROOT_DIR": str(tmp_path_factory.mktemp("root")),
+        "APP_ROOT_DIR": str(root),
         "MODEL_CACHE__HF_HOME": str(models_root / "huggingface"),
         "INGESTION__ARTIFACTS_PATH": str(models_root / "docling"),
         "VECTOR_STORE__URL": qdrant,
@@ -87,6 +88,11 @@ def settings(models_root: Path, tmp_path_factory: pytest.TempPathFactory) -> Set
     s = load_settings(LOCAL_CONFIG, env)
     apply_runtime_env(s)  # HF_HOME + HF_HUB_OFFLINE=1 (strict_offline), as the app does at startup
     return s
+
+
+@pytest.fixture(scope="session")
+def settings(models_root: Path, tmp_path_factory: pytest.TempPathFactory) -> Settings:
+    return integration_settings(models_root, tmp_path_factory.mktemp("root"))
 
 
 @pytest.fixture(scope="session")

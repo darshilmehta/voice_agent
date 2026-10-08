@@ -192,8 +192,9 @@ def test_hybrid_search_queries_with_prefetch_k_and_returns_hits(store):
     client = use(store, FakeClient(points=[point]))
     hits = asyncio.run(store.hybrid_search(QUERY, RetrievalFilters("proj1", ("doc1",))))
     q = client.last("query_points")
-    assert q["name"] == "test_chunks" and q["limit"] == 20
-    assert [p.limit for p in q["prefetch"]] == [20, 20]
+    k = store.retrieval.prefetch_k  # also the number of candidates the reranker scores
+    assert q["name"] == "test_chunks" and q["limit"] == k
+    assert [p.limit for p in q["prefetch"]] == [k, k]
     assert q["query_filter"] == build_filter(RetrievalFilters("proj1", ("doc1",)))
     assert [(h.chunk, h.score, h.dense_score) for h in hits] == [(chunk, 0.5, pytest.approx(1.0))]
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, computed_field
+from pydantic import BaseModel, ConfigDict, computed_field, field_validator
 
 Role = Literal["user", "agent", "event"]
 Modality = Literal["voice", "text"]
@@ -93,6 +93,82 @@ class PinnedItems(BaseModel):
     chats: list[PinnedChat]
 
 
+class DocumentTable(Record):
+    """A parsed table of a document version as a cell-level dataset (§12.1); cells as in ``ParsedTable``."""
+
+    id: str
+    document_id: str
+    version: int
+    table_index: int
+    page_start: int | None
+    page_end: int | None
+    bbox: list[float] | None
+    heading_path: list[str]
+    caption: str | None
+    num_rows: int
+    num_cols: int
+    markdown: str
+    cells: list[dict[str, Any]]
+    created_at: datetime
+
+
+SNIPPET_CHARS = 300
+
+
+class Citation(BaseModel):
+    """A source an agent answer cites. ``source_id`` is the marker used in the answer text (``[S1]``); ``snippet`` is
+    up to ~300 characters of the cited chunk."""
+
+    model_config = ConfigDict(frozen=True)
+
+    source_id: str
+    document_id: str
+    filename: str
+    page_start: int | None
+    page_end: int | None
+    chunk_id: str
+    snippet: str
+
+    @classmethod
+    def coerce(cls, value: Any, position: int) -> Citation | None:
+        """A Citation from a stored value. Rows written before citations were typed hold free-form JSON
+        (e.g. ``{"document_id", "page", "chunk_id"}``): missing fields get neutral defaults, ``page`` fills both page
+        fields, and values that aren't objects are dropped (None)."""
+        if isinstance(value, Citation):
+            return value
+        if not isinstance(value, dict):
+            return None
+        page = _int_or_none(value.get("page"))
+        start = _int_or_none(value.get("page_start"))
+        end = _int_or_none(value.get("page_end"))
+        return cls(
+            source_id=str(value.get("source_id") or f"S{position}"),
+            document_id=str(value.get("document_id") or ""),
+            filename=str(value.get("filename") or ""),
+            page_start=start if start is not None else page,
+            page_end=end if end is not None else (start if start is not None else page),
+            chunk_id=str(value.get("chunk_id") or ""),
+            snippet=str(value.get("snippet") or value.get("text") or "")[:SNIPPET_CHARS],
+        )
+
+
+def coerce_citations(values: Any) -> list[Citation]:
+    if not isinstance(values, list | tuple):
+        return []
+    coerced = (Citation.coerce(v, i) for i, v in enumerate(values, start=1))
+    return [c for c in coerced if c is not None]
+
+
+def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value)
+    return None
+
+
 class Message(Record):
     id: str
     chat_id: str
@@ -102,10 +178,15 @@ class Message(Record):
     text: str
     heard_text: str | None  # agent answers cut off by a barge-in: what was actually played
     language: str | None
-    citations: list[dict[str, Any]]
+    citations: list[Citation]  # agent answers: only the sources the text cites ([S1] …)
     route: dict[str, Any] | None
     latency: dict[str, Any] | None
     created_at: datetime
+
+    @field_validator("citations", mode="before")
+    @classmethod
+    def _tolerant_citations(cls, value: Any) -> list[Citation]:
+        return coerce_citations(value)
 
     @computed_field  # type: ignore[prop-decorator]
     @property

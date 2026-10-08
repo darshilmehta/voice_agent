@@ -26,6 +26,7 @@ TABLES = {
     "chats",
     "messages",
     "chat_summaries",
+    "document_tables",
 }
 
 
@@ -89,7 +90,9 @@ async def test_migrations_match_the_models(url):
 async def test_upgrade_is_idempotent_and_downgrade_drops_everything(url, caplog):
     caplog.set_level(logging.INFO)
     await migrate.upgrade(url)
-    assert [r.getMessage().split(" (")[0] for r in caplog.records] == ["metadata db schema empty → 0001"]
+    assert [r.getMessage().split(" (")[0] for r in caplog.records] == [
+        f"metadata db schema empty → {migrate.head_revision()}"
+    ]
     caplog.clear()
     await migrate.upgrade(url)  # every startup runs this: nothing to do, nothing logged
     assert caplog.records == []

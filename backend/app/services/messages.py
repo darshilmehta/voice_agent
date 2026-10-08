@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, get_args
 
 from sqlalchemy import select, update
 
 from ..db import models as orm
-from ..domain.projects import Message, MessagePage, Modality, Role
+from ..domain.projects import Citation, Message, MessagePage, Modality, Role, coerce_citations
 from .base import InvalidInput, NotFound, Service
 
 PAGE_DEFAULT = 50
@@ -24,7 +25,7 @@ class MessageService(Service):
         modality: Modality = "text",
         heard_text: str | None = None,
         language: str | None = None,
-        citations: list[dict[str, Any]] | None = None,
+        citations: Sequence[Citation | dict[str, Any]] | None = None,
         route: dict[str, Any] | None = None,
         latency: dict[str, Any] | None = None,
     ) -> Message:
@@ -32,7 +33,8 @@ class MessageService(Service):
 
         The chat's counter is incremented and read back in one UPDATE … RETURNING, which serializes concurrent
         appends to the same chat on both SQLite and Postgres, so ``seq`` is gap-free and unique per chat. The chat's
-        and project's activity times move to now.
+        and project's activity times move to now. ``citations`` are stored typed (``Citation``); plain dicts are
+        coerced the way old rows are read.
         """
         if role not in get_args(Role):
             raise InvalidInput(f"role must be one of {get_args(Role)}, got {role!r}")
@@ -59,7 +61,7 @@ class MessageService(Service):
                 text=text,
                 heard_text=heard_text,
                 language=language,
-                citations=citations or [],
+                citations=[c.model_dump(mode="json") for c in coerce_citations(list(citations or []))],
                 route=route,
                 latency=latency,
                 created_at=now,
