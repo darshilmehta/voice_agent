@@ -193,10 +193,11 @@ async def count_rows(db: MetadataDB, model: type[orm.Base]) -> int:
 
 
 @pytest.fixture
-def api(load_local) -> Iterator[TestClient]:
-    """The app on a fresh database under tmp_path (HTTP to Ollama/Qdrant mocked)."""
-    settings = load_local()
-    with TestClient(create_app(settings, build_container(settings, http=mock_http()))) as client:
+def api(make_app) -> Iterator[TestClient]:
+    """The app on a fresh database under tmp_path, with every external service faked. The Qdrant client opens its
+    own connections (not the mocked HTTP client), so without the fake vector store a test would silently use a real
+    Qdrant when one happens to run locally — and fail in CI, where none does."""
+    with make_app() as client:
         yield client
 
 
