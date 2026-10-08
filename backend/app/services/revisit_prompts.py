@@ -1,4 +1,4 @@
-"""Prompts and text cleaning for the "revisit" features: automatic chat titles (§3.9).
+"""Prompts and text cleaning for the "revisit" features: automatic chat titles and user-facing summaries (§3.9).
 
 Separate from ``prompts.py``, which holds the document-answer prompts. Everything here is for a 4B model with a small
 context: short instructions, one job per call, structured JSON for summaries, and strict post-processing so a sloppy
@@ -8,6 +8,10 @@ reply (quotes, a "Title:" prefix, a trailing full stop) never reaches the sideba
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
+from typing import Any
+
+from pydantic import BaseModel, field_validator
 
 from ..providers.llm import LLMMessage
 from ..settings import Language
@@ -15,6 +19,7 @@ from .chats import DEFAULT_TITLE
 from .prompts import LANGUAGE_NAMES
 
 TITLE_PROMPT_VERSION = "title-v1"
+SUMMARY_PROMPT_VERSION = "summary-v1"
 
 # ------------------------------------------------------------------ titles
 
@@ -99,3 +104,143 @@ def _cut(text: str, limit: int) -> str:
 
 def _clip(text: str, limit: int) -> str:
     return _SPACE.sub(" ", text).strip()[:limit]
+
+
+# ------------------------------------------------------------------ summaries
+
+MAX_KEY_POINTS = 8
+MAX_FOLLOW_UPS = 3
+OVERVIEW_CHARS = 700
+POINT_CHARS = 320
+FOLLOW_UP_CHARS = 200
+QUESTION_CHARS = 300  # an unanswered question as listed in the summary
+MESSAGE_CHARS = 1000  # one message as shown to the summarizer
+
+NO_ANSWER_LINE = "(no answer: the documents did not cover this)"
+
+
+_SOURCE_NUMBER = re.compile(r"\[?\s*S?\s*(\d{1,6})\s*\]?", re.IGNORECASE)
+
+
+class DraftPoint(BaseModel):
+    """One key point as the model writes it: ``sources`` are chat-wide citation numbers ([3] → 3)."""
+
+    text: str
+    sources: list[int]
+
+    @field_validator("sources", mode="before")
+    @classmethod
+    def _numbers(cls, value: Any) -> list[int]:
+        """Models write [3], "3", "[3]", "S3" or 3.0 for the same thing; keep the positive numbers, drop the rest."""
+        if not isinstance(value, list):
+            return []
+        numbers: list[int] = []
+        for item in value:
+            if isinstance(item, bool):
+                continue
+            if isinstance(item, float) and item.is_integer():
+                item = int(item)
+            if isinstance(item, int):
+                number = item
+            elif isinstance(item, str) and (m := _SOURCE_NUMBER.fullmatch(item)):
+                number = int(m.group(1))
+            else:
+                continue
+            if number > 0:
+                numbers.append(number)
+        return numbers
+
+
+class SummaryDraft(BaseModel):
+    """What the LLM returns for a summary (one window of the chat, or a combination of partial summaries). All fields
+    are required so the constrained decoder always writes them; the unanswered questions are not asked of the model
+    (they come from the abstained turns themselves, which cannot be mis-copied)."""
+
+    overview: str
+    key_points: list[DraftPoint]
+    follow_ups: list[str]
+
+
+_SUMMARY_LANGUAGE_RULE = {
+    "en": "Write everything in English.",
+    "hi": (
+        "Write everything in Hindi, in Devanagari script. Keep figures, citation numbers and terms such as EBITDA "
+        "or FY24 exactly as written."
+    ),
+}
+
+_SUMMARY_FORMAT = (
+    "Reply with JSON only:\n"
+    '- "overview": one to three sentences on what this was about.\n'
+    f'- "key_points": at most {MAX_KEY_POINTS} short statements of what was established from the documents. Each has '
+    '"text" and "sources": the citation numbers (like 3 for [3]) of the answers it comes from, or an empty list '
+    "when they cite none. Copy figures, names and dates exactly.\n"
+    f'- "follow_ups": at most {MAX_FOLLOW_UPS} things the user may want to ask or check next, grounded in the '
+    "conversation; an empty list if there are none."
+)
+
+
+def summary_system_prompt(language: Language) -> str:
+    return (
+        "You summarise one conversation between a user and a document assistant, so the user can revisit it later.\n"
+        'The conversation is a list of lines "#<n> User:" and "#<n> Assistant:". Assistant lines cite documents as '
+        "[1], [2] …; the list of sources after the conversation names the document and page of each number.\n"
+        f"{_SUMMARY_FORMAT}\n"
+        "Rules:\n"
+        "1. Use only what the conversation says. Never add facts, figures or citation numbers that are not in it.\n"
+        f"2. Lines saying {NO_ANSWER_LINE} are questions the documents could not answer: make no key point from "
+        "them.\n"
+        f"3. {_SUMMARY_LANGUAGE_RULE[language]}"
+    )
+
+
+def summary_user_prompt(lines: Sequence[str], legend: Sequence[str]) -> str:
+    sources = "\n".join(legend) if legend else "(none: no answer in this part cites a document)"
+    return "Conversation:\n" + "\n".join(lines) + "\n\nSources:\n" + sources
+
+
+def reduce_system_prompt(language: Language) -> str:
+    return (
+        "You combine partial summaries of consecutive parts of one conversation between a user and a document "
+        "assistant into a single summary.\n"
+        f"{_SUMMARY_FORMAT}\n"
+        "Rules:\n"
+        "1. Use only what the partial summaries say. Merge duplicates; keep the most important points.\n"
+        "2. Keep each key point's citation numbers exactly as given; never add numbers that are not in the partial "
+        "summaries.\n"
+        f"3. {_SUMMARY_LANGUAGE_RULE[language]}"
+    )
+
+
+def reduce_user_prompt(parts: Sequence[str], legend: Sequence[str]) -> str:
+    sources = "\n".join(legend) if legend else "(none)"
+    return "Partial summaries:\n\n" + "\n\n".join(parts) + "\n\nSources:\n" + sources
+
+
+def render_partial(index: int, draft: SummaryDraft) -> str:
+    """A partial summary as the reduce prompt shows it."""
+    lines = [f"Part {index}:", f"Overview: {draft.overview}"]
+    if draft.key_points:
+        lines.append("Key points:")
+        lines.extend(f"- {p.text}{''.join(f'[{n}]' for n in p.sources)}" for p in draft.key_points)
+    if draft.follow_ups:
+        lines.append("Follow-ups:")
+        lines.extend(f"- {f}" for f in draft.follow_ups)
+    return "\n".join(lines)
+
+
+# Headings of the rendered summary, by the summary's language.
+HEADINGS: dict[Language, dict[str, str]] = {
+    "en": {
+        "overview": "Overview",
+        "key_points": "Key points",
+        "unanswered": "Questions the documents couldn't answer",
+        "follow_ups": "Open follow-ups",
+    },
+    "hi": {
+        "overview": "सारांश",
+        "key_points": "मुख्य बिंदु",
+        "unanswered": "वे प्रश्न जिनका उत्तर दस्तावेज़ों में नहीं मिला",
+        "follow_ups": "आगे के प्रश्न",
+    },
+}

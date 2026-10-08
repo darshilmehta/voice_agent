@@ -216,4 +216,6 @@ class ChatSummary(Record):
     covers_message_id: str | None
     model: str | None
     created_at: datetime
-    stale: bool = False  # messages were added after the last one it covers
+    covers_seq: int = 0  # ``seq`` of the last message it includes (0: none)
+    message_count: int = 0  # the chat's messages now
+    stale: bool = False  # messages were added after the last one it covers (covers_seq < message_count)

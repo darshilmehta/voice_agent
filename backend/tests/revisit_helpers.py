@@ -15,11 +15,14 @@ from app.providers.runtime import InProcessJobQueue
 from app.services.chats import ChatService
 from app.services.messages import MessageService
 from app.services.projects import ProjectService
+from app.services.revisit_prompts import SummaryDraft
 
 from .conftest import Fakes
 from .fakes import FakeEmbedder, FakeLLM, FakeReranker, FakeStore, TextParser, keyword_scorer
 
 TITLE_MARK = "write titles for conversations"  # in the title system prompt
+SUMMARY_MARK = "You summarise one conversation"  # in the summary (map) system prompt
+REDUCE_MARK = "You combine partial summaries"  # in the reduce system prompt
 
 
 def is_title(messages: Sequence[LLMMessage]) -> bool:
@@ -67,6 +70,16 @@ class ScriptedLLM(FakeLLM):
         if isinstance(out, BaseModel):
             return out
         return schema.model_validate(out)
+
+
+def draft(overview: str = "Overview.", points: Sequence[tuple[str, Sequence[int]]] = (), follow_ups=()) -> SummaryDraft:
+    return SummaryDraft.model_validate(
+        {
+            "overview": overview,
+            "key_points": [{"text": t, "sources": list(s)} for t, s in points],
+            "follow_ups": list(follow_ups),
+        }
+    )
 
 
 def make_fakes(llm: FakeLLM) -> Fakes:

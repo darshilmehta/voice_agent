@@ -21,6 +21,7 @@ from .api.deps import install_error_handlers
 from .logging_setup import configure_logging
 from .offline import apply_runtime_env
 from .providers.registry import Container, build_container
+from .services.chat_summary import ChatSummarizer
 from .services.chat_turns import wait_for_background
 from .services.document_pipeline import DocumentPipeline
 from .services.messages import add_agent_message_hook
@@ -66,6 +67,7 @@ def create_app(
         app.state.document_pipeline.wait_before_ingesting = app.state.preloader.wait
         await app.state.document_pipeline.start()  # re-queues ingestions a restart interrupted
         app.state.voice_sessions = VoiceSessions(container)
+        app.state.summarizer = ChatSummarizer.from_container(container)
         titles = app.state.titles = TitleService.from_container(container)
         # Titles follow the first saved agent answer (text or voice) as a background job, not as part of the turn.
         unhook = add_agent_message_hook(titles.db, titles.on_agent_message) if auto_titles else None

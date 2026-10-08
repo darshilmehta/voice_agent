@@ -127,6 +127,16 @@ class MessageService(Service):
             await s.flush()
             return Message.model_validate(row)
 
+    async def all(self, chat_id: str) -> list[Message]:
+        """The whole transcript in chronological order, read page by page (for summaries and export)."""
+        items: list[Message] = []
+        cursor: int | None = 0
+        while cursor is not None:
+            page = await self.list(chat_id, after=cursor, limit=PAGE_MAX)
+            items.extend(page.items)
+            cursor = page.next_cursor
+        return items
+
     async def list(
         self,
         chat_id: str,
