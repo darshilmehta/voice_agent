@@ -5,6 +5,7 @@
 Environment (defaults suit the main checkout, where data/ holds the models and smoke fixtures):
     MODELS_ROOT   directory with huggingface/ (HF_HOME) and docling/ (artifacts)   default <repo>/data/models
     SMOKE_DOCS    directory with annual_report.pdf (written by scripts/smoke/05)  default <repo>/data/smoke/docs
+    SMOKE_AUDIO   directory with the speech clips (scripts/smoke/09)          default <repo>/data/smoke/audio
     QDRANT_URL    a local Qdrant; a uniquely named collection is created and dropped default http://127.0.0.1:6333
 """
 

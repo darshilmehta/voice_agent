@@ -136,6 +136,8 @@ RUN_INTEGRATION=1 uv run --group ml pytest tests/integration -s
 
 They read models from `MODELS_ROOT` (default `../data/models`) and the smoke-test documents from `SMOKE_DOCS` (default `../data/smoke/docs`, written by `scripts/smoke/05_docling.py`); Qdrant from `QDRANT_URL` (default `http://127.0.0.1:6333`). `test_chat_e2e.py` also needs Ollama with `qwen3:4b-instruct` and checks phase 1 end to end over HTTP: upload until `READY`, English and Hindi fact questions cited to page 2, an out-of-document question abstaining, two documents told apart, nothing leaking across projects. Timings, ranks and answers print in the summary.
 
+`test_voice_e2e.py` (also needs Ollama, and the speech clips in `SMOKE_AUDIO`, default `../data/smoke/audio`, written by `scripts/smoke/09_kokoro.py`) runs the voice loop over the WebSocket with every real model preloaded: a spoken revenue question streamed in real time must come back transcribed, answered with citations and spoken; a spoken correction barges in mid-answer and must stop it (with `heard_text`) and be answered (Whisper must understand that spoken answer again); a Hindi question must be detected as Hindi. It prints the latency from the end of the user's speech to each stage.
+
 ## Layout
 
 ```text
