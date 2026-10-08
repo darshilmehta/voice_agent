@@ -428,6 +428,13 @@ Server → client:
 4. **Stop**: `stop` cancels like a confirmed barge-in; `route.stopped = true` as in text chat.
 5. Everything said is persisted as messages in the chat (§3.9): the transcript view and the text endpoint see the same history.
 
+**Ordering guarantees** (the client relies on these and still guards against stale messages):
+
+- Within a turn the server sends `user_message`, `turn`, `sources`, then the `delta` / `audio_chunk` + frames stream, then `agent_message`. **`agent_message` comes after the turn's last binary frame**, so the client sends `playback_done` only when the answer has really finished playing. If TTS fails partway, `error {stage: "tts"}` comes before `agent_message`.
+- After `barge_in: stop` (or a client `stop`) the server sends nothing more for that `turn_id`: no `delta`, `audio_chunk` or frames. The interrupted turn's `agent_message` (with `heard_text`) comes before the next turn's `user_message`.
+- `turn_id` strictly increases within a session. A reconnect is a new session: the client resets its turn tracking on `ready` and reloads the transcript tail.
+- `stop` while thinking (before any speech) cancels the turn and saves the agent message with `route.stopped = true`, then the server returns to `listening`.
+
 **Startup.** The backend preloads the embedder, reranker, STT and TTS models at startup (in the background, reported by `/health`), so the first spoken question isn't slowed by model loading (§9 measured ~3.7 s for a cold reranker).
 
 ---
