@@ -724,6 +724,7 @@ Latency plan for the build (estimates from these measurements):
 | First spoken chunk 3–5 words (fewer tokens to wait for, faster TTS) | ~0.5 s |
 | Speculative STT during the end-of-turn silence (§9.4) | ~0.3 s |
 | Keyword fast path for stop / backchannel (no LLM) | those turns ≈ instant |
+| **Rerank fewer candidates** (8–10 instead of 20) and/or shorter chunks: measured in phase 1 at real chunk sizes, reranking 20 candidates × ~425 tokens takes **≈ 2.1 s** on the M4 GPU (the 202 ms in §9.2 was for one-sentence passages); 6 candidates ≈ 210 ms | up to ~1.8 s |
 | Instant pre-synthesized acknowledgement ("Sure,", "Let me check") | perceived wait ≈ 1 s |
 
 Expected after these: **~2.5–3 s** to the first content audio on this Mac. The original 1.5–2.5 s target is likely out of reach with router + answer model on an M4 base; perceived latency is handled with acknowledgements.
@@ -767,7 +768,7 @@ Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first
 |---|---|---|
 | −1 Downloads + smoke tests | ✅ done | §9; initial commit |
 | 0 Skeleton | ✅ done | PRs #1–#3 (hygiene, backend skeleton, frontend shell), #5 (CI), #8 (Docker images + `full` profile, `docker.config.json`, `strict_offline_local_hosts`) |
-| 1 Projects + text document chat | in progress | persistence (projects, documents, chats, messages) and ingestion/retrieval built in parallel |
+| 1 Projects + text document chat | in progress | #10 persistence (SQLite + Alembic, projects/chats/messages/pins API), #11 ingestion + hybrid retrieval library (FY24 margin table ranked first in EN and HI on the real models), #12 sidebar, project and chat pages, transcript view; next: upload + streaming cited chat (backend and frontend in parallel) |
 
 Design-only PRs so far: #4 and #6 (voice presence UI, §3.8), #7 (projects, chats, transcripts, §3.9).
 
@@ -789,6 +790,8 @@ Each phase is green (tests + acceptance criteria) before the next starts.
 ---
 
 ## 11. Open items
+
+- **Reranker cost at real chunk sizes** (≈ 2.1 s for 20 × ~425-token candidates): choose the rerank candidate count with the chat pipeline (being measured now) and revisit chunk size in phase 2.
 
 - Web search provider decided: SearXNG locally, search API in production (§3.7). Add the SearXNG container + per-engine fan-out in phase 8.
 
