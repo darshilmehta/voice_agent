@@ -50,16 +50,16 @@ from .conversation import (
     resolve_target,
 )
 from .datasets import TYPER_VERSION, table_contexts, type_document
-from .draft import Draft, draft_visual, filename_labels, same_choice, turn_context
+from .draft import Draft, cues, draft_visual, filename_labels, refinement_loses, same_choice, turn_context
 from .edits import change_kind, edit_language, merge_planned
-from .overview import overview_specs
+from .overview import document_title, main_language, overview_specs, overview_title
 from .planner import NO_VISUAL, PlanResult, VisualPlanner, builds, first_valid, visual_intent
 from .spec import SpecError, VisualSpec, resolve, split_ref
 from .store import CanvasStore
 
 log = logging.getLogger(__name__)
 
-OVERVIEW_VERSION = "o1"  # bump when the overview's choices change, so stored overviews are rebuilt
+OVERVIEW_VERSION = "o2"  # bump when the overview's choices change, so stored overviews are rebuilt
 
 
 class CanvasService:
@@ -257,24 +257,37 @@ class CanvasService:
                     return await self.store.overview_panels(project_id)
                 filenames = await self.store.filenames(project_id)
                 by_id = {d.id: d for d in datasets}
-                built: list[tuple[Visual, dict[str, object], list[str]]] = []
+                language = main_language(datasets, self.language)  # the project's, not the app's default
                 # a panel rebuilt from the same spec keeps its id (a "show in chat" from a page loaded earlier works)
                 previous = await self.store.overview_ids_by_spec(project_id)
+                visuals: dict[str, Visual] = {}
 
                 def check(spec: VisualSpec) -> bool:
                     key = _spec_key(spec.model_dump(mode="json", by_alias=True))
                     try:
-                        visual = self._build(
+                        visuals[key] = self._build(
                             spec, by_id, filenames, project_id=project_id, chat_id=None, visual_id=previous.get(key)
                         )
                     except (SpecError, AssertionError) as e:
                         log.info("canvas overview: skipped a %s (%s)", spec.kind, e)
                         return False
-                    built.append((visual, spec.model_dump(mode="json", by_alias=True), _documents(spec, by_id)))
                     return True
 
-                if self.cfg.overview_panels:
-                    overview_specs(datasets, language=self.language, max_panels=self.cfg.overview_panels, check=check)
+                specs = (
+                    overview_specs(datasets, language=language, max_panels=self.cfg.overview_panels, check=check)
+                    if self.cfg.overview_panels
+                    else []
+                )
+                # which document each panel is from, in its title, when there are several to tell apart
+                several = len({d.document_id for d in datasets if d.chartability.kind != "none"}) > 1
+                built: list[tuple[Visual, dict[str, object], list[str]]] = []
+                for spec in specs:
+                    spec_json = spec.model_dump(mode="json", by_alias=True)
+                    visual = visuals[_spec_key(spec_json)]
+                    name = filenames.get(by_id[spec.datasets[0]].document_id)
+                    label = document_title(name) if several and name else None
+                    title = overview_title(visual, label, language)
+                    built.append((visual.model_copy(update={"title": title}), spec_json, _documents(spec, by_id)))
                 panels = await self.store.replace_overview(project_id, built[: self.cfg.overview_panels], fingerprint)
                 log.info("canvas: overview of %s rebuilt with %d panel(s)", project_id, len(panels))
                 return panels
@@ -504,6 +517,15 @@ class CanvasService:
                 return
             if same_choice(spec, draft.spec, datasets):
                 trace.planner = "same"
+                return
+            # The planner refines the draft; it doesn't replace a good chart with a worse one.
+            loses = refinement_loses(
+                spec, draft, datasets, cues(question, query_en, names=ctx.names), ctx, filenames=filenames
+            )
+            if loses is not None:
+                trace.planner = "kept"
+                trace.reasons = [*trace.reasons[:3], f"planner's chart not used: {loses}"]
+                log.info("visual refine: the draft stays (%s)", loses)
                 return
         if spec is None:
             trace.planner = "none" if planned.reason == NO_VISUAL else "failed"

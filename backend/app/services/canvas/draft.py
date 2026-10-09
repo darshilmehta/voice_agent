@@ -39,7 +39,7 @@ from .chartability import series_columns
 from .overview import composition_spec, continuations
 from .parsing import find_period
 from .planner import _PERIOD_TOKEN, _STOP, _WORD, _stem, builds, first_valid, score_candidates
-from .spec import SpecError, VisualSpec, ref, resolve
+from .spec import Resolved, SpecError, VisualSpec, ref, resolve
 
 CLEAR_MARGIN = 2.0  # how far the best candidate must lead the next one to be "one clear table"
 MAX_DRAFT_SERIES = 4
@@ -738,6 +738,86 @@ def turn_context(
 def filename_labels(filenames: Mapping[str, str]) -> dict[str, str]:
     """Document labels from file names alone (when retrieval's, with titles, aren't at hand)."""
     return {d: document_label(f, None) for d, f in filenames.items()}
+
+
+TABLE_SLACK = CLEAR_MARGIN  # the planner's table may trail the draft's by this much and still be "the same match"
+
+
+def refinement_loses(
+    planned: VisualSpec,
+    draft: Draft,
+    datasets: Mapping[str, TypedDataset],
+    c: Cues,
+    ctx: TurnContext,
+    filenames: Mapping[str, str] | None = None,
+) -> str | None:
+    """Why the planner's chart must not replace the draft on screen, or None when it covers the question at least as
+    well. The planner is a 4B model reading a catalogue; the draft was chosen by code from the question's own words, the
+    turn's retrieval and the company it names, and is the better judge of tables (30 of 32 against 25 of 32 on the blind
+    set) where the planner is the better judge of kinds. So the planner's chart replaces it only when it is:
+
+    - from the company's documents when the question names one and the draft is, and from the answer's own documents
+      when the draft is (a misheard company name had the planner draw another company's table);
+    - from a table that matches the question as well (``Draft.scores``, within ``TABLE_SLACK``: an unsure draft is one
+      whose runner-up is that close);
+    - showing no fewer of the periods the question names, nor, when it names none, fewer points of a time series (a
+      quarterly question must not end in a two-point bar chart of a yearly table);
+    - showing no fewer of the series and categories the question names."""
+    if draft.spec is None:
+        return None
+    try:
+        before, after = (
+            resolve(draft.spec, datasets, filenames=filenames),
+            resolve(planned, datasets, filenames=filenames),
+        )
+    except SpecError:
+        return None  # one of them doesn't resolve: nothing to compare (the planner's was built before)
+    by_id = {d.id: d for d in datasets.values()}
+    drawn = [by_id[i] for i in draft.spec.datasets if i in by_id]
+    chosen = [by_id[i] for i in planned.datasets if i in by_id]
+    if (
+        ctx.documents
+        and all(d.document_id in ctx.documents for d in drawn)
+        and any(d.document_id not in ctx.documents for d in chosen)
+    ):
+        return "the planner's table is not from the company's documents"
+    if (
+        ctx.source_documents
+        and all(d.document_id in ctx.source_documents for d in drawn)
+        and any(d.document_id not in ctx.source_documents for d in chosen)
+    ):
+        return "the planner's table is not from the documents the answer came from"
+    score = dict(zip((d.id for d in draft.candidates), draft.scores, strict=False))
+    have = max((score[d.id] for d in drawn if d.id in score), default=None)
+    got = max((score[d.id] for d in chosen if d.id in score), default=None)
+    if have is not None and got is not None and got < have - TABLE_SLACK + 1e-6:
+        return f"the draft's table matches the question better ({have:.1f} against {got:.1f})"
+    if c.periods and _periods_shown(c, after) < _periods_shown(c, before):
+        return "the planner's chart shows fewer of the periods asked for"
+    periodic = {"period", "date"}
+    if (
+        not c.periods
+        and before.x_type in periodic
+        and after.x_type in periodic
+        and len(after.x_items) < len(before.x_items)
+    ):
+        return f"the planner's chart has fewer periods ({len(after.x_items)} against {len(before.x_items)})"
+    if _names_shown(c, after) < _names_shown(c, before):
+        return "the planner's chart shows fewer of the series the question names"
+    return None
+
+
+def _periods_shown(c: Cues, r: Resolved) -> int:
+    """How many of the periods the question names are on the chart: the period itself, or a quarter or half of the
+    fiscal year named ("FY24" on a chart of Q1 FY24 to Q4 FY24)."""
+    labels = [i.label for i in r.x_items]
+    return sum(1 for p in c.periods if any(x == p or x.endswith(f" {p}") for x in labels))
+
+
+def _names_shown(c: Cues, r: Resolved) -> int:
+    """How many of the chart's series and x items (a donut's slices) carry a word of the question."""
+    labels = {s.metric or s.label for s in r.series} | {i.label for i in r.x_items}
+    return sum(1 for label in labels if _hits(set(c.words), label)[0])
 
 
 def same_choice(a: VisualSpec, b: VisualSpec, datasets: Mapping[str, TypedDataset] | None = None) -> bool:
