@@ -21,6 +21,7 @@
  */
 
 import type { Language, Message, SourcesPayload } from "../api";
+import { publishRawCanvasEvent } from "../canvas/events";
 import { applyTool, endSearch, NO_WEB, parseTool, type WebSearchState, type WebTurn } from "../web-search";
 import { MIC_ERROR_TEXT, MicError, openMic, voiceSupport, type MicCapture, type MicErrorKind } from "./capture";
 import { AgentPlayer } from "./playback";
@@ -791,6 +792,11 @@ export class VoiceSession {
           this.discardedUtterance = true;
           if (!this.snap.userFinal) this.dropUserCaption();
         }
+        break;
+      case "visual":
+      case "canvas":
+        // The live canvas follows these (lib/canvas); they never touch the conversation's own state.
+        publishRawCanvasEvent(this.opts.chatId, msg.type, msg);
         break;
       case "error":
         // The error path may send no terminal `tool` event: whatever search was running is over.

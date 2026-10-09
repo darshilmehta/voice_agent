@@ -12,6 +12,7 @@ import "./styles/pages.css";
 import "./styles/chat.css";
 import "./styles/summary.css";
 import "./styles/voice.css";
+import "./styles/canvas.css";
 
 // BACKEND_URL is read per request on the server and handed to the client, never baked in at build time
 // (docs/DESIGN.md §6.5). Every route renders under this layout, so every route is dynamic.

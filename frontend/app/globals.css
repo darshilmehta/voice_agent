@@ -44,6 +44,29 @@
   --web-soft: #e1f2ef;
   --web-text: #0b5f58;
   --on-web: #ffffff;
+  /*
+   * Charts (docs §12.1; components/canvas, app/styles/canvas.css). The dataviz palette mapped onto this app's surfaces:
+   * eight categorical hues in a fixed order, validated against --surface in both themes (adjacent colour-vision
+   * distance and lightness band pass; the aqua, yellow and magenta marks sit below 3:1 on white, so every chart also has
+   * a table view and labels). Chart text always wears the text tokens, never a series colour.
+   */
+  --viz-1: #2a78d6;
+  --viz-2: #eb6834;
+  --viz-3: #1baf7a;
+  --viz-4: #eda100;
+  --viz-5: #e87ba4;
+  --viz-6: #008300;
+  --viz-7: #4a3aa7;
+  --viz-8: #e34948;
+  --viz-other: #898781;
+  --viz-pos: var(--viz-1);
+  --viz-neg: var(--viz-8);
+  --viz-total: #52514e;
+  --viz-grid: #e8e7e1;
+  --viz-axis: #c3c2b7;
+  --viz-ink: var(--text);
+  --viz-ink-2: #52514e;
+  --viz-band: rgb(42 120 214 / 9%);
   --radius: 12px;
   --shadow: 0 1px 2px rgb(0 0 0 / 4%), 0 1px 1px rgb(0 0 0 / 3%);
   --shadow-lg: 0 12px 32px rgb(0 0 0 / 12%), 0 2px 6px rgb(0 0 0 / 6%);
@@ -91,6 +114,19 @@
     --web-soft: rgb(79 195 184 / 14%);
     --web-text: #8be0d6;
     --on-web: #06201d;
+    --viz-1: #3987e5;
+    --viz-2: #d95926;
+    --viz-3: #199e70;
+    --viz-4: #c98500;
+    --viz-5: #d55181;
+    --viz-6: #008300;
+    --viz-7: #9085e9;
+    --viz-8: #e66767;
+    --viz-total: #c3c2b7;
+    --viz-grid: #2c2c2a;
+    --viz-axis: #46453f;
+    --viz-ink-2: #c3c2b7;
+    --viz-band: rgb(57 135 229 / 14%);
     --shadow: none;
     --shadow-lg: 0 16px 40px rgb(0 0 0 / 55%), 0 0 0 1px #33322f;
     color-scheme: dark;

@@ -17,6 +17,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { errorMessage, isAbort, type Api, type Language, type Message, type SourcesPayload, type StreamFailure } from "./api";
+import { publishRawCanvasEvent } from "./canvas/events";
 import { splitCitations } from "./citations";
 import { applyTool, endSearch, NO_WEB, type WebTurn } from "./web-search";
 
@@ -98,6 +99,10 @@ export function useChatTurns(api: Api, chatId: string, onSettled?: () => void, o
       let finished = false;
       try {
         for await (const ev of api.sendMessage(chatId, { text, language }, ctrl.signal)) {
+          if (ev.type === "canvas") {
+            publishRawCanvasEvent(chatId, ev.name, ev.data); // the canvas follows visuals as they are prepared (lib/canvas)
+            continue;
+          }
           if (ev.type === "delta") {
             buffered.current = { key, text: (buffered.current?.text ?? "") + ev.text };
             if (frame.current === null) frame.current = requestAnimationFrame(flush);

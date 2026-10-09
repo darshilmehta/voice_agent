@@ -1,0 +1,362 @@
+/*
+ * The live visual canvas, part 1 of 2 (docs/DESIGN.md §12.1, §3.8): docking of the presence field, the canvas shell,
+ * the panel card, skeletons, failure notes, the debug box, the overview card and the narrow-screen sheet. This is what a
+ * page needs before any chart exists, so it loads with the app (about 2 KB gzipped).
+ * Part 2, canvas-panels.css, is the panel and chart styles; it is imported by the chart code (components/canvas/
+ * CanvasBoard.tsx) and loads with that lazy chunk.
+ * Colours come from the --viz-* tokens in globals.css (the dataviz palette on this app's surfaces).
+ */
+
+/* ------------------------------------------------------------------ docking (voice view) */
+
+.vc-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The slot the presence rings are centred on. Animatable (basis 0), so docking eases: the field follows the slot's
+   size every frame (PresenceField observes it). */
+.vc-slot {
+  flex: 1 1 0;
+  transition:
+    flex-grow 0.4s ease,
+    flex-basis 0.4s ease,
+    min-height 0.4s ease;
+}
+
+.vc[data-docked] {
+  --vc-band: 88px;
+}
+
+/* Docked: the field shrinks into a band at the top and keeps breathing as the presence indicator. */
+.vc[data-docked] .vc-slot {
+  flex: 0 0 var(--vc-band);
+  min-height: var(--vc-band);
+}
+
+.vc[data-docked] .vc-field {
+  -webkit-mask-image: linear-gradient(to bottom, #000 0, #000 calc(var(--vc-band) - 6px), transparent calc(var(--vc-band) + 34px));
+  mask-image: linear-gradient(to bottom, #000 0, #000 calc(var(--vc-band) - 6px), transparent calc(var(--vc-band) + 34px));
+}
+
+.vc[data-docked] .vc-say {
+  padding-bottom: 8px;
+}
+
+.vc[data-docked] .vc-caption {
+  --cap: clamp(15px, 1.7vw, 18px);
+  height: calc(var(--cap) * 1.45 * 2);
+}
+
+.vc[data-docked] .vc-sources {
+  min-height: 26px;
+  margin-top: 4px;
+}
+
+/* Short windows: the field's band and the captions give the visuals more of the height. */
+@media (max-height: 820px) {
+  .vc[data-docked] {
+    --vc-band: 68px;
+  }
+
+  .vc[data-docked] .vc-hint {
+    display: none;
+  }
+
+  .vc[data-docked] .vc-controls {
+    margin-top: 4px;
+  }
+
+  .vc[data-docked] .vc-sources:empty {
+    display: none;
+  }
+}
+
+.vc-visuals {
+  flex: 1 1 0;
+  min-height: 0;
+  padding: 0 20px 12px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  animation: cv-rise 0.35s ease-out;
+}
+
+.vc-visuals[hidden] {
+  display: none;
+}
+
+@keyframes cv-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+/* The text-only layout (voice off): the canvas above the transcript. */
+.cv-inline {
+  flex: none;
+  max-height: 55%;
+  padding: 12px 16px;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ------------------------------------------------------------------ canvas shell */
+
+.cv-canvas {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+}
+
+.cv-board {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr));
+  gap: 14px;
+  align-items: start;
+  width: 100%;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+.cv-dots {
+  display: none;
+}
+
+.cv-chunk-failed {
+  grid-column: 1 / -1;
+}
+
+/* ------------------------------------------------------------------ panel card (also the skeleton's) */
+
+.cv-panel {
+  --viz-surface: var(--surface);
+  container-type: inline-size;
+  min-width: 0;
+  padding: 14px 16px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--viz-surface);
+  box-shadow: var(--shadow);
+  font-size: 13.5px;
+  transition: opacity 0.15s;
+}
+
+/* ------------------------------------------------------------------ skeleton, failure, debug, overview */
+
+.cv-skeleton {
+  min-height: 210px;
+}
+
+.cv-skel-title {
+  width: 52%;
+  height: 16px;
+}
+
+.cv-skel-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  height: 110px;
+  margin: 18px 4px 10px;
+}
+
+.cv-skel-chart .skel {
+  flex: 1;
+  border-radius: 4px 4px 0 0;
+}
+
+.cv-skel-text {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.cv-failed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 8px 12px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 10px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.cv-failed span {
+  flex: 1;
+  min-width: 0;
+}
+
+.cv-debug {
+  margin-top: 8px;
+  font-size: 13px;
+}
+
+.cv-debug summary {
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.cv-debug-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.cv-debug-msg {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.cv-overview {
+  margin-bottom: 16px;
+}
+
+.cv-overview .cv-board {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
+  max-width: none;
+}
+
+.cv-overview-sub {
+  margin: 0 0 12px;
+}
+
+
+/* ------------------------------------------------------------------ narrow: the canvas becomes a sheet */
+
+@media (max-width: 640px) {
+  .vc[data-docked] {
+    --vc-band: 60px;
+  }
+
+  /* Narrow: the field docks to the top-left corner, level with the Visuals and Transcript buttons on the right. */
+  .vc[data-docked] .vc-slot {
+    align-self: flex-start;
+    width: var(--vc-band);
+    margin-left: 10px;
+  }
+
+  /* The sheet: a swipeable row of panels, each scrolling inside itself, above the voice controls. */
+  .vc-visuals {
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+    overflow: hidden;
+  }
+
+  .vc-visuals .cv-canvas {
+    flex: 1 1 0;
+    min-height: 0;
+  }
+
+  .vc-visuals .cv-board {
+    display: flex;
+    flex: 1 1 0;
+    gap: 0;
+    min-height: 0;
+    max-width: none;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scroll-snap-type: x mandatory;
+    scrollbar-width: none;
+  }
+
+  .vc-visuals .cv-board::-webkit-scrollbar {
+    display: none;
+  }
+
+  .vc-visuals .cv-panel,
+  .vc-visuals .cv-failed {
+    flex: 0 0 100%;
+    max-height: 100%;
+    min-height: 0;
+    overflow-y: auto;
+    scroll-snap-align: start;
+    border-radius: 14px 14px 0 0;
+    border-bottom: 0;
+    box-shadow: none;
+    overscroll-behavior: contain;
+  }
+
+  .vc-visuals .cv-dots {
+    display: flex;
+    flex: none;
+    justify-content: center;
+    gap: 2px;
+    padding: 2px 0 0;
+  }
+
+  .vc-visuals .cv-dot-btn {
+    position: relative;
+    width: 24px;
+    height: 20px;
+    padding: 0;
+    border: 0;
+    background: none;
+  }
+
+  .vc-visuals .cv-dot-btn::after {
+    content: "";
+    position: absolute;
+    inset: 7px;
+    border-radius: 50%;
+    background: var(--border-strong);
+  }
+
+  .vc-visuals .cv-dot-btn[aria-current]::after {
+    background: var(--text);
+  }
+
+  .vc-visuals .cv-dots-count {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* The two buttons sit level with the field in its corner. */
+  .vc[data-docked] .vc-top {
+    top: 14px;
+    right: 10px;
+  }
+
+  .vc[data-docked] .vc-caption {
+    --cap: 15px;
+  }
+
+  .vc[data-docked] .vc-hint {
+    display: none;
+  }
+
+  .vc[data-docked] .vc-controls {
+    margin-top: 4px;
+  }
+
+  .vc[data-docked] .vc-say {
+    padding: 4px 12px 4px;
+  }
+
+  .vc[data-docked] .vc-sources {
+    min-height: 0;
+    margin-top: 2px;
+  }
+
+  .cv-panel {
+    padding: 12px 12px 10px;
+  }
+
+  .cv-overview .cv-board {
+    display: grid;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vc-visuals {
+    animation: none;
+  }
+}

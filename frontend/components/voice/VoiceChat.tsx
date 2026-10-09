@@ -128,6 +128,13 @@ export interface VoiceChatProps {
   composer: ReactNode;
   /** Language of the conversation, for captions. */
   language: string | null;
+  /**
+   * The live visual canvas (docs §12.1), or null when there is none yet. While it shows, the presence field docks: it
+   * shrinks into a band at the top, keeps breathing as the presence indicator, and the visuals take the stage.
+   */
+  canvas?: ReactNode;
+  /** Visuals on the canvas, for the toggle's badge. */
+  canvasCount?: number;
 }
 
 export function VoiceChat({
@@ -145,6 +152,8 @@ export function VoiceChat({
   panelTabs,
   composer,
   language,
+  canvas = null,
+  canvasCount = 0,
 }: VoiceChatProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const dockRef = useRef<HTMLDivElement>(null);
@@ -179,6 +188,13 @@ export function VoiceChat({
       status?.removeEventListener("change", sync);
     };
   }, []);
+
+  // The canvas takes the stage and the presence field docks; the toggle lets the person bring the full field back. A
+  // visual arriving or leaving brings the canvas back.
+  const [visualsHidden, setVisualsHidden] = useState(false);
+  useEffect(() => setVisualsHidden(false), [canvasCount]);
+  const docked = canvas !== null && !visualsHidden;
+  const canvasId = useId();
 
   const unsupported = support !== null && !support.ok;
   const blocked = permission === "denied" && snapshot.phase === "idle";
@@ -313,11 +329,26 @@ export function VoiceChat({
       data-panel={panelOpen ? "open" : "closed"}
       data-overlay={overlay || undefined}
       data-phase={snapshot.phase}
+      data-canvas={canvas !== null ? "on" : undefined}
+      data-docked={docked || undefined}
     >
       <section className="vc-stage" aria-label="Voice conversation">
         <PresenceField session={session} anchorRef={slotRef} />
 
         <div className="vc-top">
+          {canvas !== null && (
+            <button
+              type="button"
+              className="btn btn-sm vc-panel-toggle"
+              aria-expanded={docked}
+              aria-controls={canvasId}
+              onClick={() => setVisualsHidden((v) => !v)}
+            >
+              <Icon name="sparkle" size={15} />
+              {docked ? "Hide visuals" : "Show visuals"}
+              {canvasCount > 0 && <span className="vc-count">{canvasCount}</span>}
+            </button>
+          )}
           <button
             ref={panelToggleRef}
             type="button"
@@ -334,6 +365,11 @@ export function VoiceChat({
 
         <div className="vc-display">
           <div ref={slotRef} className="vc-slot" />
+          {canvas !== null && (
+            <div id={canvasId} className="vc-visuals" data-scroll-root hidden={!docked}>
+              {canvas}
+            </div>
+          )}
           <div className="vc-say">
             <Captions
               session={session}

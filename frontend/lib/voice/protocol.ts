@@ -49,7 +49,10 @@ export type ServerMessage =
   | { type: "audio_chunk"; turn_id: number; chunk_index: number; text: string; duration_ms: number; filler?: boolean }
   | { type: "agent_message"; message: Message }
   | { type: "barge_in"; turn_id: number; decision: "stop" | "resume" }
-  | { type: "error"; detail: string; stage: ErrorStage | (string & {}) | null };
+  | { type: "error"; detail: string; stage: ErrorStage | (string & {}) | null }
+  // The live visual canvas (docs §12.1; lib/canvas): a visual preparing / ready / failed, or the whole canvas.
+  | { type: "visual"; turn_id?: number; phase: string; visual_id: string; visual?: unknown; detail?: string | null }
+  | { type: "canvas"; turn_id?: number; panels: unknown[] };
 
 const SERVER_TYPES = new Set([
   "ready",
@@ -65,6 +68,8 @@ const SERVER_TYPES = new Set([
   "agent_message",
   "barge_in",
   "error",
+  "visual",
+  "canvas",
 ]);
 
 /** A parsed control message, or null for anything that isn't one (unknown types are ignored, not fatal). */

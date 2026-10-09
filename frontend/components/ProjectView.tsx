@@ -6,7 +6,7 @@
  */
 
 import Link from "next/link";
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 
 import type { Chat, Project } from "@/lib/api";
 import { useDocumentTitle } from "@/lib/backend-context";
@@ -14,6 +14,7 @@ import { fullDateTime, plural, relativeTime, shortDate } from "@/lib/format";
 import { chatActivity, chatsOf, keys, slotOf, useWorkspace, useWorkspaceActions } from "@/lib/workspace";
 
 import { useEntityActions } from "./Actions";
+import { ProjectOverview } from "./canvas/ProjectOverview";
 import { DocumentsCard } from "./Documents";
 import { Icon } from "./Icon";
 import { Menu } from "./Menu";
@@ -47,6 +48,8 @@ export function ProjectView({ projectId }: { projectId: string }) {
 
 function ProjectPage({ project }: { project: Project }) {
   const actions = useEntityActions();
+  const docs = useWorkspace().documents[project.id];
+  const docsById = useMemo(() => Object.fromEntries((docs ?? []).map((d) => [d.id, d])), [docs]);
   const menu = actions.projectMenu(project).filter((i) => i.id === "archive" || i.id === "delete");
 
   return (
@@ -93,6 +96,8 @@ function ProjectPage({ project }: { project: Project }) {
           </button>
         </div>
       )}
+
+      <ProjectOverview projectId={project.id} docsById={docsById} />
 
       <div className="project-layout">
         <ChatsCard project={project} />

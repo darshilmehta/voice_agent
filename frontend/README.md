@@ -35,8 +35,8 @@ Everything else (title, languages, feature flags, upload limits, sign-in setting
 | Route | What it shows |
 |---|---|
 | `/` | **Start a conversation** (a new chat in the project you chose or used last, opened in voice mode), recent chats to revisit, recent projects, or an invitation to create the first project |
-| `/projects/[projectId]` | Rename, pin, archive, delete; the project's chats (archived ones folded away); its documents: upload, ingestion status, delete |
-| `/chats/[chatId]` | Project › chat breadcrumb, rename, pin, archive, delete; the documents the chat answers from (toggle chips to narrow its scope); the conversation in voice mode (below), with the transcript as a panel (opens at the latest messages, loads earlier ones as you scroll up) |
+| `/projects/[projectId]` | Rename, pin, archive, delete; the project's overview dashboard once it is built ([Live visual canvas](#live-visual-canvas)); the project's chats (archived ones folded away); its documents: upload, ingestion status, delete |
+| `/chats/[chatId]` | Project › chat breadcrumb, rename, pin, archive, delete; the documents the chat answers from (toggle chips to narrow its scope); the conversation in voice mode (below), with the transcript as a panel (opens at the latest messages, loads earlier ones as you scroll up) and, when the answer has evidence to show, the live visual canvas |
 | `/status` | Health of every backend component, and what this frontend is connected to |
 
 The sidebar (a drawer below 820 px) has New project, search (⌘K / Ctrl+K; filters project names and chat titles), Pinned, Projects (each expands to its chats, newest activity first; each project's menu can upload documents) and a health indicator that opens `/status`.
@@ -99,6 +99,54 @@ When a question needs current data the backend searches the web (SearXNG, docs/D
 - **Labels** (`lib/route.ts`): `route.basis` (a sorted subset of `documents`, `web`, `general`) decides them when present, and a web citation adds "web": "General knowledge, not from your documents" (general only), "From your documents + general knowledge", "Live web results" (web only), "From your documents + live web results", "Live web results + general knowledge" and "From your documents + live web results + general knowledge" (documents only has no label). Without `basis` (older messages) the logic that predates it applies, and an answer with web citations never says "documents + general knowledge". A general answer shows its web chips, no document chips. `route.live_note` (`unavailable` / `failed`) adds a quiet line ("Live web search isn't available, so this answer has no web results.").
 - **Summaries**: a key point's web source is `{document_id: "", filename: <site>}` with no pages and no link; it renders as a web chip (globe and site), not a document.
 
+### Live visual canvas
+
+The voice gives the short insight; the screen shows the evidence: charts, tiles, tables and timelines built by the backend from the documents' own tables (docs/DESIGN.md §12.1). The frontend **draws and formats; it never computes**: every number arrives in its unit's scale with the cell it came from, and every derived number arrives as a `Calculation` ("calculated", with its formula and the cells it used). Contract v1 is read by `lib/canvas/types.ts` (`normalizeVisual` tolerates a missing list or an unknown `kind`, which is then shown as a table).
+
+**Where it shows.** A chat whose canvas has panels takes the stage and the presence field **docks**: it shrinks into a band at the top (the top-left corner at 640 px and below), keeps breathing as the presence indicator through every voice state, and eases back to full size when the last panel goes. The slot the rings are centred on is animated, and the field follows it every frame, so `PresenceField` needed no change. A *Hide visuals* button brings the full field back; a new or removed visual brings the canvas back. The transcript panel is unchanged. At 640 px and below the panels are a **swipeable sheet** (scroll-snap, dots or "3 of 15") above the voice controls, each panel scrolling inside itself; wider, they are a responsive grid. A canvas with nothing on it draws **nothing** (no chrome, no empty state, the presence field stays full size); a chat of a backend without the endpoint (404) or an unreachable one behaves the same. With voice turned off the canvas sits above the transcript.
+
+**Events.** `GET /api/chats/{id}/canvas` on open; `visual` (`preparing` → skeleton, `ready` → panel, `failed` → a quiet note that goes away after 15 s) and `canvas` (a full snapshot) from both turn streams: the SSE `event: visual` / `event: canvas` (`lib/api.ts` `sendMessage` yields them, `lib/chat-turns.ts` publishes them) and the voice socket's `{type: "visual" | "canvas"}` (`lib/voice/session.ts`). Both go through `lib/canvas/events.ts` into one pure reducer (`lib/canvas/state.ts`), so the two paths cannot drift. Pin, unpin, remove and move are `POST …/canvas/ops`; the answer is the new canvas and replaces what the page holds. Move up / down are buttons (keyboard), the grip drags (mouse); after a move or a removal focus stays on a button of the panel that took its place and the change is announced.
+
+**Kinds.** `kpi` tiles (value, unit small beside it, change, source), `line` (several units become stacked small charts, never two y-scales), `bar` (nominal categories in one colour; a long or long-named list lies down as rows, folds to twelve with "Show all", and emphasises the highlighted bar by greying the rest), `grouped_bar`, `stacked_bar` (negatives stack below zero), `waterfall` (start and end bars, floating increases and decreases; direction is also in the signed labels and the legend words), `donut` (at most eight parts, otherwise bars), `table`, `comparison` (A vs B with changes), `timeline`.
+
+**Marks and colour.** The dataviz skill's method: bars at most 24 px with a 4 px rounded data end and a square baseline, 2 px lines, 10 px markers with a 2 px surface ring, 2 px surface gaps between touching marks, solid hairline grids, a legend for two or more series, value labels only where they fit (never a number on every point), text in text tokens (never a series colour), thin marks. The eight categorical hues are the skill's default palette mapped onto this app's surfaces as `--viz-*` tokens in `app/globals.css` and re-selected for dark; the six checks were run with `validate_palette.js` against this app's `--surface` (`#ffffff` and `#1d1d1b`): lightness band, chroma, adjacent colour-vision distance (worst 9.1 light / 8.4 dark, floor 8) and normal-vision distance (19.6 / 19.3, floor 15) pass; in light mode the aqua, yellow and magenta marks are below 3:1 on white, which the relief rule answers with a legend, selective labels, tooltips and the table view that every chart has. Waterfall polarity uses the skill's diverging pair (blue and red) with ink for totals. A ninth series is neutral grey, never a generated hue. Texture (the skill's opt-in channel for print and forced colours) is not drawn; `forced-colors` keeps the marks' own colours.
+
+**Provenance.** Hovering or focusing a point shows a tooltip: the value, its label, every series at that position, and the source (document, page, the cell's text); clicking (or Enter) opens the existing citation popover (`components/Citations.tsx`, one export added) for that source, led by `Cell "604"` and followed by the cited passage. Tiles, table cells, timeline sources and the inputs of a calculation do the same on hover, focus and click. There is no document viewer in the app, so the popover is where a source opens. Calculated values (`series.calculated`, a tile's change, every `Calculation`) carry a dashed **calculated** badge, their `formula_text`, and their inputs as chips that open their cells; each panel's "How these were calculated (n)" lists them all. A `highlight` washes its positions, flags them, makes their labels bold (and greys or dims what it isn't about) and shows its note under the chart.
+
+**Accessibility.** Each panel is an `article` named by its title and described by the visual's `summary`. Every chart has "View as table" (units in the headers, calculated columns marked, sources one click away). The marks are decorative to assistive technology; over them is one real button per data point (at least 24 px, bigger than the mark) with a full name ("FY22, EBITDA: ₹604 crore. Source: annual_report_FY24.pdf, Page 46"), one tab stop per chart, arrow keys between positions and series, Home/End/PageUp/PageDown, Enter for the source, Esc to hide the tooltip. Nothing is told by colour alone (legend words, signed labels, arrows and flags, dashed "calculated" badges, hollow markers for missing values). `prefers-reduced-motion` stops the docking ease and every transition. Hindi visuals use Hindi labels and words ("तालिका के रूप में देखें", "गणना की गई", "₹4,210 करोड़"), keep Latin digits as the documents print them, break and truncate labels on whole characters (`Intl.Segmenter`) and use a taller line height.
+
+**Numbers.** `lib/canvas/format.ts`: Indian grouping (12,34,567) whenever the unit is INR or uses lakh/crore, western otherwise; the scale word is spelled out ("₹4,210 crore"); at most two decimals with trailing zeros dropped; a true minus (−); percent values are percent (18.4 is 18.4%); changes are "+18.3%", "+1.2 pp", "+₹520 crore", never coloured good or bad (the contract doesn't say which way is good). Missing values are "—" (and "Not reported" in a tooltip), drawn as a gap in a line and a hollow mark on a bar chart's baseline.
+
+**Chart rendering: hand-rolled SVG, no new dependency.** The canvas needs five shapes (lines with gaps, bars with rounded ends and gaps, stacks, a waterfall, a ring), nice ticks, label fitting and a hit layer. What a library would add against that, bundled minified and tree-shaken (React external), measured with esbuild:
+
+| Option | Added, gzipped |
+|---|---|
+| d3-scale 4.0.2 + d3-shape 3.2.0 (scales and paths only: no axes, tooltips, keyboard, labels) | 11.9 KB |
+| visx 4.0.0 (scale, shape, axis) | 26.0 KB |
+| Recharts 3.10.1 | 119.7 KB |
+| ECharts 6.1.0 (tree-shaken, SVG renderer) | 195.4 KB |
+| Vega-Lite 6.5.0 (+ vega) | 264.9 KB |
+| **This implementation: all of the canvas** (every chart, panels, tooltips, keyboard, tables, tiles, timeline, both languages) | **22.1 KB JS + 3.0 KB CSS, lazy** |
+
+The d3 primitives would save a few hundred lines of pure, tested layout math (`lib/canvas/scales.ts`) and still leave the part that matters here undone: a focusable button per point, provenance in every tooltip, per-mark rounded ends and surface gaps, small multiples, label fitting for Devanagari, "calculated" everywhere, themeing from CSS tokens. A chart library would draw its own tooltips, legends and ARIA, which then have to be fought into the citation popover and the house marks; Recharts, ECharts and Vega-Lite also cost more than the rest of the app's page JS. So: plain React SVG, a small `lib/canvas/scales.ts` (ticks, bar and stack geometry, waterfall steps, line runs, donut arcs, label fitting, tooltip placement, keyboard cursor), nothing added to `package.json`, no CDN, no pinning question.
+
+**Bundle cost** (`next build`, gzipped, against `origin/main` at the same commit): the chart code is a separate chunk (20.7 KB JS, 3.0 KB CSS) that a page downloads **only when a canvas or an overview has a panel, or a visual is being prepared** (so the skeleton turns into the chart without a second wait); the contract reader loads with it (1.4 KB), the debug form only with `features.debug_panel` (0.9 KB). A chat or project with nothing to draw loads none of it (checked in the browser's resource list with the production build). Always loaded: +1.0 KB CSS (docking, shell, skeleton) and +3.9 KB JS on the chat page (+3.6 KB on the project page): the canvas state, the calls, the shell and the few words it needs.
+
+**Overview dashboard.** The project page shows `GET /api/projects/{id}/overview` once `ready` (read-only panels: no pin, move or remove; each with "View as table" and its sources), "Building the overview…" while `building` (re-read every 3 s, up to ten minutes), and nothing for `none`, while loading, or when the endpoint is missing. **No "Show in chat" action:** contract v1 has no way to put an existing visual on a chat's canvas (the operations are remove, pin, unpin and move; `POST …/visuals` is debug-only and takes a spec, not a visual), so the button could only pretend. Ask the question in a chat and the visual is built there.
+
+**Debug panel.** With `features.debug_panel` on, the chat header has "Debug: add a visual from a VisualSpec": paste JSON, `POST /api/chats/{id}/visuals`, and the visual joins the canvas like any other.
+
+**Contract ambiguities and what the frontend does.**
+
+- *Waterfall: which rows are totals?* Not in the contract. The first and last rows are the start and end bars, the rows between are increases and decreases; a row may say `kind: "total" | "delta"` (an optional extra, ignored when absent) for a bridge with a subtotal.
+- *Comparison: how are A and B given?* `x` is null and `tiles` are "kpi / comparison only". The sides are the visual's `series` (FY23 | FY24), the metrics its `rows`, and each metric's change is the tile with the same label (or the same position when there are as many tiles as rows); a comparison with no rows lists its tiles with their changes.
+- *Series with different units on one chart.* Each unit gets its own small chart (shared x, one crosshair on lines) instead of a second y-axis.
+- *Donut shares.* A percentage would be a computation, so slices show the part's own figure; a share shows only if the backend sent a `share` calculation whose label names the part.
+- *Percent scale.* `18.4` with a percent unit is 18.4%.
+- *`position` for `move`.* The panel moves to the `position` of the neighbour it swaps with (or of the panel it is dropped on); the answer replaces the whole canvas.
+- *`preparing` for an id already on the canvas.* The panel stays and says "Updating…" until its `ready`.
+- *A calculation without a unit.* growth, CAGR and share are percentages, a ratio is a ratio, anything else follows the visual.
+
 ## Checks
 
 ```bash
@@ -111,7 +159,8 @@ npm run build && npm run typecheck
 
 ```text
 app/          root layout (reads BACKEND_URL per request), routes, global styles (globals.css: tokens + primitives;
-              styles/: shell, overlays, pages, chat, voice, summary)
+              styles/: shell, overlays, pages, chat, voice, summary, canvas + canvas-panels (the second loads with the
+              chart code))
 components/   AppProviders, AppFrame (sidebar + drawer), Sidebar, views (Home, Project, Chat, Status), Transcript,
               Summary (panel tabs, the summary view), TitleText, Citations (chips, source list, popover),
               Documents (documents card), Uploads (upload queue), Actions (dialogs and entity actions), Dialog, Menu,
@@ -125,6 +174,12 @@ lib/          api.ts (typed backend calls, upload, streamed chat), sse.ts (Serve
               documents store, ingestion polling), health.tsx (GET /health polling), format.ts, route.ts (what the
               router decided, "Understood as"), use-chat-summary.ts + summary-model.ts + summary-request.ts (summaries),
               auto-title.ts + title-watch.ts (the automatic title and its timing), download.ts (export file names and saving)
+components/canvas/  CanvasPanel (the shell: skeletons, failure notes, lazy loading), CanvasBoard (the lazy chunk: panels), Panel,
+              ChartFrame (hit layer, keyboard, tooltip), charts/ (Line, Bar, Waterfall, Donut, Tiles, Timeline, DataTable),
+              ProjectOverview, CanvasDebug (+ CanvasDebugForm), panel-context (provenance and the citation popover)
+lib/canvas/   types.ts (contract v1 reader), state.ts (the reducer), events.ts, client.ts, use-canvas.ts, model.ts (series, units,
+              provenance), format.ts (numbers, units, dates), scales.ts (layout math), labels.ts + labels-panel.ts (English and
+              Hindi words: the few the shell needs, then the panels' own), order.ts
 lib/voice/    protocol.ts (messages, frame header, socket URL), session.ts (the live session), capture.ts (mic +
               AudioWorklet), playback.ts (gapless 24 kHz playback, duck, progress), vad.ts (Silero barge-in), captions.ts
               (word timing), analysis.ts + presence-renderer.ts (voice levels, the WebGL2 field), autostart.ts,
