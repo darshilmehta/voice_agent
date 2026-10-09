@@ -8,6 +8,11 @@ the subtitle (their numbers are cell values, calculation values or numbers print
 of "31 Mar 2024"). ``check_grounding`` verifies a finished Visual against exactly this and is run on every visual
 before it is stored; the tests run it over every spec the corpus datasets allow.
 
+**Language.** The summary is written in the visual's language only (``visual.language``). A data label of the other
+language is named in it (``overview.label_name``: the document's own name for it when it prints both, else the word
+list, with the printed label after it: "Sewing and garment making (सिलाई एवं परिधान निर्माण)") or, when it can't be,
+quoted as printed. Names add no numbers, so the grounding check holds.
+
 Sources: each dataset used becomes one ``Citation`` (the table's chunk). A dataset whose chunk is among the turn's
 sources keeps that source's id (the spoken answer's [S2] and the chart's cells point to the same S2); others get the
 next free ids.
@@ -38,6 +43,7 @@ from ...domain.projects import Citation
 from ..sources import snippet
 from . import calculator as calc
 from .calculator import CalculationError, Operand, format_value
+from .overview import in_language, label_name
 from .parsing import Quantity, localized_label, parse_period, parse_quantity
 from .spec import MAX_TITLE, Point, Resolved, ResolvedSeries, SpecError, document_name, same_unit
 
@@ -108,9 +114,12 @@ _TEXT = {
         "trend": "{series} went from {a} in {xa} to {b} in {xb} ({growth}).",
         "trend_flat": "{series}: {a} in {xa} and {b} in {xb}.",
         "more_series": " Also shown: {names}.",
+        "end": ".",
         "bars": "{series}: highest {top} ({top_v}), lowest {low} ({low_v}).",
-        "donut": "{top} is the largest part of {series}: {top_v} ({share}).",
-        "donut_no_share": "{top} is the largest part of {series}: {top_v}.",
+        "donut": "The largest share of {series} is {top}: {top_v} ({share}).",
+        "donut_no_share": "The largest share of {series} is {top}: {top_v}.",
+        "donut_anon": "The largest part is {top}: {top_v} ({share}).",
+        "donut_anon_no_share": "The largest part is {top}: {top_v}.",
         "kpi": "{items}.",
         "comparison": "{items}.",
         "table": "Figures from {title}.",
@@ -131,9 +140,12 @@ _TEXT = {
         "trend": "{series} {xa} में {a} से {xb} में {b} रहा ({growth})।",
         "trend_flat": "{series}: {xa} में {a} और {xb} में {b}।",
         "more_series": " साथ में: {names}।",
+        "end": "।",
         "bars": "{series}: सबसे अधिक {top} ({top_v}), सबसे कम {low} ({low_v})।",
         "donut": "{series} में सबसे बड़ा हिस्सा {top} का है: {top_v} ({share})।",
         "donut_no_share": "{series} में सबसे बड़ा हिस्सा {top} का है: {top_v}।",
+        "donut_anon": "सबसे बड़ा हिस्सा {top} का है: {top_v} ({share})।",
+        "donut_anon_no_share": "सबसे बड़ा हिस्सा {top} का है: {top_v}।",
         "kpi": "{items}।",
         "comparison": "{items}।",
         "table": "{title} के आँकड़े।",
@@ -153,12 +165,41 @@ _TEXT = {
 }
 
 
+_HI_PP = "प्रतिशत अंक"
+
+
 def _t(language: str, key: str, **kw: object) -> str:
     return _TEXT["hi" if language == "hi" else "en"][key].format(**kw)
 
 
+def _name(label: str, language: str, *, printed: bool = True, lead: bool = False) -> str:
+    """A data label as the summary's sentence mentions it, so the summary is written in the visual's language only
+    (``label_name``): a label in another language is named in this one when the document or the word list gives a name
+    ("Sewing and garment making (सिलाई एवं परिधान निर्माण)": the printed label follows, unless ``printed`` is off, for a
+    measure: "seats"), and otherwise quoted as printed. ``lead``: the name starts a sentence."""
+    n = label_name(label, language)
+    text = n.text
+    if lead and n.kind == "translated" and language != "hi":
+        text = text[:1].upper() + text[1:]
+    if not printed or not n.printed:
+        return text
+    return f"{text} [{n.printed}]" if "(" in n.printed else f"{text} ({n.printed})"  # (no parentheses in parentheses)
+
+
+def _unit_in(unit: Unit | None, language: str) -> Unit | None:
+    """The unit with its label in the visual's language when the label is a word of the other one ("सप्ताह" → "weeks"
+    in an English summary); a label that isn't on the word list stays as printed."""
+    if unit is None or unit.kind in ("currency", "percent", "ratio") or not unit.label:
+        return unit
+    label = in_language(unit.label, language)
+    return unit if label == unit.label else unit.model_copy(update={"label": label})
+
+
 def _show(value: float, unit: Unit | None, decimals: int, language: str) -> str:
-    return format_value(value, unit, decimals, language)
+    text = format_value(value, _unit_in(unit, language), decimals, language)
+    if language == "hi" and unit is not None and unit.kind == "percent" and unit.label == "pp":
+        return text.removesuffix("pp") + _HI_PP  # (percentage points: "1.2 pp" → "1.2 प्रतिशत अंक")
+    return text
 
 
 def _show_point(p: Point, language: str) -> str:
@@ -335,7 +376,7 @@ def build_visual(
             summary, shares = _donut(book, r, language)
             calculations += shares
         elif r.kind == "table":
-            summary = _t(language, "table", title=_source_titles(r, language))
+            summary = _t(language, "table", title=_source_titles(r, language, named=True))
         elif r.x_type in ("period", "date"):
             summary, implied = _trend_summary(book, r, language)
             calculations += implied
@@ -367,10 +408,11 @@ def build_visual(
         calculations += deltas
     elif r.kind == "timeline":
         events = _events(book, r)
-        summary = _t(language, "timeline", first=events[0].date, last=events[-1].date)
+        summary = _t(language, "timeline", first=_name(events[0].date, language), last=_name(events[-1].date, language))
 
     if calculations and r.kind not in ("kpi", "comparison", "donut", "waterfall") and r.calcs:
-        summary += " " + "; ".join(f"{c.label}: {_show_calc(c, language)}" for c in calculations[: len(r.calcs)]) + "."
+        listed = (f"{_calc_name(c, r, language)}: {_show_calc(c, language)}" for c in calculations[: len(r.calcs)])
+        summary += " " + "; ".join(listed) + _t(language, "end")
     calculations = _dedupe(calculations)
     # tiles, events and a comparison's metric rows have nothing to highlight on an x axis
     highlight = _highlight(r, language) if rows and r.kind != "comparison" else None
@@ -491,10 +533,22 @@ def _joint_title(r: Resolved) -> str:
     return f"{base}, {xs[0]}–{xs[-1]}" if len(xs) >= 2 else base
 
 
-def _source_titles(r: Resolved, language: str) -> str:
-    """The printed titles of the tables a visual draws on, once each."""
+def _source_titles(r: Resolved, language: str, *, named: bool = False) -> str:
+    """The printed titles of the tables a visual draws on, once each (``named``: as a summary in ``language`` says
+    them)."""
     joiner = " और " if language == "hi" else " and "
-    return joiner.join(dict.fromkeys(ds.title for ds in r.used_datasets))
+    titles = dict.fromkeys(ds.title for ds in r.used_datasets)
+    return joiner.join(_name(t, language) if named else t for t in titles)
+
+
+def _calc_name(c: Calculation, r: Resolved, language: str) -> str:
+    """A calculation's label for the summary: the label's frame is in the visual's language already; the data labels
+    inside it (series, periods, categories) are named as the rest of the summary names them."""
+    names = {i.label: _name(i.label, language) for i in r.x_items}
+    names.update({s.label: _name(s.label, language, printed=False) for s in r.series})
+    pattern = "|".join(re.escape(label) for label in sorted(names, key=len, reverse=True) if label)
+    text = re.sub(pattern, lambda m: names[m.group(0)], c.label) if pattern else c.label
+    return text[:1].upper() + text[1:] if language != "hi" else text
 
 
 def _num(token: str) -> str:
@@ -530,12 +584,14 @@ def _trend_summary(book: SourceBook, r: Resolved, language: str) -> tuple[str, l
     first, last = present[0], present[-1]
     a, b = _show_point(s.points[first], language), _show_point(s.points[last], language)
     found = _delta_calc(book, s, first, last, language)
-    others = [x.label for x in r.series[1:]]
+    others = [_name(x.label, language, printed=False) for x in r.series[1:]]
     tail = _t(language, "more_series", names=", ".join(others)) if others else ""
+    series = _name(s.label, language, printed=False, lead=True)
+    xa, xb = _name(first, language), _name(last, language)
     if found is None:
-        return _t(language, "trend_flat", series=s.label, a=a, xa=first, b=b, xb=last) + tail, []
+        return _t(language, "trend_flat", series=series, a=a, xa=xa, b=b, xb=xb) + tail, []
     c, _ = found
-    text = _t(language, "trend", series=s.label, a=a, xa=first, b=b, xb=last, growth=_show_calc(c, language))
+    text = _t(language, "trend", series=series, a=a, xa=xa, b=b, xb=xb, growth=_show_calc(c, language))
     return text + tail, [c]
 
 
@@ -546,17 +602,18 @@ def _bars_summary(r: Resolved, language: str) -> str:
         for x in r.x_items
         if x.label in s.points and s.points[x.label].value.value is not None
     ]
+    series = _name(s.label, language, printed=False, lead=True)
     if not pts:
-        return s.label
+        return series
     top = max(pts, key=lambda xp: xp[1].value.value)  # type: ignore[arg-type, return-value]
     low = min(pts, key=lambda xp: xp[1].value.value)  # type: ignore[arg-type, return-value]
     return _t(
         language,
         "bars",
-        series=s.label,
-        top=top[0],
+        series=series,
+        top=_name(top[0], language),
         top_v=_show_point(top[1], language),
-        low=low[0],
+        low=_name(low[0], language),
         low_v=_show_point(low[1], language),
     )
 
@@ -576,17 +633,18 @@ def _donut(book: SourceBook, r: Resolved, language: str) -> tuple[str, list[Calc
         except CalculationError:
             shares = []
     top_share = next((c for c, (x, _) in zip(shares, pts, strict=False) if x == top[0]), None)
-    if top_share is not None:
-        text = _t(
-            language,
-            "donut",
-            top=top[0],
-            series=s.label,
-            top_v=_show_point(top[1], language),
-            share=_show_calc(top_share, language),
-        )
-    else:
-        text = _t(language, "donut_no_share", top=top[0], series=s.label, top_v=_show_point(top[1], language))
+    # What it is a part of is named in the summary's language ("seats") or, when it can't be (a label of the other
+    # language that isn't on the word list), left to the title and the legend: "The largest part is “…”".
+    measure = label_name(s.label, language)
+    named = "donut" if measure.kind != "quoted" else "donut_anon"
+    text = _t(
+        language,
+        named if top_share is not None else f"{named}_no_share",
+        top=_name(top[0], language),
+        series=_name(s.label, language, printed=False),
+        top_v=_show_point(top[1], language),
+        share=_show_calc(top_share, language) if top_share is not None else "",
+    )
     return text, shares
 
 
@@ -653,9 +711,9 @@ def _waterfall(book: SourceBook, r: Resolved, language: str) -> tuple[list[Row],
     summary = _t(
         language,
         "waterfall",
-        start=pts[0][0],
+        start=_name(pts[0][0], language),
         start_v=_show_point(pts[0][1], language),  # type: ignore[arg-type]
-        end=pts[-1][0],
+        end=_name(pts[-1][0], language),
         end_v=_show_point(pts[-1][1], language),  # type: ignore[arg-type]
     )
     return rows, series, bridge, summary
@@ -663,6 +721,7 @@ def _waterfall(book: SourceBook, r: Resolved, language: str) -> tuple[list[Row],
 
 def _kpi_tiles(book: SourceBook, r: Resolved, language: str) -> tuple[list[Tile], list[Calculation], str]:
     tiles: list[Tile] = []
+    said: list[str] = []  # each tile's label as the summary says it (in the visual's language)
     deltas: list[Calculation] = []
     xs = [i.label for i in r.x_items]
     periodic = r.x_type in ("period", "date")
@@ -680,7 +739,13 @@ def _kpi_tiles(book: SourceBook, r: Resolved, language: str) -> tuple[list[Tile]
                     c, kind = found
                     delta = Delta(value=c.value, kind=kind, calculation=c)  # type: ignore[arg-type]
                     deltas.append(c)
-            label = f"{s.label} ({x})" if periodic or len(r.series) > 1 else x
+            labelled = periodic or len(r.series) > 1
+            label = f"{s.label} ({x})" if labelled else x
+            said.append(
+                f"{_name(s.label, language, printed=False, lead=True)} ({_name(x, language)})"
+                if labelled
+                else _name(x, language, lead=True)
+            )
             tiles.append(
                 Tile(
                     label=label,
@@ -697,8 +762,8 @@ def _kpi_tiles(book: SourceBook, r: Resolved, language: str) -> tuple[list[Tile]
     if not tiles:
         raise SpecError(["no numbers for the KPI tiles"])
     items = []
-    for t in tiles[:3]:
-        text = f"{t.label}: {_show(t.value, t.unit, _decimals(t.cell.text) if t.cell else 0, language)}"
+    for t, name in zip(tiles[:3], said, strict=False):
+        text = f"{name}: {_show(t.value, t.unit, _decimals(t.cell.text) if t.cell else 0, language)}"
         if t.delta is not None:
             text += f" ({_show_calc(t.delta.calculation, language)})"
         items.append(text)
@@ -754,10 +819,15 @@ def _comparison(
                     delta=delta,
                 )
             )
-            text = _t(language, "vs", a=f"{a} {_show_point(pa, language)}", b=f"{b} {_show_point(pb, language)}")
+            text = _t(
+                language,
+                "vs",
+                a=f"{_name(a, language)} {_show_point(pa, language)}",
+                b=f"{_name(b, language)} {_show_point(pb, language)}",
+            )
             if delta is not None:
                 text += f" ({_show_calc(delta.calculation, language)})"
-            items.append(f"{s.label}: {text}")
+            items.append(f"{_name(s.label, language, printed=False, lead=True)}: {text}")
         return rows, list(used.values()), tiles, deltas, _t(language, "comparison", items="; ".join(items))
 
     x = xs[0]
@@ -775,8 +845,10 @@ def _comparison(
         key = _series_key(label, used)
         used[key] = Series(key=key, label=label, unit=s.unit, better=better_direction(s.metric or s.label))
         values[key], cells[key] = p.value.value, cell_ref(book, p.dataset, p.value)
-        items.append(f"{label}: {_show_point(p, language)}")
+        items.append(f"{_name(label, language, lead=not items)}: {_show_point(p, language)}")
     row_x = f"{metric} ({x})"
+    said_metric = " / ".join(_name(m, language, printed=False, lead=i == 0) for i, m in enumerate(metric_names))
+    said_x = f"{said_metric} ({_name(x, language)})"
     rows.append(Row(x=row_x, values=values, cells=cells))
     (first, p0), (last, p1) = sides[0], sides[-1]
     delta = None
@@ -804,7 +876,7 @@ def _comparison(
             delta=delta,
         )  # type: ignore[arg-type]
     )
-    return rows, list(used.values()), tiles, deltas, _t(language, "comparison", items=f"{row_x}: " + "; ".join(items))
+    return rows, list(used.values()), tiles, deltas, _t(language, "comparison", items=f"{said_x}: " + "; ".join(items))
 
 
 _KEY = re.compile(r"[^a-z0-9]+")

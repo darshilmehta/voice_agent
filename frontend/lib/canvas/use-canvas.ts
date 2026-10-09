@@ -15,9 +15,21 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 import { errorMessage, isAbort } from "../api";
 import { useBackend } from "../backend-context";
 import { useToast } from "@/components/Toast";
-import { createCanvasApi, type Overview, type OverviewStatus } from "./client";
+import { createCanvasApi } from "./client";
 import { subscribeCanvasEvents } from "./events";
 import { shellLabelsFor } from "./labels";
+import {
+  START_CYCLE,
+  afterRead,
+  failedRead,
+  mergeRead,
+  nextDelay,
+  retryDelay,
+  signatureOf,
+  watchCount,
+  type CountWatch,
+  type Held,
+} from "./overview-refresh";
 import { INITIAL_CANVAS, canvasReducer, hasCanvasContent, nextSkeletonIn, visiblePending, type Pending } from "./state";
 import type { CanvasOp, Visual } from "./types";
 
@@ -151,44 +163,88 @@ export function useCanvas(chatId: string): CanvasController {
 
 export type OverviewState =
   | { status: "loading" | "none"; panels: [] }
-  | { status: "building"; panels: [] }
+  /** Being (re)built: the panels last shown stay (none yet: the page shows a skeleton). */
+  | { status: "building"; panels: Visual[] }
   | { status: "ready"; panels: Visual[] };
 
-const POLL_MS = 3000;
-const POLL_LIMIT_MS = 10 * 60_000;
-
-/** `GET /api/projects/{id}/overview`: re-read every few seconds while the backend says it is still `building`. */
-export function useOverview(projectId: string): OverviewState {
+/**
+ * `GET /api/projects/{id}/overview`, kept up to date while the page stays open (the rules are in
+ * lib/canvas/overview-refresh.ts): read again, with a growing pause, while the backend says `building`; read again
+ * when `readyDocuments` (the project's count of READY documents) changes, and once more to confirm it; stop when it
+ * is `ready` and says the same twice. The panels last shown stay while it is rebuilt, and a read that brings nothing
+ * new changes nothing, so nothing flickers.
+ */
+export function useOverview(projectId: string, readyDocuments: number | null = null): OverviewState {
   const { backendUrl } = useBackend();
   const client = useMemo(() => createCanvasApi(backendUrl), [backendUrl]);
-  const [overview, setOverview] = useState<{ projectId: string; value: Overview | null }>({ projectId, value: null });
+  const [held, setHeld] = useState<Held<Visual> | null>(null);
+  const heldRef = useRef(held);
+  useEffect(() => {
+    heldRef.current = held;
+  }, [held]);
+
+  // Each change of the count of READY documents starts a new run of reads (derived while rendering, as React allows).
+  const [watch, setWatch] = useState<CountWatch>({ projectId, count: readyDocuments, generation: 0 });
+  const seen = watchCount(watch, projectId, readyDocuments);
+  if (seen !== watch) setWatch(seen);
+  const generation = seen.generation;
 
   useEffect(() => {
     const ctrl = new AbortController();
-    let timer = 0;
+    const afterChange = generation > 0;
     const startedAt = Date.now();
+    let timer = 0;
+    let cycle = START_CYCLE;
+    let failures = 0;
+    let parked = false; // a read is due, but the tab is hidden: it waits for the tab to come back
+
+    const schedule = (ms: number) => {
+      timer = window.setTimeout(due, ms);
+    };
+    const due = () => {
+      if (document.visibilityState === "hidden") parked = true;
+      else void read();
+    };
+    const onVisible = () => {
+      if (parked && document.visibilityState === "visible") {
+        parked = false;
+        void read();
+      }
+    };
     const read = async () => {
       try {
         const value = await client.getOverview(projectId, ctrl.signal);
         if (ctrl.signal.aborted) return;
-        setOverview({ projectId, value });
-        if (value.status === "building" && Date.now() - startedAt < POLL_LIMIT_MS) timer = window.setTimeout(() => void read(), POLL_MS);
+        failures = 0;
+        setHeld((prev) => mergeRead(prev, projectId, value));
+        cycle = afterRead(cycle, signatureOf(value.status, value.panels), value.status);
+        const delay = nextDelay(cycle, value.status, afterChange, Date.now() - startedAt);
+        if (delay !== null) schedule(delay);
       } catch (err) {
         if (isAbort(err) || ctrl.signal.aborted) return;
-        // No overview endpoint, or the backend is down: nothing to show.
-        setOverview({ projectId, value: { status: "none", panels: [] } });
+        const kept = heldRef.current;
+        if (!kept || kept.projectId !== projectId) {
+          // No overview endpoint, or the backend is down: nothing to show.
+          setHeld((prev) => failedRead(prev, projectId));
+          return;
+        }
+        failures += 1; // (what the page shows stays; a few more tries)
+        const delay = retryDelay(failures, Date.now() - startedAt);
+        if (delay !== null) schedule(delay);
       }
     };
+
+    document.addEventListener("visibilitychange", onVisible);
     void read();
     return () => {
       ctrl.abort();
       window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [client, projectId]);
+  }, [client, projectId, generation]);
 
-  const value = overview.projectId === projectId ? overview.value : null;
+  const value = held && held.projectId === projectId ? held : null;
   if (!value) return { status: "loading", panels: [] };
-  const status: OverviewStatus = value.status;
-  if (status === "ready") return { status, panels: value.panels };
-  return { status, panels: [] };
+  if (value.status === "none") return { status: "none", panels: [] };
+  return { status: value.status, panels: value.panels };
 }
