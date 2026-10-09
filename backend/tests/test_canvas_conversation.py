@@ -93,6 +93,10 @@ def test_an_answer_with_three_figures_suggests_a_visual():
         ("pie chart ko table mein badlo", CanvasEdit("kind", kind="table", target_kind="donut")),
         ("इसे बार चार्ट में दिखाओ", CanvasEdit("kind", kind="bar")),
         ("इसे टेबल में दिखाओ", CanvasEdit("kind", kind="table")),
+        ("isko table mein dikhao", CanvasEdit("kind", kind="table")),
+        ("isko table mein dikhao na", CanvasEdit("kind", kind="table")),  # spoken fillers don't make a new question
+        ("इसको टेबल में दिखाओ ना", CanvasEdit("kind", kind="table")),
+        ("zara isko bar chart mein dikha do yaar", CanvasEdit("kind", kind="bar")),
         # remove, pin, unpin, clear
         ("remove the pie", CanvasEdit("remove", target_kind="donut")),
         ("delete that chart", CanvasEdit("remove")),

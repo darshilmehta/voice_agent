@@ -378,6 +378,7 @@ _EDIT_WORDS = wordset(
     दिखाओ दिखाइए दिखाएं दिखाएँ दिखा दो दीजिए बनाओ बनाइए बना बदलो बदल करो कर कीजिए करें चाहिए चार्ट ग्राफ़ ग्राफ
     add include compare next alongside beside too also well with against bhi saath jodo jod daalo sirf keval
     भी साथ जोड़ो जोड़ जोड़ें डालो सिर्फ़ सिर्फ केवल
+    na toh yaar bhai plz pls jara thora jaldi ना तो यार भाई जरा थोड़ा जल्दी
     """
 )
 # Question words: a question is never an edit ("what caused that drop", spoken without a question mark).

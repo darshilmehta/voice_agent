@@ -51,6 +51,7 @@ from .conversation import (
 )
 from .datasets import TYPER_VERSION, table_contexts, type_document
 from .draft import Draft, draft_visual, filename_labels, same_choice, turn_context
+from .edits import change_kind, edit_language, merge_planned
 from .overview import overview_specs
 from .planner import NO_VISUAL, PlanResult, VisualPlanner, builds, first_valid, visual_intent
 from .spec import SpecError, VisualSpec, resolve, split_ref
@@ -562,8 +563,10 @@ class CanvasService:
         """An edit said in the conversation (``conversation.parse_edit``), applied to the visual it means
         (``resolve_target``). Yields the canvas events (a rebuilt visual: ``visual{ready}`` with its id kept, a model
         rebuild ``visual{preparing}`` first; then the ``canvas`` snapshot) and, last, the ``EditResult``. Rebuilds go
-        through the spec, the validator and the builder: every number is still a cell. Never raises for an edit that
-        can't be done (the result says why)."""
+        through the spec, the validator and the builder: every number is still a cell, and (``edits.change_kind``,
+        ``edits.merge_planned``) everything that was on screen. A rebuilt visual keeps the chat's response language
+        (``edits.edit_language``), not ``language``, the turn's, which follows the edit utterance: a Hindi edit said in
+        an English chat gets the fixed reply in Hindi but the visual's labels and units stay English."""
         panels = await self.store.panels(chat_id)
         if not panels:
             yield EditResult("nothing", edit.op)
@@ -585,13 +588,16 @@ class CanvasService:
         except (NotFound, ValueError):
             yield EditResult("failed", edit.op, target.id, detail="the visual's spec can't be read")
             return
+        # The visual is drawn in the chat's language, not the edit utterance's (a Hindi edit in an English chat).
+        visual_language = edit_language(utterance, await self.store.response_language(chat_id), target.language)
+        spec = spec.model_copy(update={"language": visual_language})  # type: ignore[arg-type]
         changed: VisualSpec | None = None
         outcome: EditOutcome = "done"
         if edit.op == "kind" and edit.kind is not None:
             if edit.kind == target.kind:
                 yield EditResult("same", edit.op, target.id)
                 return
-            changed = first_valid(spec.model_copy(update={"kind": edit.kind}), datasets, builds(datasets, filenames))
+            changed = change_kind(spec, edit.kind, datasets, builds(datasets, filenames))
             outcome = "done" if changed is not None else "cannot"
         elif edit.op in ("periods", "only"):
             available = _periods_of(spec, datasets)
@@ -611,7 +617,7 @@ class CanvasService:
                 outcome = "done" if changed is not None else "cannot"
         if changed is None and outcome == "done":  # the rules can't say: the planner, with the visual as context
             async for event in self._edit_with_model(
-                chat_id, target, edit, utterance=utterance, language=language, query_en=query_en
+                chat_id, target, spec, edit, utterance=utterance, language=visual_language, query_en=query_en
             ):
                 yield event
             return
@@ -638,6 +644,7 @@ class CanvasService:
         self,
         chat_id: str,
         target: Visual,
+        spec: VisualSpec,
         edit: CanvasEdit,
         *,
         utterance: str,
@@ -645,14 +652,15 @@ class CanvasService:
         query_en: str | None,
     ) -> AsyncIterator[VisualEvent | CanvasEvent | EditResult]:
         """An edit the rules can't read ("add profit to that chart", FY23 from another table): the planner chooses
-        again for the request, told what is on screen, with the visual's tables first among the candidates."""
+        again for the request, told what is on screen (``spec``), with the visual's tables first among the candidates.
+        What it chooses is merged with what was on screen (``edits.merge_planned``) and drawn in ``language``, the
+        visual's, not the utterance's."""
         if self.planner is None:
             yield EditResult("failed", edit.op, target.id, source="model", detail="no planner")
             return
         yield VisualEvent(phase="preparing", visual_id=target.id)  # "Updating…" on the panel
         try:
             project_id, datasets, filenames, _ = await self._chat_datasets(chat_id)
-            spec = VisualSpec.model_validate(await self.store.panel_spec(chat_id, target.id))
             chunks = [d.chunk_id for d in (datasets.get(i) for i in spec.datasets) if d is not None and d.chunk_id]
             question = f"Change the chart on screen ({describe(target)}): {utterance}"
             english = f"Change the chart on screen ({describe(target)}): {query_en}" if query_en else None
@@ -665,10 +673,13 @@ class CanvasService:
                 source_chunks=chunks,
                 force=True,
             )
+            if changed is not None:
+                changed = merge_planned(spec, changed, utterance, datasets, builds(datasets, filenames))
             if changed is None:
                 yield VisualEvent(phase="failed", visual_id=target.id, detail="no table fits that change")
                 yield EditResult("failed", edit.op, target.id, source="model", detail="no table fits that change")
                 return
+            changed = changed.model_copy(update={"language": language})  # type: ignore[arg-type]
             visual = self._build(
                 changed,
                 datasets,

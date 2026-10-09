@@ -24,6 +24,7 @@ from ..base import InvalidInput, NotFound, Service, get_or_404
 
 # Document statuses (as in ``services.documents``, which imports this module for its cascade)
 PENDING, PROCESSING, READY = "PENDING", "PROCESSING", "READY"
+LANGUAGES = ("en", "hi")
 
 
 def _visual(row: orm.CanvasVisual) -> Visual:
@@ -211,6 +212,29 @@ class CanvasStore(Service):
         async with self.db.session() as s:
             chat = await get_or_404(s, orm.Chat, chat_id, "chat")
             return chat.project_id, chat.document_scope, chat.language
+
+    async def response_language(self, chat_id: str) -> str | None:
+        """The language the chat answers in, as far as a visual should follow it: the one the user asked for ("answer
+        in Hindi", which sticks), else that of the latest answer that wasn't a canvas edit's fixed reply ("हो गया।" is
+        in the language of the edit that was said, which says nothing about the chat), else the chat's own language.
+        None: the chat has no answer yet and no language."""
+        async with self.db.session() as s:
+            chat = await get_or_404(s, orm.Chat, chat_id, "chat")
+            state = await s.get(orm.ChatState, chat_id)
+            if state is not None and state.preferred_language in LANGUAGES:
+                return state.preferred_language
+            stmt = (
+                select(orm.Message.language, orm.Message.route)
+                .where(orm.Message.chat_id == chat_id, orm.Message.role == "agent")
+                .order_by(orm.Message.seq.desc())
+                .limit(20)
+            )
+            for language, route in (await s.execute(stmt)).all():
+                if route and route.get("canvas_edit"):
+                    continue
+                if language in LANGUAGES:
+                    return language
+            return chat.language if chat.language in LANGUAGES else None
 
     async def panels(self, chat_id: str) -> list[Visual]:
         async with self.db.session() as s:
