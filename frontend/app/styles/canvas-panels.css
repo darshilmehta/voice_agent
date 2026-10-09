@@ -1,0 +1,1034 @@
+/*
+ * The live visual canvas, part 2 of 2: panels, charts (SVG marks, the hit layer, tooltips), key figures, comparison,
+ * timeline, donut and tables. Loaded together with the chart code, only when a canvas or an overview has panels.
+ * Chart text wears the text tokens, never a series colour. Marks are thin, grids are solid hairlines, nothing is dashed.
+ */
+
+/* ------------------------------------------------------------------ panel */
+
+.cv-panel[data-pinned] {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.cv-panel[data-busy] {
+  opacity: 0.7;
+}
+
+.cv-panel[data-dragging] {
+  opacity: 0.45;
+}
+
+.cv-panel[data-drop] {
+  outline: 2px dashed var(--accent);
+  outline-offset: 2px;
+}
+
+.cv-panel[lang="hi"] {
+  line-height: 1.65;
+}
+
+.cv-overview .cv-panel {
+  --viz-surface: var(--bg);
+  box-shadow: none;
+}
+
+.cv-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 6px 12px;
+  margin-bottom: 8px;
+}
+
+.cv-head-text {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+.cv-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.cv-panel[lang="hi"] .cv-title {
+  line-height: 1.5;
+}
+
+.cv-pinned {
+  display: inline-flex;
+  color: var(--accent-text);
+}
+
+.cv-subtitle {
+  margin: 2px 0 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.cv-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.cv-view {
+  height: 28px;
+  margin-right: 4px;
+  padding: 0 10px;
+  font-size: 12.5px;
+}
+
+.cv-actions .icon-btn[aria-disabled="true"] {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.cv-actions .icon-btn[aria-pressed="true"] {
+  color: var(--accent-text);
+}
+
+.cv-grip {
+  cursor: grab;
+}
+
+.cv-summary {
+  margin: 0 0 10px;
+  color: var(--viz-ink-2);
+  font-size: 13px;
+}
+
+.cv-note,
+.cv-empty,
+.cv-updating {
+  margin: 0 0 8px;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.cv-empty {
+  padding: 18px 0;
+  text-align: center;
+}
+
+.cv-body {
+  min-width: 0;
+}
+
+.cv-highlight {
+  display: flex;
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--viz-band);
+  font-size: 12.5px;
+}
+
+.cv-flag-key {
+  flex: none;
+  color: var(--viz-ink-2);
+}
+
+.cv-fold {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+/* ------------------------------------------------------------------ calculated numbers and their sources */
+
+.cv-calc {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 17px;
+  padding: 0 6px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.cv-calcs {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.cv-calcs summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-weight: 550;
+  cursor: pointer;
+}
+
+.cv-calc-list {
+  display: grid;
+  gap: 10px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cv-calc-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin: 0;
+}
+
+.cv-calc-label {
+  color: var(--text-muted);
+}
+
+.cv-calc-value {
+  font-variant-numeric: tabular-nums;
+}
+
+.cv-calc-formula {
+  margin: 3px 0 0;
+  color: var(--text-muted);
+}
+
+.cv-calc-formula code,
+.cv-formula {
+  font: 11.5px/1.45 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.cv-inputs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cv-input {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 1px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.cv-input-page {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* A figure that came from a cell: dotted underline says "this opens its source". */
+button.cv-cell {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: inherit;
+  text-decoration: underline dotted var(--border-strong) 1px;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+button.cv-cell:hover {
+  color: var(--accent-text);
+  text-decoration-color: currentColor;
+}
+
+button.cv-input {
+  padding: 1px 9px;
+  border: 1px solid var(--border);
+  text-decoration: none;
+}
+
+.cv-tile-value button.cv-cell,
+.cv-compare-val button.cv-cell {
+  text-decoration: none;
+}
+
+.cv-sources {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.cv-sources-label {
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.cv-sources .cites {
+  margin: 0;
+}
+
+/* ------------------------------------------------------------------ chart plumbing */
+
+.cv-box {
+  width: 100%;
+  min-width: 0;
+}
+
+.cv-box-next {
+  margin-top: 12px;
+}
+
+.cv-plot {
+  position: relative;
+  max-width: 100%;
+}
+
+.cv-svg {
+  position: absolute;
+  inset: 0;
+  display: block;
+  overflow: visible;
+}
+
+.cv-hits {
+  position: absolute;
+  inset: 0;
+}
+
+.cv-hit {
+  position: absolute;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.cv-hit[data-round] {
+  border-radius: 50%;
+}
+
+/* The focus ring is drawn on the mark itself (ChartFrame), so the hit area stays invisible. */
+.cv-hit:focus,
+.cv-hit:focus-visible {
+  outline: none;
+}
+
+.cv-focus {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  pointer-events: none;
+}
+
+/* Text inside charts: text tokens only. */
+.cv-tick {
+  fill: var(--text-muted);
+  font: 12px var(--font);
+}
+
+.cv-tick-strong {
+  fill: var(--viz-ink);
+  font-weight: 650;
+}
+
+.cv-caption {
+  font-weight: 550;
+}
+
+.cv-value {
+  fill: var(--viz-ink);
+  font: 600 12px var(--font);
+  paint-order: stroke;
+  stroke: var(--viz-surface);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+.cv-inside {
+  fill: #0b0b0b;
+  font: 600 11.5px var(--font);
+}
+
+.cv-inside[data-slot="6"],
+.cv-inside[data-slot="7"] {
+  fill: #fff;
+}
+
+.cv-center {
+  fill: var(--viz-ink);
+  font: 650 13px var(--font);
+}
+
+.cv-center-sub {
+  fill: var(--text-muted);
+  font: 12px var(--font);
+}
+
+/* Grid and axes: hairline, solid, recessive. */
+.cv-gl {
+  stroke: var(--viz-grid);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+.cv-axis,
+.cv-zero {
+  stroke: var(--viz-axis);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+.cv-crosshair,
+.cv-connector {
+  stroke: var(--viz-axis);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+  pointer-events: none;
+}
+
+/* Marks. */
+.cv-line {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.cv-area {
+  opacity: 0.1;
+  stroke: none;
+}
+
+.cv-dot {
+  stroke: var(--viz-surface);
+  stroke-width: 4;
+  paint-order: stroke;
+  transition: r 0.1s;
+}
+
+.cv-null {
+  fill: none;
+  stroke: var(--text-muted);
+  stroke-width: 1.5;
+}
+
+.cv-bar {
+  transition: filter 0.12s;
+}
+
+.cv-bar[data-active] {
+  filter: brightness(1.12);
+}
+
+.cv-slice {
+  cursor: pointer;
+  stroke: none;
+}
+
+.cv-band {
+  fill: var(--viz-band);
+  pointer-events: none;
+}
+
+.cv-flag {
+  fill: var(--viz-ink-2);
+  pointer-events: none;
+}
+
+/* Legend and keys. */
+.cv-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 0 0 6px;
+  padding: 0;
+  list-style: none;
+  color: var(--viz-ink-2);
+  font-size: 12.5px;
+}
+
+.cv-legend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cv-legend li[data-strong] .cv-legend-label {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.cv-key {
+  display: inline-block;
+  flex: none;
+}
+
+.cv-key[data-shape="line"] {
+  width: 14px;
+  height: 2px;
+  border-radius: 1px;
+}
+
+.cv-key[data-shape="bar"] {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+.cv-key[data-shape="dot"] {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+/* ------------------------------------------------------------------ tooltip */
+
+.cv-tip {
+  position: absolute;
+  z-index: 6;
+  max-width: min(300px, 94%);
+  padding: 9px 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+  font-size: 12.5px;
+  line-height: 1.4;
+  pointer-events: none;
+}
+
+.cv-tip-x {
+  margin: 0 0 5px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 550;
+}
+
+.cv-tip-rows {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cv-tip-rows li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 7px;
+  padding: 1px 5px;
+  margin: 0 -5px;
+  border-radius: 5px;
+}
+
+.cv-tip-rows li[data-active]:not(:only-child) {
+  background: var(--accent-soft);
+}
+
+.cv-tip-val {
+  color: var(--text);
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.cv-tip-name {
+  color: var(--text-muted);
+}
+
+.cv-tip-formula {
+  display: flex;
+  gap: 5px;
+  margin: 6px 0 0;
+  color: var(--viz-ink-2);
+  font: 11.5px/1.4 var(--mono);
+}
+
+.cv-tip-src {
+  margin: 7px 0 0;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.cv-tip-file {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.cv-tip-hint {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* ------------------------------------------------------------------ key figures and comparison */
+
+.cv-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cv-tile {
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--viz-surface);
+}
+
+.cv-tile[data-highlight],
+.cv-compare-row[data-highlight] {
+  border-color: var(--viz-1);
+  box-shadow: inset 3px 0 0 var(--viz-1);
+}
+
+.cv-tile-label {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.cv-tile-value {
+  margin: 4px 0 0;
+  font-size: 28px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
+.cv-pre {
+  margin-right: 1px;
+}
+
+.cv-suf {
+  margin-left: 6px;
+  color: var(--viz-ink-2);
+  font-size: 0.46em;
+  font-weight: 550;
+  letter-spacing: 0;
+}
+
+.cv-suf[data-tight] {
+  margin-left: 1px;
+  font-size: 0.7em;
+}
+
+.cv-nodata {
+  color: var(--text-muted);
+}
+
+.cv-delta {
+  margin-top: 8px;
+  font-size: 12.5px;
+}
+
+.cv-delta-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 6px;
+  margin: 0;
+  font-weight: 600;
+}
+
+.cv-arrow {
+  color: var(--viz-ink-2);
+  font-size: 9px;
+}
+
+.cv-delta-val {
+  font-variant-numeric: tabular-nums;
+}
+
+.cv-delta-label {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.cv-delta-calc {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 4px 6px;
+  margin: 4px 0 0;
+  color: var(--text-muted);
+}
+
+.cv-compare-head {
+  display: grid;
+  grid-template-columns: minmax(110px, 1.1fr) repeat(var(--sides, 2), minmax(0, 1fr)) minmax(130px, 1.5fr);
+  gap: 0 12px;
+  padding: 0 12px 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.cv-compare-body,
+.cv-compare-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cv-compare-row {
+  display: grid;
+  grid-template-columns: minmax(110px, 1.1fr) repeat(var(--sides, 2), minmax(0, 1fr)) minmax(130px, 1.5fr);
+  align-items: start;
+  gap: 4px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--viz-surface);
+}
+
+.cv-compare-list .cv-compare-row {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.cv-compare-cells {
+  display: contents;
+}
+
+.cv-compare-list .cv-compare-cells {
+  display: block;
+}
+
+.cv-compare-metric {
+  margin: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.cv-compare-val {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.cv-compare-val .cv-suf {
+  font-size: 0.55em;
+}
+
+.cv-side-inline {
+  display: none;
+}
+
+.cv-compare .cv-delta {
+  margin-top: 0;
+}
+
+/* ------------------------------------------------------------------ timeline */
+
+.cv-timeline {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cv-event {
+  display: grid;
+  grid-template-columns: 108px 16px minmax(0, 1fr);
+  gap: 0 12px;
+  padding-bottom: 14px;
+}
+
+.cv-event-date {
+  padding-top: 1px;
+  color: var(--viz-ink-2);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.cv-rail {
+  position: relative;
+  display: flex;
+  justify-content: center;
+}
+
+.cv-rail::before {
+  content: "";
+  position: absolute;
+  top: 8px;
+  bottom: -14px;
+  width: 2px;
+  background: var(--viz-axis);
+}
+
+.cv-event:last-child .cv-rail::before {
+  display: none;
+}
+
+.cv-pt {
+  position: relative;
+  width: 10px;
+  height: 10px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: var(--viz-1);
+  box-shadow: 0 0 0 3px var(--viz-surface);
+}
+
+.cv-event[data-highlight] .cv-pt {
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+}
+
+.cv-event-label {
+  margin: 0;
+  font-weight: 600;
+}
+
+.cv-event[data-highlight] .cv-event-label {
+  font-weight: 700;
+}
+
+.cv-event-detail {
+  margin: 2px 0 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+button.cv-event-src {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+/* ------------------------------------------------------------------ donut */
+
+.cv-donut {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.cv-donut[data-side] {
+  flex-direction: row;
+  justify-content: center;
+  gap: 28px;
+}
+
+.cv-donut-legend {
+  display: grid;
+  flex: 1 1 220px;
+  gap: 7px;
+  max-width: 380px;
+  min-width: 0;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 13px;
+}
+
+.cv-donut-legend li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+}
+
+.cv-donut-legend li[data-strong] .cv-donut-name {
+  font-weight: 700;
+}
+
+.cv-donut-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.cv-donut-val {
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.cv-donut-share {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------------------ tables */
+
+.cv-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.cv-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.cv-table th,
+.cv-table td {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: baseline;
+}
+
+.cv-table thead th {
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  vertical-align: bottom;
+}
+
+.cv-table tbody tr:last-child th,
+.cv-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.cv-table tbody th {
+  font-weight: 550;
+}
+
+.cv-table th:first-child {
+  position: sticky;
+  left: 0;
+  background: var(--viz-surface);
+}
+
+.cv-table thead th:first-child {
+  background: var(--surface-muted);
+}
+
+.cv-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.cv-table tr[data-highlight] th,
+.cv-table tr[data-highlight] td {
+  background: var(--viz-band);
+  font-weight: 650;
+}
+
+.cv-table td[data-strong] {
+  font-weight: 650;
+}
+
+.cv-th-name,
+.cv-th-unit {
+  display: block;
+}
+
+.cv-th-unit {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.cv-table .cv-calc {
+  margin-top: 3px;
+}
+
+.cv-detail {
+  display: block;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+@container (max-width: 520px) {
+  .cv-compare-head {
+    display: none;
+  }
+
+  .cv-compare-row {
+    grid-template-columns: repeat(var(--sides, 2), minmax(0, 1fr));
+  }
+
+  .cv-compare-metric,
+  .cv-compare-row .cv-delta,
+  .cv-delta-none {
+    grid-column: 1 / -1;
+  }
+
+  .cv-side-inline {
+    display: block;
+    color: var(--text-muted);
+    font-size: 11.5px;
+    font-weight: 500;
+    letter-spacing: 0;
+  }
+
+  .cv-event {
+    grid-template-columns: 84px 14px minmax(0, 1fr);
+    gap: 0 8px;
+  }
+
+  .cv-tile-value {
+    font-size: 24px;
+  }
+}
+
+
+@media (prefers-color-scheme: dark) {
+  /* A label inside the dark theme's lighter violet needs dark ink to clear contrast. */
+  .cv-inside[data-slot="7"] {
+    fill: #0b0b0b;
+  }
+}
+
+@media (forced-colors: active) {
+  .cv-bar,
+  .cv-dot,
+  .cv-line,
+  .cv-slice,
+  .cv-key {
+    forced-color-adjust: none;
+  }
+
+  .cv-focus {
+    stroke: Highlight;
+  }
+}

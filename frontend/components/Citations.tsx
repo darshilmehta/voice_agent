@@ -376,7 +376,8 @@ function SnippetView({ snippet }: { snippet: string }) {
   );
 }
 
-function usePopover(): PopoverApi {
+/** The shared popover, for marks that are not chips (the canvas opens it from its data points). */
+export function usePopover(): PopoverApi {
   const ctx = useContext(PopoverContext);
   if (!ctx) throw new Error("citation chips must be inside <CitationPopoverProvider>");
   return ctx;
