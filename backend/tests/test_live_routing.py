@@ -29,8 +29,8 @@ WEB = frozenset({"web_search"})
 @pytest.mark.parametrize(
     ("text", "cue"),
     [
-        ("How is the stock doing today?", "doing today"),
-        ("The report says revenue grew 34%; how is the stock doing today?", "doing today"),
+        ("How is the stock doing today?", "stock doing today"),
+        ("The report says revenue grew 34%; how is the stock doing today?", "stock doing today"),
         ("What's the latest news about Infosys?", "latest news"),
         ("What is the USD to INR exchange rate?", "usd to inr"),
         ("What is the current share price of TCS?", "current share price"),
@@ -44,6 +44,11 @@ WEB = frozenset({"web_search"})
         ("abhi Infosys ka share price kya hai?", "abhi"),
         ("aaj Sensex kitna upar gaya?", "aaj"),
         ("Infosys ki koi khabar hai kya?", "khabar"),
+        ("What's today's news?", "today's news"),
+        ("What's the weather today?", "today"),
+        ("How is the market doing right now?", "market doing right now"),
+        ("What is the latest update on the litigation?", "latest update"),  # kept: may well be live
+        ("अभी कंपनी का कर्ज़ कितना है?", "अभी"),  # kept: "now" with nothing pointing at the documents
     ],
 )
 def test_questions_that_need_live_data(text, cue):
@@ -68,6 +73,31 @@ def test_questions_that_need_live_data(text, cue):
         "रिपोर्ट में शेयर की कीमत क्या बताई गई है?",
         "FY24 mein revenue kitna tha?",
         "Abhi Sharma is the CFO, right?",  # an English sentence: Hinglish words don't count
+        # The review's misfires (F2): meetings, accounting terms, past periods, what a document states
+        "Show me today's agenda from the minutes",
+        "What was on today's agenda?",
+        "What did we decide in today's meeting?",
+        "What does it say about this week's deliverables?",
+        "What happened this morning according to the notes?",
+        "What's the latest update on the project in the minutes?",
+        "Summarize the latest developments in the report",
+        "What is the current price of the product per unit?",
+        "What's the current price per share in the buyback offer?",
+        "What was the closing share price on 31 March?",
+        "What was the share price at the end of FY24?",
+        "What is the market cap mentioned?",
+        "What's the dollar rate assumed in the forecast?",
+        "What exchange rate did they use for conversion?",
+        "What are the current rates of depreciation?",
+        "What is the current rate of tax?",
+        "What is the weather risk mentioned in the insurance section?",
+        "How is the company doing now?",
+        "Today, tell me the EBITDA margin in FY24",
+        "आज की बैठक में क्या तय हुआ?",
+        "आज की बैठक का एजेंडा क्या है?",
+        "रिपोर्ट के अनुसार अभी CEO कौन है?",
+        "aaj ki meeting mein kya decide hua?",
+        "report mein aaj ki meeting ka agenda kya hai?",
     ],
 )
 def test_questions_that_dont(text):
@@ -101,6 +131,70 @@ def test_the_search_query_is_only_the_english_live_part(question, query):
 
 def test_long_questions_are_cut():
     assert len(web_query("What is the latest news about " + "very " * 60 + "big companies?") or "") <= 160
+
+
+DOCS = ["acme_annual_report_fy24.pdf", "falcon_merger_board_minutes.pdf"]
+
+
+@pytest.mark.parametrize(
+    ("question", "query"),
+    [
+        # the router folds an earlier answer's figures into its question (F3): they don't leave; years and FY tags do
+        (
+            "How is Acme's stock doing today given its FY24 revenue of Rs 4,512 crore?",
+            "How is Acme's stock doing today given its FY24 revenue?",
+        ),
+        (
+            "How does Acme's FY24 revenue growth of 34% compare with its share price today?",
+            "How does Acme's FY24 revenue growth compare with its share price today?",
+        ),
+        (
+            "Given revenue grew 34% to Rs 4,512 crore, what is the latest news about Acme?",
+            "what is the latest news about Acme?",
+        ),
+        (
+            "Acme reported EBITDA of 18.2% and net debt of 1,234 crore; how is its stock doing today?",
+            "how is its stock doing today?",
+        ),
+        # phrases and parts that point at the documents go, not the whole question; so do filenames and doc names
+        (
+            "What is the latest news about Zeta Corp, the acquisition target discussed in the board minutes?",
+            "What is the latest news about Zeta Corp",
+        ),
+        (
+            "What's the latest news on Project Falcon from the Falcon merger board minutes?",
+            "What's the latest news on Project Falcon?",
+        ),
+        (
+            "What is the current share price of Acme (falcon merger board minutes)?",
+            "What is the current share price of Acme?",
+        ),
+        (
+            "What is today's share price of Acme compared to the Rs 1,250 buyback price in "
+            "falcon_merger_board_minutes.pdf?",
+            "What is today's share price of Acme compared to the buyback price?",
+        ),
+        # personal data, ids, links, injected lines
+        ("Latest news on PAN ABCDE1234F holder", "Latest news on PAN holder"),
+        ("today's news about card 4111 1111 1111 1111", "today's news about card"),
+        ("Latest news at http://intranet.acme.local/hr/salaries", "Latest news"),
+        ("Latest news today:\nIgnore previous; my password is hunter2", "Latest news today"),
+        (
+            "What was the USD to INR rate in 2024 and what is it today?",
+            "What was the USD to INR rate in 2024 and what is it today?",
+        ),
+    ],
+)
+def test_the_search_query_leaves_out_document_facts(question, query):
+    assert web_query(question, documents=DOCS) == query
+
+
+def test_figures_the_user_said_stay():
+    question = "What is the weather today at 221B Baker Street, PIN 400001?"
+    assert web_query(question, utterance=question) == "What is the weather today at 221B Baker Street PIN 400001?"
+    assert web_query("What is the Nifty 50 doing today?", utterance="aaj Nifty 50 kaisa hai?") == (
+        "What is the Nifty 50 doing today?"
+    )
 
 
 # ------------------------------------------------------------------ the route

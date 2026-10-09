@@ -212,7 +212,8 @@ def live_search(decision: RouteDecision, req: RouteRequest) -> tuple[RouteDecisi
     route = decision.route
     if "web_search" not in route.tools:
         return decision, None, "unavailable"
-    query = web_query(route.query_en or route.rewritten_query or req.utterance, documents=req.documents)
+    english = route.query_en or route.rewritten_query or req.utterance
+    query = web_query(english, documents=req.documents, utterance=req.utterance)
     if query is None:
         overrides = (*decision.overrides, "web_search dropped: no English search query")
         return replace(decision, route=route.model_copy(update={"tools": []}), overrides=overrides), None, "failed"

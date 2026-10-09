@@ -176,7 +176,7 @@ async def test_a_mixed_question_is_answered_with_separate_document_and_web_citat
         "used": 2,
         "pages": 0,
     }
-    assert r["router"]["live_cue"] == "doing today"
+    assert r["router"]["live_cue"] == "stock doing today"
     assert agent.latency["web_first_result_ms"] is not None and agent.latency["web_search_ms"] is not None
 
 
@@ -348,7 +348,7 @@ async def test_an_unavailable_tool_never_searches_and_the_answer_says_so(world):
     assert "tool:start" not in kinds(events) and world.web.queries == []
     assert agent.text == f"{LIVE_NOTICES['unavailable']['en']} From the documents, revenue grew 34% [S1]."
     assert agent.route["tools"] == [] and agent.route["live_note"] == "unavailable"
-    assert agent.route["router"]["live_cue"] == "doing today"
+    assert agent.route["router"]["live_cue"] == "stock doing today"
 
 
 async def test_no_documents_and_no_live_data_abstains_after_the_notice(world):
