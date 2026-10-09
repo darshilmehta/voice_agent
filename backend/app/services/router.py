@@ -316,8 +316,11 @@ def asks_about_facts(text: str) -> bool:
     """A question about facts (a figure, a name, a date, which one…), not a definition or how-to, and not a question
     to the assistant itself: in a project with documents, such a question may well be about them even when the router
     model says "general" (B1)."""
-    return is_question(text) and len(words(text)) >= 3 and not is_definitional(text) and not (
-        _TO_THE_ASSISTANT.search(text)
+    return (
+        is_question(text)
+        and len(words(text)) >= 3
+        and not is_definitional(text)
+        and not (_TO_THE_ASSISTANT.search(text))
     )
 
 
