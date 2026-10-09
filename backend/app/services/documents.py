@@ -140,6 +140,40 @@ class DocumentService(Service):
             await s.flush()
             return Document.model_validate(doc), job.id
 
+    async def indexed_documents(self) -> list[str]:
+        """READY documents of every project with no ingestion job queued or running: the ones whose index a newer
+        chunking version may have made stale. Oldest first."""
+        active = select(orm.IngestionJob.document_id).where(orm.IngestionJob.status.in_((QUEUED, RUNNING)))
+        stmt = (
+            select(orm.Document.id)
+            .where(orm.Document.status == READY, orm.Document.id.not_in(active))
+            .order_by(orm.Document.created_at, orm.Document.id)
+        )
+        async with self.db.session() as s:
+            return list((await s.scalars(stmt)).all())
+
+    async def queue_reindex(self, document_id: str) -> str | None:
+        """A QUEUED job that ingests a READY document's current version again (its index is stale). The document
+        stays READY, and searchable on its old index, until the job starts (PROCESSING, then READY again).
+        None when the document is gone, not READY, or already has a job queued or running."""
+        async with self.db.session() as s:
+            doc = await s.get(orm.Document, document_id)
+            if doc is None or doc.status != READY:
+                return None
+            active = await s.scalar(
+                select(orm.IngestionJob.id).where(
+                    orm.IngestionJob.document_id == document_id, orm.IngestionJob.status.in_((QUEUED, RUNNING))
+                )
+            )
+            if active is not None:
+                return None
+            job = orm.IngestionJob(
+                document_id=document_id, version=doc.version, status=QUEUED, attempts=0, created_at=self.now()
+            )
+            s.add(job)
+            await s.flush()
+            return job.id
+
     async def start_job(self, job_id: str) -> JobTarget | None:
         """Mark a QUEUED job RUNNING and its document PROCESSING. None when there is nothing to do (the document was
         deleted, or the job already ran)."""

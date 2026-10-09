@@ -176,6 +176,16 @@ class FakeStore(VectorStore):
             and (filters.document_ids is None or p.chunk.document_id in filters.document_ids)
         )
 
+    async def outdated(self, document_ids: Sequence[str], chunking_version: str) -> list[str]:
+        if self.fail_with is not None:
+            raise self.fail_with
+        out = []
+        for doc_id in document_ids:
+            versions = {p.chunk.chunking_version for p in self.points.values() if p.chunk.document_id == doc_id}
+            if not versions or versions != {chunking_version}:
+                out.append(doc_id)
+        return out
+
 
 class FakeParser(DocumentParser):
     name = "fake"
@@ -203,7 +213,8 @@ class TextParser(DocumentParser):
 
     name = "fake_text"
 
-    def __init__(self) -> None:
+    def __init__(self, chunking_version: str = "v1") -> None:
+        self.chunking_version = chunking_version  # set to the app's ingestion.chunking.version by Fakes.install
         self.fail_with: Exception | None = None
         self.gate: asyncio.Event | None = None
         self.parsed_paths: list[Path] = []
@@ -273,7 +284,7 @@ class TextParser(DocumentParser):
                         document_id=document_id,
                         version=version,
                         chunk_index=index,
-                        chunking_version="v1",
+                        chunking_version=self.chunking_version,
                         page_start=number,
                         page_end=number,
                         heading_path=["Body"],

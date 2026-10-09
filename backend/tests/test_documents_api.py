@@ -7,6 +7,7 @@ import hashlib
 import io
 import time
 import zipfile
+from dataclasses import replace
 from functools import partial
 
 import pytest
@@ -382,6 +383,93 @@ def test_restart_resumes_interrupted_ingestion(make_app, fakes, monkeypatch):
             ("CANCELLED", "interrupted: the server stopped"),
             ("SUCCEEDED", None),
         ]
+
+
+# ------------------------------------------------------------------ re-indexing (chunking version)
+
+
+def _versions(fakes, doc_id: str) -> set[str]:
+    return {p.chunk.chunking_version for p in fakes.store.points.values() if p.chunk.document_id == doc_id}
+
+
+def test_restart_reindexes_documents_built_by_an_older_chunking_version(make_app, fakes):
+    """Changing what is embedded bumps ingestion.chunking.version; at the next startup every READY document indexed
+    by another version is ingested again through the job queue, and its chunks carry the new version."""
+    with make_app() as api:
+        version = api.app.state.container.settings.ingestion.chunking.version  # type: ignore[attr-defined]
+        doc_id = upload(api, _project(api), "a.txt", REPORT).json()["id"]
+        drain(api)
+        assert _versions(fakes, doc_id) == {version}
+    with make_app(INGESTION__CHUNKING__VERSION="next") as api:
+        drain(api)
+        doc = api.get(f"/api/documents/{doc_id}").json()
+        assert (doc["status"], doc["chunk_count"], doc["error"]) == ("READY", 5, None)
+        assert _versions(fakes, doc_id) == {"next"}
+        assert [j.status for j in _run(api, _jobs, _db(api), doc_id)] == ["SUCCEEDED", "SUCCEEDED"]
+        assert len(fakes.parser.parsed_paths) == 2
+    with make_app(INGESTION__CHUNKING__VERSION="next") as api:  # up to date: nothing to do
+        drain(api)
+        assert [j.status for j in _run(api, _jobs, _db(api), doc_id)] == ["SUCCEEDED", "SUCCEEDED"]
+        assert len(fakes.parser.parsed_paths) == 2
+
+
+def test_a_reindexed_document_stays_searchable_until_its_job_starts(app, fakes):
+    """Queued re-indexing keeps the document READY on its old index; it is PROCESSING (like any ingestion, after
+    the startup preload) only while it re-ingests, then READY again."""
+    pipeline = app.app.state.document_pipeline  # type: ignore[attr-defined]
+    version = pipeline.settings.ingestion.chunking.version
+    p = _project(app)
+    doc_id = upload(app, p, "a.txt", REPORT).json()["id"]
+    other = upload(app, p, "b.txt", b"gamma delta").json()["id"]
+    drain(app)
+    for cid, point in list(fakes.store.points.items()):  # as if indexed by the previous release
+        if point.chunk.document_id == doc_id:
+            fakes.store.points[cid] = replace(point, chunk=point.chunk.model_copy(update={"chunking_version": "old"}))
+
+    preloaded, gate = asyncio.Event(), asyncio.Event()
+    pipeline.wait_before_ingesting = preloaded.wait
+    fakes.parser.gate = gate
+    assert _run(app, pipeline.reindex_outdated) == [doc_id]
+    assert _run(app, pipeline.reindex_outdated) == []  # already queued
+    assert app.get(f"/api/documents/{doc_id}").json()["status"] == "READY"
+    assert [j.status for j in _run(app, _jobs, _db(app), doc_id)] == ["SUCCEEDED", "QUEUED"]
+
+    _run(app, preloaded.set)
+    assert wait_for_status(app, doc_id, "PROCESSING")["status"] == "PROCESSING"
+    _run(app, gate.set)
+    drain(app)
+    assert app.get(f"/api/documents/{doc_id}").json()["status"] == "READY"
+    assert _versions(fakes, doc_id) == {version} and _versions(fakes, other) == {version}
+    assert [j.status for j in _run(app, _jobs, _db(app), other)] == ["SUCCEEDED"]  # up to date: untouched
+
+
+def test_documents_missing_from_the_index_are_reindexed(app, fakes):
+    pipeline = app.app.state.document_pipeline  # type: ignore[attr-defined]
+    doc_id = upload(app, _project(app), "a.txt", REPORT).json()["id"]
+    drain(app)
+    fakes.store.points.clear()  # e.g. the vector store's data was lost
+    assert _run(app, pipeline.reindex_outdated) == [doc_id]
+    drain(app)
+    assert app.get(f"/api/documents/{doc_id}").json()["status"] == "READY"
+    assert _versions(fakes, doc_id) == {pipeline.settings.ingestion.chunking.version}
+
+
+def test_reindex_check_skips_documents_that_are_not_ready_and_survives_a_store_failure(app, fakes):
+    pipeline = app.app.state.document_pipeline  # type: ignore[attr-defined]
+    fakes.parser.fail_with = RuntimeError("broken file")
+    failed = upload(app, _project(app), "a.txt", REPORT).json()["id"]
+    drain(app)
+    assert app.get(f"/api/documents/{failed}").json()["status"] == "FAILED"
+    assert _run(app, pipeline.reindex_outdated) == []  # FAILED documents have no index to refresh
+
+    fakes.parser.fail_with = None
+    ready = upload(app, _project(app, "Other"), "b.txt", b"gamma delta").json()["id"]
+    drain(app)
+    fakes.store.points.clear()
+    fakes.store.fail_with = ConnectionError("qdrant down")
+    assert _run(app, pipeline.reindex_outdated) == []  # logged; the next startup checks again
+    fakes.store.fail_with = None
+    assert app.get(f"/api/documents/{ready}").json()["status"] == "READY"
 
 
 async def test_storage_failure_after_put_removes_the_file(db, load_local, tmp_path, monkeypatch):

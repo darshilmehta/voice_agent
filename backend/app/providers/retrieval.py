@@ -255,6 +255,11 @@ class VectorStore(Provider):
     async def count(self, filters: RetrievalFilters) -> int:
         raise NotImplementedError(f"{type(self).__name__}.count")
 
+    async def outdated(self, document_ids: Sequence[str], chunking_version: str) -> list[str]:
+        """The documents among ``document_ids`` whose index must be rebuilt: no chunks indexed, or chunks built by
+        another ``chunking_version`` (what is embedded changed). Order of ``document_ids`` kept."""
+        raise NotImplementedError(f"{type(self).__name__}.outdated")
+
 
 def build_filter(filters: RetrievalFilters) -> qm.Filter:
     """Qdrant filter for a project, optionally narrowed to documents."""
@@ -462,6 +467,30 @@ class QdrantStore(VectorStore):
                 return 0
             raise
         return res.count
+
+    async def outdated(self, document_ids: Sequence[str], chunking_version: str) -> list[str]:
+        from qdrant_client import models as qm
+
+        if not document_ids:
+            return []
+        client = self.client()
+        try:
+            exists = await client.collection_exists(self.collection)
+        except Exception as e:
+            raise VectorStoreError(f"cannot check the index of {len(document_ids)} document(s): {e}") from e
+        if not exists:
+            return list(document_ids)
+        out = []
+        for doc_id in document_ids:
+            of_doc = qm.FieldCondition(key="document_id", match=qm.MatchValue(value=doc_id))
+            current = qm.FieldCondition(key="chunking_version", match=qm.MatchValue(value=chunking_version))
+            total = await client.count(self.collection, count_filter=qm.Filter(must=[of_doc]), exact=True)
+            other = await client.count(
+                self.collection, count_filter=qm.Filter(must=[of_doc], must_not=[current]), exact=True
+            )
+            if total.count == 0 or other.count > 0:
+                out.append(doc_id)
+        return out
 
     async def drop_collection(self) -> None:
         """Delete the whole collection (tests, re-index). Recreated on the next upsert."""
