@@ -37,6 +37,10 @@
   answer's last sentence is spoken as soon as its text is complete (``AnswerStop.on_answered``), not after a
   continuation; speech after the complete answer has been played, while only a continuation was still to come,
   isn't a barge-in: the turn just ends (the answer saved complete) and the speech is the next turn.
+- The canvas (§12.1): the answer's visual comes from the turn (``run(on_visual=…)``) as ``visual`` / ``canvas`` with
+  the turn's id, before or after its ``agent_message``; ready while the answer is still being heard, it is followed
+  by the tail ("It's on screen now.", ``audio_chunk {tail: true}``, not part of the answer). ``stop`` and the session
+  ending cancel a visual still being planned; the next question cancels it in the turn service.
 """
 
 from __future__ import annotations
@@ -47,17 +51,19 @@ import logging
 import time
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 
 from ...db.types import new_id
+from ...domain.canvas import CanvasEvent, VisualEvent
 from ...domain.projects import Chat, Message
 from ...providers.registry import Container
 from ...providers.speech import SpeechRecognizer, SpeechSynthesizer, Transcript, VoiceActivityDetector
 from ...providers.storage import MetadataDB
 from ...settings import Language, Settings
 from ..base import InvalidInput, NotFound
+from ..canvas.conversation import visual_in_progress
 from ..chat_turns import (
     AgentMessageEvent,
     AnswerStop,
@@ -75,7 +81,7 @@ from ..chat_turns import (
 from ..chats import ChatService
 from ..language import script_language
 from ..messages import MessageService
-from .fillers import filler_audio
+from .fillers import VISUAL_TAILS, filler_audio
 from .protocol import (
     CLOSE_CHAT_NOT_FOUND,
     CLOSE_GOING_AWAY,
@@ -121,6 +127,9 @@ from .turn_taking import (
     barge_in_verdict,
 )
 
+if TYPE_CHECKING:
+    from ..canvas.service import CanvasService
+
 log = logging.getLogger(__name__)
 
 PLAYBACK_GRACE_S = 2.0  # a turn whose client never says playback_done ends this long after its audio should have
@@ -134,6 +143,9 @@ ACKNOWLEDGEMENT_GRACE = 2
 # speech (the first time at decision_timeout_ms of speech, or this long after a "resume"), to stop the answer as soon
 # as it has real words instead of when the sentence ends (B3).
 WATCH_STEP_MS = 400
+# The visual's spoken tail (§12.1) is sent after agent_message only while the answer still has this much left to play:
+# the client plays it as part of the turn, before it reports playback_done.
+TAIL_MARGIN_S = 0.3
 
 
 class Transport(Protocol):
@@ -194,6 +206,9 @@ class AgentTurn:
     barge_in_at: float | None = None  # when it arrived (perf_counter)
     playback_timer: asyncio.TimerHandle | None = None
     marks: dict[str, float] = field(default_factory=dict)  # perf_counter timestamps for the latency log
+    answer_ms: float | None = None  # the answer's audio, once all of it is sent (the visual's tail comes after)
+    tail_wanted: bool = False  # the visual is ready while the answer is still being spoken: say so after it
+    tail_sent: bool = False
 
 
 @dataclass(eq=False)
@@ -284,9 +299,12 @@ class VoiceSession:
         self._tasks: set[asyncio.Task[Any]] = set()
         self._state: AgentState | None = None
         self._errors_sent: dict[str, float] = {}
+        self._tails: set[Language] = set()  # languages whose visual tail is synthesized (or being)
 
     @classmethod
-    def from_container(cls, chat: Chat, transport: Transport, container: Container) -> VoiceSession:
+    def from_container(
+        cls, chat: Chat, transport: Transport, container: Container, *, canvas: CanvasService | None = None
+    ) -> VoiceSession:
         db, vad, stt, tts = (container[c] for c in ("metadata_db", "vad", "stt", "tts"))
         if not (
             isinstance(db, MetadataDB)
@@ -298,7 +316,7 @@ class VoiceSession:
         return cls(
             chat,
             transport,
-            turns=ChatTurnService.from_container(container),
+            turns=ChatTurnService.from_container(container, canvas=canvas),
             messages=MessageService(db),
             vad=vad,
             stt=stt,
@@ -344,6 +362,7 @@ class VoiceSession:
             pending, self._pending = self._pending, None
             if pending is not None and pending.deadline is not None:
                 pending.deadline.cancel()
+            self._cancel_visual()  # nobody is left to see it
             if self._turn is not None:
                 await self._interrupt(self._turn, "disconnect", None)
             if self._settling:  # interruptions started before (they save what was heard): let them finish
@@ -483,8 +502,10 @@ class VoiceSession:
                     await self._finish_turn(agent)
             case Stop():
                 # Utterances that ended before this are not answered either (one may be in STT while the client
-                # already shows "thinking"): they are saved with an empty, stopped answer (§3.10).
+                # already shows "thinking"): they are saved with an empty, stopped answer (§3.10). A visual still
+                # being prepared stops too (§12.1).
                 self._stop_at = time.perf_counter()
+                self._cancel_visual()
                 if self._turn is not None:
                     await self._interrupt(self._turn, "stop", None)
                 elif self._processing or not self._utterances.empty():
@@ -742,8 +763,12 @@ class VoiceSession:
             agent.answer_queued = True
 
         agent.stop.on_answered = answered
+
+        async def on_visual(event: VisualEvent | CanvasEvent) -> None:
+            await self._on_visual(agent, event)
+
         try:
-            events = self.turns.run(agent.turn, stop=agent.stop, user=agent.stop.user)
+            events = self.turns.run(agent.turn, stop=agent.stop, user=agent.stop.user, on_visual=on_visual)
             async with contextlib.aclosing(events):
                 async for event in events:
                     await self._on_turn_event(agent, event, chunker, queue)
@@ -757,7 +782,10 @@ class VoiceSession:
                 speaker.cancel()
                 await asyncio.wait([speaker])
         # Every chunk and its frames are out: agent_message closes the turn (the client sends playback_done after it).
+        agent.answer_ms = agent.sent_ms
         agent.audio_done = True
+        if agent.tail_wanted and not agent.cut and agent.first_audio_at is not None and not agent.errored:
+            await self._send_tail(agent)  # the visual became ready while the answer was spoken (§12.1)
         if agent.message is not None:
             agent.message_sent = True
             await self._send_for(agent, {"type": "agent_message", "message": _message_json(agent.message)})
@@ -796,9 +824,64 @@ class VoiceSession:
                         queue.put_nowait(chunk)
             case AgentMessageEvent(message=message):
                 agent.message = message
+            case VisualEvent() | CanvasEvent():  # a canvas edit's (§12.1): before its "Done."
+                await self._send_for(agent, {"type": event.name, "turn_id": agent.id, **event.payload()})
             case ErrorEvent(stage=stage, detail=detail):
                 agent.errored = True
                 await self._send_for(agent, {"type": "error", "detail": detail, "stage": stage})
+
+    # -------------------------------------------------------------- the canvas (§12.1)
+
+    def _cancel_visual(self) -> None:
+        visual = visual_in_progress(self.chat.id)
+        if visual is not None:
+            visual.cancel()
+
+    async def _on_visual(self, agent: AgentTurn, event: VisualEvent | CanvasEvent) -> None:
+        """The answer's visual, as it comes (``visual`` / ``canvas`` with the turn's id; possibly after its
+        agent_message, and even after the turn was cut: a visual being planned is cancelled by the next turn that
+        needs the model, not by the cut). When it is ready while the answer is still being heard, say so."""
+        await self._send({"type": event.name, "turn_id": agent.id, **event.payload()})
+        language = agent.voice_language or agent.turn.language
+        if language not in self._tails:  # synthesized while the visual is planned (seconds), once per language
+            self._tails.add(language)
+            self._spawn(self._warm_tail(language), f"{self.id}-tail-audio")
+        if isinstance(event, VisualEvent) and event.phase == "ready":
+            await self._visual_tail(agent)
+
+    async def _warm_tail(self, language: Language) -> None:
+        with contextlib.suppress(Exception):  # it is synthesized when needed instead
+            await filler_audio(self.tts).phrase(VISUAL_TAILS[language], language)
+
+    async def _visual_tail(self, agent: AgentTurn) -> None:
+        """ "It's on screen now." / "स्क्रीन पर दिखा दिया है।" after the answer, only while its audio is still being
+        sent or played, the user isn't talking and the turn wasn't cut; otherwise nothing (the chart appearing says
+        it). Never before the visual is ready, so it never promises one that fails."""
+        if agent.tail_sent or agent.cut or agent.interrupted or agent.errored or agent.tts_failed:
+            return
+        if self._turn is not agent:  # its audio is over: the next turn (or nothing) is going on
+            return
+        if self._pending is not None or self._endpointer.in_utterance:  # the user is talking
+            return
+        if not agent.audio_done:
+            agent.tail_wanted = True  # after the answer's last chunk, before agent_message
+            return
+        if agent.first_audio_at is None or time.perf_counter() >= agent.play_end - TAIL_MARGIN_S:
+            return
+        await self._send_tail(agent)
+        if agent.playback_timer is not None:
+            self._arm_playback_timer(agent)
+
+    async def _send_tail(self, agent: AgentTurn) -> None:
+        agent.tail_sent = True
+        language = agent.voice_language or agent.turn.language
+        text = VISUAL_TAILS[language]
+        try:
+            pcm = await filler_audio(self.tts).phrase(text, language)
+        except Exception as e:
+            log.warning("voice session %s: the visual's tail couldn't be synthesized: %s", self.id, _describe(e))
+            return
+        await self._send_chunk(agent, text, pcm, tail=True)
 
     async def _announce(self, agent: AgentTurn, user: Message) -> None:
         """``user_message`` then ``turn``, once each (also called for a turn cut before they went out)."""
@@ -856,9 +939,12 @@ class VoiceSession:
         finally:
             agent.tts_busy = False
 
-    async def _send_chunk(self, agent: AgentTurn, text: str, pcm: bytes, *, filler: bool = False) -> None:
-        """``audio_chunk`` (``filler: true`` for the filler), then its frames; ``state: speaking`` with the answer's
-        first chunk (the filler alone doesn't count)."""
+    async def _send_chunk(
+        self, agent: AgentTurn, text: str, pcm: bytes, *, filler: bool = False, tail: bool = False
+    ) -> None:
+        """``audio_chunk`` (``filler: true`` for the filler, ``tail: true`` for the visual's tail), then its frames;
+        ``state: speaking`` with the answer's first chunk (the filler alone doesn't count). Neither the filler nor
+        the tail is part of the answer: their words never count in ``heard_text``."""
         if not pcm:
             return
         rate = self.tts.sample_rate
@@ -867,8 +953,8 @@ class VoiceSession:
             if agent.cut:  # synthesized after the decision: dropped
                 return
             index = len(agent.chunks)
-            first_answer_chunk = not filler and agent.first_audio_at is None
-            chunk = SpokenChunk(index, text, agent.sent_ms, duration_ms, filler=filler)
+            first_answer_chunk = not filler and not tail and agent.first_audio_at is None
+            chunk = SpokenChunk(index, text, agent.sent_ms, duration_ms, filler=filler or tail)
             announce: dict[str, Any] = {
                 "type": "audio_chunk",
                 "turn_id": agent.id,
@@ -878,6 +964,8 @@ class VoiceSession:
             }
             if filler:
                 announce["filler"] = True
+            if tail:
+                announce["tail"] = True
             await self._send_text_unlocked(dumps(announce))
             agent.chunks.append(chunk)
             agent.sent_ms = chunk.end_ms
@@ -905,7 +993,7 @@ class VoiceSession:
             return False
         if agent.queue is not None and not agent.queue.empty():
             return False
-        return self._played_ms(agent, played_ms) >= agent.sent_ms - 1
+        return self._played_ms(agent, played_ms) >= _answer_end_ms(agent) - 1
 
     def _arm_playback_timer(self, agent: AgentTurn) -> None:
         """End the turn when the client says playback_done, or PLAYBACK_GRACE_S after its audio should have finished
@@ -1023,8 +1111,9 @@ class VoiceSession:
                 await asyncio.wait([agent.task])  # the pipeline saves the stopped answer before the task ends
             message = agent.stop.saved
             complete = agent.message or agent.stop.completed
-            # Fully heard: all of it was played, and either the turn had ended or only a continuation was to come.
-            fully_heard = played >= agent.sent_ms and (agent.audio_done or heard_all)
+            # Fully heard: all of it was played (the visual's tail after it doesn't count), and either the turn had
+            # ended or only a continuation was to come.
+            fully_heard = played >= _answer_end_ms(agent) and (agent.audio_done or heard_all)
             try:
                 if message is None and complete is not None:
                     if not fully_heard:  # fully heard: it was sent complete already and nothing was cut
@@ -1237,6 +1326,11 @@ class VoiceSession:
             )
 
 
+def _answer_end_ms(agent: AgentTurn) -> float:
+    """Where the answer's audio ends in the turn's audio: the visual's tail, if any, comes after it (§12.1)."""
+    return agent.answer_ms if agent.answer_ms is not None else agent.sent_ms
+
+
 def filler_gap_ms(agent: AgentTurn) -> float | None:
     """How long after the filler finished playing the answer's first audio arrived (§3.7 target: < 1 s); 0 when it
     arrived before the filler ended (it plays right after it). None without a filler or answer audio."""
@@ -1250,10 +1344,12 @@ def filler_gap_ms(agent: AgentTurn) -> float | None:
 
 
 class VoiceSessions:
-    """The live voice sessions of this process, at most one per chat: opening a second one closes the first (4409)."""
+    """The live voice sessions of this process, at most one per chat: opening a second one closes the first (4409).
+    ``canvas``: the app's canvas service, so answers get visuals (§12.1)."""
 
-    def __init__(self, container: Container) -> None:
+    def __init__(self, container: Container, *, canvas: CanvasService | None = None) -> None:
         self.container = container
+        self.canvas = canvas
         self._sessions: dict[str, VoiceSession] = {}
         self._lock = asyncio.Lock()
 
@@ -1268,7 +1364,7 @@ class VoiceSessions:
         chat = await ChatService(db).get(chat_id)
         async with self._lock:
             previous = self._sessions.get(chat_id)
-            session = VoiceSession.from_container(chat, transport, self.container)
+            session = VoiceSession.from_container(chat, transport, self.container, canvas=self.canvas)
             self._sessions[chat_id] = session
         if previous is not None:
             previous.close(CLOSE_REPLACED, "another voice session was opened for this chat")

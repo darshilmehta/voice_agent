@@ -52,7 +52,10 @@ def document_pipeline(request: Request) -> DocumentPipeline:
 
 
 def chat_turns(request: Request) -> ChatTurnService:
-    return ChatTurnService.from_container(request.app.state.container)
+    """Text turns, with the app's canvas: an answer's visual travels in its SSE stream (§12.1)."""
+    return ChatTurnService.from_container(
+        request.app.state.container, canvas=getattr(request.app.state, "canvas", None)
+    )
 
 
 Projects = Annotated[ProjectService, Depends(project_service)]

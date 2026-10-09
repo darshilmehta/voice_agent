@@ -7,10 +7,11 @@ instead of being called from the chat pipeline: hooks are registered per metadat
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, get_args
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from sqlalchemy import select, update
 
@@ -26,6 +27,15 @@ PAGE_MAX = 200
 
 AgentMessageHook = Callable[[Message], Awaitable[None]]
 _AGENT_HOOKS: WeakKeyDictionary[MetadataDB, list[AgentMessageHook]] = WeakKeyDictionary()
+# Read-modify-write updates of a saved message's route, one at a time per message (this process).
+_ROUTE_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+
+
+def _route_lock(message_id: str) -> asyncio.Lock:
+    lock = _ROUTE_LOCKS.get(message_id)
+    if lock is None:
+        lock = _ROUTE_LOCKS[message_id] = asyncio.Lock()
+    return lock
 
 
 def add_agent_message_hook(db: MetadataDB, hook: AgentMessageHook) -> Callable[[], None]:
@@ -116,7 +126,7 @@ class MessageService(Service):
         """Mark an agent answer as cut short after it was saved (voice: the user barged in or said stop while it was
         still playing): ``heard_text`` is what was actually played; the route gets ``stopped = true`` and
         ``interrupted = reason``."""
-        async with self.db.session() as s:
+        async with _route_lock(message_id), self.db.session() as s:
             row = await s.get(orm.Message, message_id)
             if row is None:
                 raise NotFound("message", message_id)
@@ -124,6 +134,17 @@ class MessageService(Service):
                 raise InvalidInput(f"message {message_id!r} is not an agent answer")
             row.heard_text = heard_text
             row.route = {**(row.route or {}), "stopped": True, "interrupted": reason}
+            await s.flush()
+            return Message.model_validate(row)
+
+    async def update_route(self, message_id: str, changes: dict[str, Any]) -> Message:
+        """Add fields to a saved message's route (the turn's visual, ready after the answer was saved, §12.1). Updates
+        of one message's route are serialized, so this and ``record_interruption`` never lose each other's fields."""
+        async with _route_lock(message_id), self.db.session() as s:
+            row = await s.get(orm.Message, message_id)
+            if row is None:
+                raise NotFound("message", message_id)
+            row.route = {**(row.route or {}), **changes}
             await s.flush()
             return Message.model_validate(row)
 

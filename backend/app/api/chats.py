@@ -59,7 +59,13 @@ _SSE_DOC = {
             "A turn that searches the web (live data) also sends tool events ({name: web_search, phase: start | "
             "results | done | timeout | failed, query, …}) between user_message and agent_message: start before "
             "sources; results (web Citations, kind: web, [W1]…) before sources and again before a continuation's "
-            "deltas; one of done / timeout / failed when the search ends."
+            "deltas; one of done / timeout / failed when the search ends. "
+            "The live visual canvas (docs/DESIGN.md §12.1): an answer from the documents that calls for a visual gets "
+            "visual events ({phase: preparing | ready | failed, visual_id, visual?, detail?}) and a canvas snapshot "
+            "({panels}) once its text is complete: preparing (a requested visual's skeleton) just before "
+            "agent_message, ready + canvas (or failed) after it; the stream stays open for them, at most "
+            "canvas.planner_timeout_ms + 2 s. A canvas edit ('make it a bar chart') sends its visual / canvas events "
+            "before its delta ('Done.')."
         ),
         "content": {"text/event-stream": {"schema": {"type": "string"}}},
     }

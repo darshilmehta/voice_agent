@@ -74,7 +74,7 @@ def create_app(
         app.state.document_pipeline.listeners.append(canvas)
         await app.state.document_pipeline.start()  # re-queues ingestions a restart interrupted
         await canvas.schedule_backfill()
-        app.state.voice_sessions = VoiceSessions(container)
+        app.state.voice_sessions = VoiceSessions(container, canvas=canvas)
         app.state.summarizer = ChatSummarizer.from_container(container)
         titles = app.state.titles = TitleService.from_container(container)
         # Titles follow the first saved agent answer (text or voice) as a background job, not as part of the turn.

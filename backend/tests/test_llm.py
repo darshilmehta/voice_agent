@@ -191,7 +191,8 @@ async def test_every_request_keeps_the_same_context_size_and_keep_alive(load_loc
     assert [b["options"].get("num_predict") for b in bodies[-2:]] == [1, 1]  # warm-ups read, they don't write
 
 
-async def test_warm_prompts_reads_the_router_and_answer_prompts_once(load_local):
+async def test_warm_prompts_reads_the_router_answer_and_planner_prompts_once(load_local):
+    from app.services.canvas.planner import SYSTEM_PROMPT as PLANNER_SYSTEM_PROMPT
     from app.services.preload import warm_prompts
     from app.services.prompts import answer_system_prompt
     from app.services.router import ROUTER_SYSTEM_PROMPT
@@ -199,9 +200,10 @@ async def test_warm_prompts_reads_the_router_and_answer_prompts_once(load_local)
     llm, rec = make_llm(load_local, lambda r: httpx.Response(200, content=chunks("ok")))
     await warm_prompts(llm, load_local())
     systems = [rec.body(i)["messages"][0]["content"] for i in range(len(rec.requests))]
-    # the answer's system prompt is the same in English and Hindi (the question asks for the language): read once
-    assert systems == [ROUTER_SYSTEM_PROMPT, answer_system_prompt("en", "short")]
-    assert {rec.body(i)["options"]["num_predict"] for i in range(2)} == {1}  # read, not answered
+    # the answer's system prompt is the same in English and Hindi (the question asks for the language): read once;
+    # the visual planner's (§12.1) too, which runs after an answer while it is spoken
+    assert systems == [ROUTER_SYSTEM_PROMPT, answer_system_prompt("en", "short"), PLANNER_SYSTEM_PROMPT]
+    assert {rec.body(i)["options"]["num_predict"] for i in range(3)} == {1}  # read, not answered
 
 
 def test_openai_compatible_placeholder_raises(cloud_settings):
