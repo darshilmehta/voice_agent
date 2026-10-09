@@ -1,0 +1,952 @@
+{
+  "version": 2,
+  "name": "canvas_planner_holdout_v2",
+  "description": "Blind hold-out set v2 for the visual (chart) planner: 36 EN / HI / Hinglish requests over the eval corpus (data/eval/docs, built by scripts/eval/build_corpus.py), written from the corpus generator's table inventory without seeing the planner. See evals/canvas/README.md.",
+  "documents": ["valmora_annual_report_fy24.pdf", "zephyra_investor_deck_q4fy24.pptx", "valmora_travel_expense_policy.docx", "suryodaya_yojana_soochna.docx", "valmora_group_health_policy_scan.pdf"],
+  "cases": [
+    {
+      "id": "v2-en-01",
+      "question": "Compare Valmora's revenue in each quarter of FY24 with the same quarter of FY23.",
+      "language": "en",
+      "kinds": ["grouped_bar", "bar", "line"],
+      "datasets": [
+        [0, "Quarterly performance: FY24"],
+        [0, "Quarterly performance: FY23"]
+      ],
+      "series": ["Revenue"],
+      "expected": {
+        "kind": "grouped_bar",
+        "acceptable_kinds": ["bar", "line"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Quarterly performance: FY24",
+          "page": 19
+        },
+        "series": ["Revenue"],
+        "periods": ["Q1 FY24", "Q2 FY24", "Q3 FY24", "Q4 FY24"],
+        "measure": "Revenue",
+        "additional_tables": [
+          {
+            "document": "valmora_annual_report_fy24.pdf",
+            "table": {
+              "title": "Quarterly performance: FY23 (comparative year)",
+              "page": 20
+            },
+            "series": ["Revenue"],
+            "periods": ["Q1 FY23", "Q2 FY23", "Q3 FY23", "Q4 FY23"]
+          }
+        ]
+      },
+      "tags": ["compare_years", "multi_table", "company_named", "lookalike_table_elsewhere"],
+      "notes": "No single table holds both years: FY24 quarters are on p19 and the FY23 comparative quarters on p20. Primary = p19; a full answer combines p19 and p20 (additional_tables). A plan from either one alone is a partial answer. Zephyra's Q4 table is a lookalike. The 'Full year' rows must not be plotted as a quarter."
+    },
+    {
+      "id": "v2-en-02",
+      "question": "How did quarterly revenue move through FY24?",
+      "language": "en",
+      "kinds": ["line", "bar"],
+      "datasets": [
+        [0, "Quarterly performance: FY24"]
+      ],
+      "series": ["Revenue"],
+      "expected": {
+        "kind": "line",
+        "acceptable_kinds": ["bar"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Quarterly performance: FY24",
+          "page": 19
+        },
+        "series": ["Revenue"],
+        "periods": ["Q1 FY24", "Q2 FY24", "Q3 FY24", "Q4 FY24"],
+        "measure": "Revenue"
+      },
+      "tags": ["trend", "no_company_named", "implied_request"],
+      "notes": "No company named. Only Valmora has all four quarters of FY24 (annual report p19); Zephyra's deck gives just Q4 FY24, Q4 FY23 and Q3 FY24 (slide 9, not a FY24 trend). The 'Full year FY24' row is a total, not a quarter."
+    },
+    {
+      "id": "v2-en-03",
+      "question": "Chart EBITDA for Valmora's three businesses, FY23 versus FY24.",
+      "language": "en",
+      "kinds": ["grouped_bar", "bar"],
+      "datasets": [
+        [0, "Segment results"]
+      ],
+      "series": ["Specialty Chemicals", "Engineered Plastics", "Digital Services"],
+      "expected": {
+        "kind": "grouped_bar",
+        "acceptable_kinds": ["bar"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Segment results",
+          "page": 18
+        },
+        "series": ["Specialty Chemicals", "Engineered Plastics", "Digital Services"],
+        "periods": ["FY23", "FY24"],
+        "measure": "EBITDA"
+      },
+      "tags": ["compare_years", "segments", "company_named", "lookalike_table_elsewhere"],
+      "notes": "Segment results (p18): the EBITDA FY24 and EBITDA FY23 columns for the three segment rows; the Total row is not a segment. Zephyra's Segment overview (slide 5) has the same shape and a Digital Services segment too, but no EBITDA amounts, only margins."
+    },
+    {
+      "id": "v2-en-04",
+      "question": "What share of Valmora's FY24 revenue comes from each business?",
+      "language": "en",
+      "kinds": ["donut", "bar", "stacked_bar"],
+      "datasets": [
+        [0, "Business overview"],
+        [0, "Segment results"]
+      ],
+      "series": ["Specialty Chemicals", "Engineered Plastics", "Digital Services"],
+      "expected": {
+        "kind": "donut",
+        "acceptable_kinds": ["bar", "stacked_bar"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Business overview",
+          "page": 6
+        },
+        "series": ["Specialty Chemicals", "Engineered Plastics", "Digital Services"],
+        "periods": ["FY24"],
+        "measure": "Share of FY24 revenue",
+        "acceptable_tables": [
+          {
+            "document": "valmora_annual_report_fy24.pdf",
+            "table": {
+              "title": "Segment results",
+              "page": 18
+            },
+            "series": ["Specialty Chemicals", "Engineered Plastics", "Digital Services"],
+            "periods": ["FY24"]
+          }
+        ]
+      },
+      "tags": ["composition", "segments", "company_named"],
+      "notes": "The Business overview table (p6) states the shares directly (48.4 / 31.3 / 20.3 %). The Segment results table (p18) holds the revenue amounts from which the same shares can be calculated; acceptable but not the first choice."
+    },
+    {
+      "id": "v2-en-05",
+      "question": "Walk me from Zephyra's EBITDA down to profit after tax for FY24.",
+      "language": "en",
+      "kinds": ["waterfall", "bar"],
+      "datasets": [
+        [1, "FY24 profit and loss summary"]
+      ],
+      "series": ["EBITDA", "Other income", "Depreciation and amortisation", "Finance costs", "Tax expense", "Profit after tax"],
+      "expected": {
+        "kind": "waterfall",
+        "acceptable_kinds": ["bar"],
+        "company": "Zephyra",
+        "document": "zephyra_investor_deck_q4fy24.pptx",
+        "table": {
+          "title": "FY24 profit and loss summary",
+          "slide": 10
+        },
+        "series": ["EBITDA", "Other income", "Depreciation and amortisation", "Finance costs", "Tax expense", "Profit after tax"],
+        "periods": ["FY24"],
+        "measure": "FY24 column"
+      },
+      "tags": ["bridge", "company_named", "lookalike_table_elsewhere"],
+      "notes": "Slide 10 holds the whole chain in one table (EBITDA 633 + other income 41 - D&A 226 - finance costs 90 = PBT 358; tax 90; PAT 268). Valmora's P&L (pages 21-22) is the lookalike but is split over two pages and has no EBITDA line."
+    },
+    {
+      "id": "v2-en-06",
+      "question": "Show me the installed capacity of the four plastics plants side by side.",
+      "language": "en",
+      "kinds": ["bar", "table"],
+      "datasets": [
+        [0, "Operations and manufacturing footprint"]
+      ],
+      "series": ["Hosur Polymers", "Sanand Compounding", "Pune Moulding Park", "Aurangabad Films"],
+      "expected": {
+        "kind": "bar",
+        "acceptable_kinds": ["table"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Operations and manufacturing footprint",
+          "page": 10
+        },
+        "series": ["Hosur Polymers", "Sanand Compounding", "Pune Moulding Park", "Aurangabad Films"],
+        "periods": [],
+        "measure": "Installed capacity (tpa)"
+      },
+      "tags": ["categorical_comparison", "no_company_named", "mixed_units_in_table"],
+      "notes": "Only Valmora's annual report has plants (p10). The table mixes tonnes per annum (chemicals, plastics) and seats (Digital Services centres): only the four Engineered Plastics rows share a unit."
+    },
+    {
+      "id": "v2-en-07",
+      "question": "Show me what total assets were made up of at the end of FY23 and FY24.",
+      "language": "en",
+      "kinds": ["stacked_bar", "grouped_bar", "bar", "donut"],
+      "datasets": [
+        [0, "31 March 2024: assets"]
+      ],
+      "series": ["Property, plant and equipment", "Inventories", "Trade receivables", "Cash and bank balances"],
+      "expected": {
+        "kind": "stacked_bar",
+        "acceptable_kinds": ["grouped_bar", "bar", "donut"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Consolidated balance sheet as at 31 March 2024: assets",
+          "page": 23
+        },
+        "series": ["Property, plant and equipment", "Inventories", "Trade receivables", "Cash and bank balances"],
+        "periods": ["31 Mar 2024", "31 Mar 2023"],
+        "measure": "Asset lines"
+      },
+      "tags": ["composition", "no_company_named", "subtotal_rows"],
+      "notes": "No company named; only Valmora has a balance sheet (p23, assets side). The table has subtotal rows (Total non-current assets, Total current assets, Total assets) that must not be plotted next to the lines they sum. Periods are the year-end dates 31 Mar 2024 and 31 Mar 2023."
+    },
+    {
+      "id": "v2-en-08",
+      "question": "Did cash from operating, investing and financing activities improve from FY23 to FY24? Chart it.",
+      "language": "en",
+      "kinds": ["grouped_bar", "bar", "comparison", "table"],
+      "datasets": [
+        [0, "cash flow statement"]
+      ],
+      "series": ["Net cash generated from operating activities", "Net cash used in investing activities", "Net cash used in financing activities"],
+      "expected": {
+        "kind": "grouped_bar",
+        "acceptable_kinds": ["bar", "comparison", "table"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Consolidated cash flow statement",
+          "page": 25
+        },
+        "series": ["Net cash generated from operating activities", "Net cash used in investing activities", "Net cash used in financing activities"],
+        "periods": ["FY24", "FY23"]
+      },
+      "tags": ["compare_years", "no_company_named", "negative_values"],
+      "notes": "No company named; the only cash-flow table is Valmora's (p25). Zephyra's cash flow is in bullet text on slide 11, not a table. Investing and financing figures are negative (shown in brackets)."
+    },
+    {
+      "id": "v2-en-09",
+      "question": "Chart branches, warehouses and owned trucks for FY23 and FY24.",
+      "language": "en",
+      "kinds": ["grouped_bar", "bar", "table", "comparison"],
+      "datasets": [
+        [1, "Network and fleet"]
+      ],
+      "series": ["Branches", "Warehouses", "Owned trucks"],
+      "expected": {
+        "kind": "grouped_bar",
+        "acceptable_kinds": ["bar", "table", "comparison"],
+        "company": "Zephyra",
+        "document": "zephyra_investor_deck_q4fy24.pptx",
+        "table": {
+          "title": "Network and fleet",
+          "slide": 12
+        },
+        "series": ["Branches", "Warehouses", "Owned trucks"],
+        "periods": ["FY24", "FY23"]
+      },
+      "tags": ["compare_years", "no_company_named", "mixed_units_in_table"],
+      "notes": "No company named; only Zephyra's Network and fleet table (slide 12) has these rows. The table's other rows are in other units (million sq ft, per cent) and don't belong in the same chart."
+    },
+    {
+      "id": "v2-en-10",
+      "question": "Bar chart of how many meetings each board committee held in FY24.",
+      "language": "en",
+      "kinds": ["bar", "table"],
+      "datasets": [
+        [0, "Corporate governance report"]
+      ],
+      "series": ["Audit Committee", "Nomination and Remuneration Committee", "Stakeholders Relationship Committee", "Corporate Social Responsibility Committee", "Risk Management Committee"],
+      "expected": {
+        "kind": "bar",
+        "acceptable_kinds": ["table"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Corporate governance report",
+          "page": 14
+        },
+        "series": ["Audit Committee", "Nomination and Remuneration Committee", "Stakeholders Relationship Committee", "Corporate Social Responsibility Committee", "Risk Management Committee"],
+        "periods": [],
+        "measure": "Meetings in FY24"
+      },
+      "tags": ["categorical_comparison", "no_company_named", "text_with_numbers"],
+      "notes": "Corporate governance report (p14). The 'Members' column is a distractor; the plotted measure is the 'Meetings in FY24' column, whose cells read '5 meetings', '3 meetings' and so on."
+    },
+    {
+      "id": "v2-en-11",
+      "question": "Give me Zephyra's year at a glance: revenue, EBITDA and profit after tax, and how much each grew.",
+      "language": "en",
+      "kinds": ["kpi", "comparison", "table"],
+      "datasets": [
+        [1, "Zephyra at a glance: FY24"]
+      ],
+      "series": ["Revenue from operations", "EBITDA", "Profit after tax"],
+      "expected": {
+        "kind": "kpi",
+        "acceptable_kinds": ["comparison", "table"],
+        "company": "Zephyra",
+        "document": "zephyra_investor_deck_q4fy24.pptx",
+        "table": {
+          "title": "Zephyra at a glance: FY24",
+          "slide": 3
+        },
+        "series": ["Revenue from operations", "EBITDA", "Profit after tax"],
+        "periods": ["FY24", "FY23"]
+      },
+      "tags": ["kpi_change", "company_named", "lookalike_table_elsewhere"],
+      "notes": "Slide 3 (metric, FY24, FY23, change). Valmora's Financial highlights (p3) has the same rows; the question names Zephyra. The growth figures are the table's own Change column."
+    },
+    {
+      "id": "v2-en-12",
+      "question": "What was Valmora's EBITDA margin in FY24, and how much did it change from FY23? Put it on screen.",
+      "language": "en",
+      "kinds": ["kpi", "comparison"],
+      "datasets": [
+        [0, "Financial highlights"],
+        [0, "Segment results"]
+      ],
+      "series": ["EBITDA margin"],
+      "expected": {
+        "kind": "kpi",
+        "acceptable_kinds": ["comparison"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Financial highlights",
+          "page": 3
+        },
+        "series": ["EBITDA margin"],
+        "periods": ["FY24", "FY23"],
+        "measure": "EBITDA margin and change (+118 bps)",
+        "acceptable_tables": [
+          {
+            "document": "valmora_annual_report_fy24.pdf",
+            "table": {
+              "title": "Segment results",
+              "page": 18
+            },
+            "series": ["EBITDA margin"],
+            "periods": ["FY24", "FY23"]
+          }
+        ]
+      },
+      "tags": ["kpi_change", "company_named", "lookalike_table_elsewhere"],
+      "notes": "Financial highlights (p3) states 21.0% vs 19.8% and +118 bps. The Total row of Segment results (p18) also holds both margins (acceptable). Zephyra's slide 3 has an EBITDA margin row too (12.7%), the wrong company."
+    },
+    {
+      "id": "v2-en-13",
+      "question": "Plot Zephyra's Q4 FY24 results against the same quarter last year and against Q3.",
+      "language": "en",
+      "kinds": ["grouped_bar", "comparison", "bar", "table"],
+      "datasets": [
+        [1, "Q4 FY24 results"]
+      ],
+      "series": ["Revenue from operations", "EBITDA", "Profit after tax"],
+      "expected": {
+        "kind": "grouped_bar",
+        "acceptable_kinds": ["comparison", "bar", "table"],
+        "company": "Zephyra",
+        "document": "zephyra_investor_deck_q4fy24.pptx",
+        "table": {
+          "title": "Q4 FY24 results",
+          "slide": 9
+        },
+        "series": ["Revenue from operations", "EBITDA", "Profit after tax"],
+        "periods": ["Q4 FY24", "Q4 FY23", "Q3 FY24"]
+      },
+      "tags": ["compare_periods", "company_named", "lookalike_table_elsewhere"],
+      "notes": "Slide 9: three period columns (Q4 FY24, Q4 FY23, Q3 FY24) in that order, not chronological. Valmora's quarterly tables (p19-20) are lookalikes. The EBITDA margin row is a ratio and sits badly beside crore amounts."
+    },
+    {
+      "id": "v2-en-14",
+      "question": "Break down Valmora's borrowings by type at the end of FY24 and FY23.",
+      "language": "en",
+      "kinds": ["stacked_bar", "grouped_bar", "bar"],
+      "datasets": [
+        [0, "Note 14: Borrowings"]
+      ],
+      "series": ["Secured term loans from banks", "Non-convertible debentures", "Working capital demand loans", "Commercial paper"],
+      "expected": {
+        "kind": "stacked_bar",
+        "acceptable_kinds": ["grouped_bar", "bar"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Note 14: Borrowings",
+          "page": 26
+        },
+        "series": ["Secured term loans from banks", "Non-convertible debentures", "Working capital demand loans", "Commercial paper"],
+        "periods": ["31 Mar 2024", "31 Mar 2023"],
+        "measure": "Borrowings by instrument"
+      },
+      "tags": ["composition", "company_named", "subtotal_rows"],
+      "notes": "Note 14: Borrowings (p26). The table has subtotals (Non-current borrowings, Short-term borrowings, Total borrowings) that must not be stacked with their parts; commercial paper is '-' in FY24. A 'Terms' text column sits between the instrument and the numbers."
+    },
+    {
+      "id": "v2-en-15",
+      "question": "How much of Zephyra do the promoters hold compared with institutions and the public? Chart it.",
+      "language": "en",
+      "kinds": ["donut", "bar", "stacked_bar"],
+      "datasets": [
+        [1, "Stock information and investor contacts"]
+      ],
+      "series": ["Promoters", "Foreign portfolio investors", "Domestic institutions", "Public"],
+      "expected": {
+        "kind": "donut",
+        "acceptable_kinds": ["bar", "stacked_bar"],
+        "company": "Zephyra",
+        "document": "zephyra_investor_deck_q4fy24.pptx",
+        "table": {
+          "title": "Stock information and investor contacts",
+          "slide": 15
+        },
+        "series": ["Promoters", "Foreign portfolio investors", "Domestic institutions", "Public"],
+        "periods": []
+      },
+      "tags": ["composition", "company_named", "lookalike_table_elsewhere", "mixed_content_table"],
+      "notes": "Slide 15 mixes identifiers (ISIN, CIN, BSE code, NSE symbol, contacts) with four shareholding percentages; only the four percentages are chartable. Valmora's Shareholding pattern (p28) is the lookalike."
+    },
+    {
+      "id": "v2-en-16",
+      "question": "Show me the hotel limits per night by grade, for tier-1 and tier-2 cities.",
+      "language": "en",
+      "kinds": ["grouped_bar", "bar", "table"],
+      "datasets": [
+        [2, "Hotel limits per night"]
+      ],
+      "series": ["L1 to L2", "L3 to L4", "L5 to L7", "Tier-1 city", "Tier-2 city"],
+      "expected": {
+        "kind": "grouped_bar",
+        "acceptable_kinds": ["bar", "table"],
+        "company": "Valmora",
+        "document": "valmora_travel_expense_policy.docx",
+        "table": {
+          "title": "Hotel limits per night",
+          "section": "5.1"
+        },
+        "series": ["L1 to L2", "L3 to L4", "L5 to L7", "Tier-1 city", "Tier-2 city"],
+        "periods": [],
+        "measure": "Hotel limit (INR per night)"
+      },
+      "tags": ["categorical_comparison", "no_company_named", "non_financial_document"],
+      "notes": "The table is in the Travel and Expense Policy DOCX (section 5.1), not a financial statement: three grade bands, two city tiers, amounts in rupees per night."
+    },
+    {
+      "id": "v2-en-17",
+      "question": "Plot Valmora's share price month by month for FY24.",
+      "language": "en",
+      "kinds": [],
+      "datasets": [],
+      "series": [],
+      "expected": {
+        "kind": "none",
+        "acceptable_kinds": [],
+        "company": null,
+        "document": null,
+        "table": null,
+        "series": [],
+        "periods": []
+      },
+      "tags": ["no_table", "company_named"],
+      "notes": "No table holds a share price series. Page 28 states only the FY24 low (Rs 1,226), high (Rs 1,912) and market capitalisation in prose. Expected: no visual."
+    },
+    {
+      "id": "v2-en-18",
+      "question": "Break Zephyra's revenue down by customer industry in a pie chart.",
+      "language": "en",
+      "kinds": [],
+      "datasets": [],
+      "series": [],
+      "expected": {
+        "kind": "none",
+        "acceptable_kinds": [],
+        "company": null,
+        "document": null,
+        "table": null,
+        "series": [],
+        "periods": []
+      },
+      "tags": ["no_table", "company_named", "tempting_lookalike"],
+      "notes": "Zephyra's deck gives revenue by segment (slide 5) but nothing by customer industry; it states only the number of customers (more than 3,400). A segment donut would answer a different question. Expected: no visual."
+    },
+    {
+      "id": "v2-hi-01",
+      "question": "ज़ेफ़ायरा के तीनों बिज़नेस का FY24 बनाम FY23 का रेवेन्यू चार्ट में दिखाओ।",
+      "language": "hi",
+      "query_en": "Show Zephyra's revenue for its three businesses, FY24 versus FY23.",
+      "kinds": ["grouped_bar", "bar"],
+      "datasets": [
+        [1, "Segment overview"]
+      ],
+      "series": ["Freight Services", "Contract Logistics", "Digital Services"],
+      "expected": {
+        "kind": "grouped_bar",
+        "acceptable_kinds": ["bar"],
+        "company": "Zephyra",
+        "document": "zephyra_investor_deck_q4fy24.pptx",
+        "table": {
+          "title": "Segment overview",
+          "slide": 5
+        },
+        "series": ["Freight Services", "Contract Logistics", "Digital Services"],
+        "periods": ["FY24", "FY23"],
+        "measure": "Revenue FY24 and Revenue FY23"
+      },
+      "tags": ["compare_years", "segments", "company_named", "lookalike_table_elsewhere"],
+      "notes": "Segment overview (slide 5): Revenue FY24 and Revenue FY23 columns for the three segment rows; the Total row isn't a segment. Valmora's Segment results (p18) is the lookalike (also has a Digital Services row)."
+    },
+    {
+      "id": "v2-hi-02",
+      "question": "वालमोरा की बैलेंस शीट में इक्विटी और देनदारियाँ किन-किन हिस्सों से बनी हैं, चार्ट बनाकर दिखाओ।",
+      "language": "hi",
+      "query_en": "Show what Valmora's equity and liabilities on the balance sheet are made up of.",
+      "kinds": ["stacked_bar", "donut", "bar", "grouped_bar"],
+      "datasets": [
+        [0, "equity and liabilities"]
+      ],
+      "series": ["Other equity", "Borrowings", "Trade payables", "Other current liabilities"],
+      "expected": {
+        "kind": "stacked_bar",
+        "acceptable_kinds": ["donut", "bar", "grouped_bar"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Consolidated balance sheet as at 31 March 2024: equity and liabilities",
+          "page": 24
+        },
+        "series": ["Other equity", "Borrowings", "Trade payables", "Other current liabilities"],
+        "periods": ["31 Mar 2024", "31 Mar 2023"],
+        "measure": "Equity and liabilities lines"
+      },
+      "tags": ["composition", "company_named", "subtotal_rows"],
+      "notes": "The equity and liabilities side is its own table on p24 (the assets side is p23). Subtotals (Total equity, Total non-current liabilities, Total current liabilities, Total equity and liabilities) must not be plotted beside their parts."
+    },
+    {
+      "id": "v2-hi-03",
+      "question": "वालमोरा में प्रमोटरों, एफ़पीआई और म्यूचुअल फ़ंड्स की कितनी-कितनी हिस्सेदारी है? चार्ट में दिखाओ।",
+      "language": "hi",
+      "query_en": "Show Valmora's shareholding split among promoters, FPIs and mutual funds.",
+      "kinds": ["donut", "bar", "stacked_bar"],
+      "datasets": [
+        [0, "Shareholding pattern"]
+      ],
+      "series": ["Promoters and promoter group", "Foreign portfolio investors", "Mutual funds and financial institutions", "Public and others"],
+      "expected": {
+        "kind": "donut",
+        "acceptable_kinds": ["bar", "stacked_bar"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Shareholding pattern at 31 March 2024",
+          "page": 28
+        },
+        "series": ["Promoters and promoter group", "Foreign portfolio investors", "Mutual funds and financial institutions", "Public and others"],
+        "periods": ["31 March 2024"],
+        "measure": "Share of equity capital"
+      },
+      "tags": ["composition", "company_named", "lookalike_table_elsewhere"],
+      "notes": "Shareholding pattern at 31 March 2024 (p28), a small table on the same page as the dividend table. Zephyra's shareholding rows (slide 15) are the lookalike."
+    },
+    {
+      "id": "v2-hi-04",
+      "question": "योजना के हर कोर्स में कितनी सीटें हैं, बार चार्ट बनाकर दिखाओ।",
+      "language": "hi",
+      "query_en": "Show the number of seats in each course of the scheme as a bar chart.",
+      "kinds": ["bar", "donut", "table"],
+      "datasets": [
+        [3, "पाठ्यक्रम और सीटें"]
+      ],
+      "series": ["सोलर पैनल तकनीशियन", "घरेलू इलेक्ट्रिशियन", "सिलाई एवं परिधान निर्माण", "खाद्य प्रसंस्करण सहायक", "मोबाइल रिपेयरिंग तकनीशियन", "कृषि ड्रोन ऑपरेटर", "पशुपालन एवं डेयरी सहायक"],
+      "expected": {
+        "kind": "bar",
+        "acceptable_kinds": ["donut", "table"],
+        "company": "neither",
+        "document": "suryodaya_yojana_soochna.docx",
+        "table": {
+          "title": "पाठ्यक्रम और सीटें",
+          "section": "7"
+        },
+        "series": ["सोलर पैनल तकनीशियन", "घरेलू इलेक्ट्रिशियन", "सिलाई एवं परिधान निर्माण", "खाद्य प्रसंस्करण सहायक", "मोबाइल रिपेयरिंग तकनीशियन", "कृषि ड्रोन ऑपरेटर", "पशुपालन एवं डेयरी सहायक"],
+        "periods": [],
+        "measure": "सीटें"
+      },
+      "tags": ["categorical_comparison", "no_company_named", "hindi_document"],
+      "notes": "Section 7 of the Hindi notice (courses and seats). The 'कुल' (total) row has 18,000 seats and must not be a bar; the duration column (weeks) is in another unit."
+    },
+    {
+      "id": "v2-hi-05",
+      "question": "किस ज़िले को सबसे ज़्यादा बजट मिला है? सारे ज़िलों की तुलना दिखाओ।",
+      "language": "hi",
+      "query_en": "Which district got the largest budget? Show a comparison of all districts.",
+      "kinds": ["bar", "table"],
+      "datasets": [
+        [3, "जिलेवार लक्ष्य एवं बजट"]
+      ],
+      "series": ["कमलपुर", "हरिपुर", "सूर्यगढ़", "नर्मदापुर", "देवगढ़", "रामनगर", "गंगापुर", "शिवपुर"],
+      "expected": {
+        "kind": "bar",
+        "acceptable_kinds": ["table"],
+        "company": "neither",
+        "document": "suryodaya_yojana_soochna.docx",
+        "table": {
+          "title": "जिलेवार लक्ष्य एवं बजट",
+          "section": "8"
+        },
+        "series": ["कमलपुर", "हरिपुर", "सूर्यगढ़", "नर्मदापुर", "देवगढ़", "रामनगर", "गंगापुर", "शिवपुर"],
+        "periods": [],
+        "measure": "आवंटित बजट (₹ लाख)"
+      },
+      "tags": ["categorical_comparison", "no_company_named", "hindi_document", "implied_request"],
+      "notes": "Section 8 of the Hindi notice: eight districts with training centres, target youth and allocated budget (Rs lakh). The plotted measure is the budget column; the कुल row is a total."
+    },
+    {
+      "id": "v2-hi-06",
+      "question": "आवेदन की तारीख़ें और प्रशिक्षण कब शुरू होगा, इसे टाइमलाइन में दिखाओ।",
+      "language": "hi",
+      "query_en": "Show the application dates and when training starts, as a timeline.",
+      "kinds": ["timeline", "table"],
+      "datasets": [
+        [3, "महत्वपूर्ण तिथियाँ"]
+      ],
+      "series": ["ऑनलाइन आवेदन प्रारंभ", "आवेदन की अंतिम तिथि", "दस्तावेज़ सत्यापन", "चयन सूची का प्रकाशन", "प्रशिक्षण का प्रारंभ"],
+      "expected": {
+        "kind": "timeline",
+        "acceptable_kinds": ["table"],
+        "company": "neither",
+        "document": "suryodaya_yojana_soochna.docx",
+        "table": {
+          "title": "महत्वपूर्ण तिथियाँ",
+          "section": "5"
+        },
+        "series": ["ऑनलाइन आवेदन प्रारंभ", "आवेदन की अंतिम तिथि", "दस्तावेज़ सत्यापन", "चयन सूची का प्रकाशन", "प्रशिक्षण का प्रारंभ"],
+        "periods": ["20 सितंबर 2024", "30 नवंबर 2024", "1 से 10 दिसंबर 2024", "15 दिसंबर 2024", "6 जनवरी 2025"]
+      },
+      "tags": ["timeline", "no_company_named", "hindi_document"],
+      "notes": "Section 5 of the Hindi notice (important dates): activity and date in Devanagari. One date is a range ('1 से 10 दिसंबर 2024')."
+    },
+    {
+      "id": "v2-hi-07",
+      "question": "ज़ेफ़ायरा का FY24 का लाभ-हानि का ब्योरा एक टेबल में दिखाओ।",
+      "language": "hi",
+      "query_en": "Show Zephyra's FY24 profit and loss in a table.",
+      "kinds": ["table", "waterfall"],
+      "datasets": [
+        [1, "FY24 profit and loss summary"]
+      ],
+      "series": ["Revenue from operations", "EBITDA", "Other income", "Depreciation and amortisation", "Finance costs", "Profit before tax", "Tax expense", "Profit after tax"],
+      "expected": {
+        "kind": "table",
+        "acceptable_kinds": ["waterfall"],
+        "company": "Zephyra",
+        "document": "zephyra_investor_deck_q4fy24.pptx",
+        "table": {
+          "title": "FY24 profit and loss summary",
+          "slide": 10
+        },
+        "series": ["Revenue from operations", "EBITDA", "Other income", "Depreciation and amortisation", "Finance costs", "Profit before tax", "Tax expense", "Profit after tax"],
+        "periods": ["FY24", "FY23"]
+      },
+      "tags": ["exact_figures", "company_named", "lookalike_table_elsewhere"],
+      "notes": "Slide 10, FY24 profit and loss summary. The user asks for exact figures in a table; a waterfall of the same rows is the acceptable alternative. Valmora's P&L (p21-22) is the lookalike."
+    },
+    {
+      "id": "v2-hi-08",
+      "question": "वालमोरा के कर्मचारियों की संख्या और अट्रिशन रेट FY23 से FY24 में कितनी बदली, दिखाओ।",
+      "language": "hi",
+      "query_en": "Show how Valmora's number of employees and attrition rate changed from FY23 to FY24.",
+      "kinds": ["comparison", "kpi", "table"],
+      "datasets": [
+        [0, "People and culture"]
+      ],
+      "series": ["Total employees", "Voluntary attrition rate"],
+      "expected": {
+        "kind": "comparison",
+        "acceptable_kinds": ["kpi", "table"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "People and culture",
+          "page": 12
+        },
+        "series": ["Total employees", "Voluntary attrition rate"],
+        "periods": ["FY24", "FY23"]
+      },
+      "tags": ["kpi_change", "company_named", "lookalike_table_elsewhere", "mixed_units"],
+      "notes": "People and culture (p12) is the only table with the attrition rate; it also holds total employees (the Financial highlights on p3 has the head count but not attrition). A count and a percentage don't share an axis, so tiles or a comparison card suit better than one bar chart. Zephyra's slide 3 also has employees."
+    },
+    {
+      "id": "v2-hi-09",
+      "question": "वालमोरा के कर्मचारियों की संख्या हर बिज़नेस के हिसाब से चार्ट में दिखाओ।",
+      "language": "hi",
+      "query_en": "Show Valmora's employee count by business as a chart.",
+      "kinds": [],
+      "datasets": [],
+      "series": [],
+      "expected": {
+        "kind": "none",
+        "acceptable_kinds": [],
+        "company": null,
+        "document": null,
+        "table": null,
+        "series": [],
+        "periods": []
+      },
+      "tags": ["no_table", "company_named", "tempting_lookalike"],
+      "notes": "No table splits Valmora's head count by business. Only Digital Services' headcount appears, in prose (p9: 3,950 against 3,410); the people tables (p3, p12) give group totals only. Expected: no visual."
+    },
+    {
+      "id": "v2-hg-01",
+      "question": "Valmora ke teeno segments ka EBITDA margin FY24 mein kaisa raha? Compare karke dikhao.",
+      "language": "hinglish",
+      "query_en": "Compare the EBITDA margin of Valmora's three segments in FY24.",
+      "kinds": ["bar", "grouped_bar"],
+      "datasets": [
+        [0, "Segment results"]
+      ],
+      "series": ["Specialty Chemicals", "Engineered Plastics", "Digital Services"],
+      "expected": {
+        "kind": "bar",
+        "acceptable_kinds": ["grouped_bar"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Segment results",
+          "page": 18
+        },
+        "series": ["Specialty Chemicals", "Engineered Plastics", "Digital Services"],
+        "periods": ["FY24"],
+        "measure": "EBITDA margin FY24"
+      },
+      "tags": ["segments", "company_named", "lookalike_table_elsewhere"],
+      "notes": "Segment results (p18), the EBITDA margin FY24 column (FY23 alongside is fine, then grouped). Zephyra's Segment overview (slide 5) has margins too; the question names Valmora."
+    },
+    {
+      "id": "v2-hg-02",
+      "question": "Valmora ka FY24 ka revenue se profit tak ka bridge dikhao.",
+      "language": "hinglish",
+      "query_en": "Show the bridge from Valmora's FY24 revenue to profit.",
+      "kinds": ["waterfall", "bar"],
+      "datasets": [
+        [0, "statement of profit and loss"]
+      ],
+      "series": ["Revenue from operations", "Other income", "Cost of materials consumed", "Employee benefits expense", "Other expenses", "Depreciation and amortisation expense", "Finance costs", "Profit before tax", "Current tax", "Deferred tax", "Profit for the year"],
+      "expected": {
+        "kind": "waterfall",
+        "acceptable_kinds": ["bar"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Consolidated statement of profit and loss for the year ended 31 March 2024 (part 1)",
+          "page": 21
+        },
+        "series": ["Revenue from operations", "Other income", "Cost of materials consumed", "Employee benefits expense", "Other expenses"],
+        "periods": ["FY24"],
+        "acceptable_tables": [
+          {
+            "document": "valmora_annual_report_fy24.pdf",
+            "table": {
+              "title": "Consolidated statement of profit and loss (part 2, continued)",
+              "page": 22
+            },
+            "series": ["Depreciation and amortisation expense", "Finance costs", "Profit before tax", "Current tax", "Deferred tax", "Profit for the year"],
+            "periods": ["FY24"]
+          }
+        ]
+      },
+      "tags": ["bridge", "company_named", "lookalike_table_elsewhere", "multi_table"],
+      "notes": "Valmora's statement of profit and loss is split over p21 (revenue, other income, cost lines) and p22 (D&A, finance costs, PBT, tax, profit): no single table runs from revenue to profit, so either part is accepted and the two together are best. Zephyra's slide 10 is a single-table lookalike but is the wrong company. Subtotal rows (Total income, Total expenses) must not be bars."
+    },
+    {
+      "id": "v2-hg-03",
+      "question": "Valmora ke FY23 ke har quarter ka profit kaisa raha? Chart mein dikhao.",
+      "language": "hinglish",
+      "query_en": "Show Valmora's profit after tax for each quarter of FY23.",
+      "kinds": ["line", "bar"],
+      "datasets": [
+        [0, "Quarterly performance: FY23"]
+      ],
+      "series": ["Profit after tax"],
+      "expected": {
+        "kind": "line",
+        "acceptable_kinds": ["bar"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Quarterly performance: FY23 (comparative year)",
+          "page": 20
+        },
+        "series": ["Profit after tax"],
+        "periods": ["Q1 FY23", "Q2 FY23", "Q3 FY23", "Q4 FY23"],
+        "measure": "Profit after tax"
+      },
+      "tags": ["trend", "company_named", "wrong_year_trap"],
+      "notes": "The FY23 comparative-year quarterly table (p20); the FY24 quarterly table (p19) is the wrong-year trap. 'Full year FY23' is a total row."
+    },
+    {
+      "id": "v2-hg-04",
+      "question": "Zephyra ke teeno businesses ka FY24 ka revenue share pie chart mein dikhao.",
+      "language": "hinglish",
+      "query_en": "Show each of Zephyra's three businesses' share of FY24 revenue as a pie chart.",
+      "kinds": ["donut", "bar", "stacked_bar"],
+      "datasets": [
+        [1, "Segment overview"]
+      ],
+      "series": ["Freight Services", "Contract Logistics", "Digital Services"],
+      "expected": {
+        "kind": "donut",
+        "acceptable_kinds": ["bar", "stacked_bar"],
+        "company": "Zephyra",
+        "document": "zephyra_investor_deck_q4fy24.pptx",
+        "table": {
+          "title": "Segment overview",
+          "slide": 5
+        },
+        "series": ["Freight Services", "Contract Logistics", "Digital Services"],
+        "periods": ["FY24"],
+        "measure": "Revenue FY24 (share of total)"
+      },
+      "tags": ["composition", "segments", "company_named", "lookalike_table_elsewhere"],
+      "notes": "Segment overview (slide 5): the shares come from the Revenue FY24 column (the Total row is the whole, not a slice). Valmora's Business overview (p6) gives shares directly but is the wrong company."
+    },
+    {
+      "id": "v2-hg-05",
+      "question": "Zephyra ke employees ki sankhya FY23 se FY24 mein kitni badhi?",
+      "language": "hinglish",
+      "query_en": "How much did the number of Zephyra's employees grow from FY23 to FY24?",
+      "kinds": ["kpi", "comparison"],
+      "datasets": [
+        [1, "Zephyra at a glance: FY24"]
+      ],
+      "series": ["Number of employees"],
+      "expected": {
+        "kind": "kpi",
+        "acceptable_kinds": ["comparison"],
+        "company": "Zephyra",
+        "document": "zephyra_investor_deck_q4fy24.pptx",
+        "table": {
+          "title": "Zephyra at a glance: FY24",
+          "slide": 3
+        },
+        "series": ["Number of employees"],
+        "periods": ["FY24", "FY23"],
+        "measure": "Number of employees and change (+4.9%)"
+      },
+      "tags": ["kpi_change", "company_named", "lookalike_table_elsewhere", "implied_request"],
+      "notes": "Slide 3 states 14,120 vs 13,460 (+4.9%). Valmora's tables (p3 and p12) have employees too: wrong company. Slide 13 repeats 14,120 in a bullet, which is not a table."
+    },
+    {
+      "id": "v2-hg-06",
+      "question": "Valmora ki contingent liabilities FY23 aur FY24 mein matter ke hisaab se dikhao.",
+      "language": "hinglish",
+      "query_en": "Show Valmora's contingent liabilities by matter for FY23 and FY24.",
+      "kinds": ["grouped_bar", "bar", "table"],
+      "datasets": [
+        [0, "Note 31: Contingent liabilities"]
+      ],
+      "series": ["Disputed excise duty and GST demands", "Disputed income tax demands", "Claims by customers not acknowledged as debt"],
+      "expected": {
+        "kind": "grouped_bar",
+        "acceptable_kinds": ["bar", "table"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Note 31: Contingent liabilities",
+          "page": 27
+        },
+        "series": ["Disputed excise duty and GST demands", "Disputed income tax demands", "Claims by customers not acknowledged as debt"],
+        "periods": ["31 Mar 2024", "31 Mar 2023"],
+        "measure": "Contingent liabilities (Rs crore)"
+      },
+      "tags": ["compare_years", "company_named"],
+      "notes": "Note 31 (p27), a small three-row table at the top of the page; the periods are the year-end dates 31 Mar 2024 and 31 Mar 2023. The page also holds unrelated prose notes."
+    },
+    {
+      "id": "v2-hg-07",
+      "question": "Valmora ka dividend per share FY23 vs FY24 chart mein dikhao.",
+      "language": "hinglish",
+      "query_en": "Show Valmora's dividend per share for FY23 versus FY24 as a chart.",
+      "kinds": ["bar", "grouped_bar", "comparison", "kpi", "table"],
+      "datasets": [
+        [0, "Dividend"],
+        [0, "Financial highlights"]
+      ],
+      "series": ["Dividend per share"],
+      "expected": {
+        "kind": "bar",
+        "acceptable_kinds": ["grouped_bar", "comparison", "kpi", "table"],
+        "company": "Valmora",
+        "document": "valmora_annual_report_fy24.pdf",
+        "table": {
+          "title": "Dividend",
+          "page": 28
+        },
+        "series": ["Dividend per share"],
+        "periods": ["FY24 (recommended)", "FY23 (paid in FY24)"],
+        "measure": "Dividend per share (Rs)",
+        "acceptable_tables": [
+          {
+            "document": "valmora_annual_report_fy24.pdf",
+            "table": {
+              "title": "Financial highlights",
+              "page": 3
+            },
+            "series": ["Dividend per share"],
+            "periods": ["FY24", "FY23"]
+          }
+        ]
+      },
+      "tags": ["compare_years", "company_named", "periods_as_rows"],
+      "notes": "The dividend table (p28) has the years as rows ('FY24 (recommended)', 'FY23 (paid in FY24)') and the metrics as columns (dividend per share, rate, total outflow, payout ratio): the opposite orientation to most tables. The columns are in different units; the question is about dividend per share only. The Financial highlights (p3) also hold Dividend per share for both years (acceptable)."
+    },
+    {
+      "id": "v2-hg-08",
+      "question": "Zephyra ki on-time delivery rate pichle saal se behtar hui? Dikhao.",
+      "language": "hinglish",
+      "query_en": "Did Zephyra's on-time delivery rate improve on last year? Show it.",
+      "kinds": ["kpi", "comparison", "bar"],
+      "datasets": [
+        [1, "Network and fleet"]
+      ],
+      "series": ["On-time delivery rate"],
+      "expected": {
+        "kind": "kpi",
+        "acceptable_kinds": ["comparison", "bar"],
+        "company": "Zephyra",
+        "document": "zephyra_investor_deck_q4fy24.pptx",
+        "table": {
+          "title": "Network and fleet",
+          "slide": 12
+        },
+        "series": ["On-time delivery rate"],
+        "periods": ["FY24", "FY23"],
+        "measure": "On-time delivery rate (96.4% vs 94.8%)"
+      },
+      "tags": ["kpi_change", "company_named", "implied_request"],
+      "notes": "Network and fleet (slide 12), a single percentage with a prior-year value. Valmora's annual report has no delivery-rate table (OTIF is only defined in the glossary)."
+    },
+    {
+      "id": "v2-hg-09",
+      "question": "Zephyra ke har warehouse ki capacity ka bar chart dikhao.",
+      "language": "hinglish",
+      "query_en": "Show a bar chart of the capacity of each of Zephyra's warehouses.",
+      "kinds": [],
+      "datasets": [],
+      "series": [],
+      "expected": {
+        "kind": "none",
+        "acceptable_kinds": [],
+        "company": null,
+        "document": null,
+        "table": null,
+        "series": [],
+        "periods": []
+      },
+      "tags": ["no_table", "company_named", "tempting_lookalike"],
+      "notes": "Slide 12 gives only network totals (112 warehouses, 18.6 million sq ft in total, FY23: 103 and 16.9); nothing per warehouse. A bar of FY23 vs FY24 totals would not answer the question. Expected: no visual."
+    }
+  ]
+}

@@ -5,6 +5,9 @@ Measuring the document agent against known answers. Today this is the **retrieva
 ```text
 evals/
 ├── README.md                      this file
+├── canvas/
+│   └── README.md                  the blind hold-out set v2 for the chart planner (the set itself:
+│                                  backend/tests/integration/canvas_planner_holdout_v2.json)
 └── retrieval/
     ├── manifest.json              every planted fact: document, real pages, evidence strings  (committed, text)
     └── questions.jsonl            194 questions with expected documents and pages              (committed)
