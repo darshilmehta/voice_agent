@@ -118,7 +118,7 @@ def test_canvas_section(load_local):
     s = load_local()
     c = s.canvas
     assert (c.planner_timeout_ms, c.planner_max_tokens, c.planner_candidates, c.max_panels, c.overview_panels) == (
-        6000,
+        8000,
         200,
         4,
         12,

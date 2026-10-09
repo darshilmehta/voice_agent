@@ -9,11 +9,15 @@ from pydantic import ValidationError
 from app.providers.llm import LLMError
 from app.services.canvas.planner import (
     VisualPlanner,
+    bridges,
     build_catalog,
+    builds,
+    first_valid,
     planner_messages,
     planner_schema,
     rank_candidates,
     to_spec,
+    transposed,
     variants,
     visual_intent,
 )
@@ -138,6 +142,74 @@ def test_variants_fall_back_to_compatible_kinds():
     spec = VisualSpec(kind="line", datasets=["ds_segments"], series=["ds_segments:revenue_fy24"])
     kinds = [v.kind for v in variants(spec)]
     assert kinds[:3] == ["line", "line", "line"] and "bar" in kinds
+
+
+BY_ID = {d.id: d for d in POOL}
+SEG = "ds_segments"
+
+
+def test_rows_chosen_as_a_donuts_series_become_its_slices():
+    # what qwen3:4b does: the slices as "series"
+    spec = VisualSpec(
+        kind="donut", datasets=[SEG], series=[f"{SEG}:specialty_chemicals", f"{SEG}:digital_services"], periods=["FY24"]
+    )
+    flipped = transposed(spec, BY_ID)
+    assert flipped is not None
+    assert (flipped.series, flipped.categories) == (
+        [f"{SEG}:revenue_fy24"],
+        [f"{SEG}:specialty_chemicals", f"{SEG}:digital_services"],
+    )
+    assert first_valid(spec, BY_ID, builds(BY_ID)) == flipped
+    no_period = spec.model_copy(update={"periods": []})
+    assert transposed(no_period, BY_ID).series == [f"{SEG}:revenue_fy24"]  # type: ignore[union-attr]  # the latest
+
+
+def test_a_waterfall_that_doesnt_add_up_becomes_one_that_does():
+    cf = "ds_cash_flow"
+    rows = [
+        "net_cash_generated_from_operating_activities",
+        "net_cash_used_in_investing_activities",
+        "net_cash_used_in_financing_activities",
+        "net_increase_in_cash_and_cash_equivalents",
+        "cash_and_cash_equivalents_at_the_beginning_of",
+    ]
+    spec = VisualSpec(kind="waterfall", datasets=[cf], series=[f"{cf}:{r}" for r in rows], periods=["FY24"])
+    valid = first_valid(spec, BY_ID, builds(BY_ID))
+    assert valid is not None and valid.kind == "waterfall" and valid.series == [f"{cf}:fy24"]
+    assert valid.categories == [f"{cf}:{r}" for r in rows[:4]]  # the flows, then the total they add up to
+    assert bridges(valid, BY_ID)[0].categories == valid.categories
+
+
+def test_choices_lose_what_the_table_doesnt_have():
+    cat = build_catalog([DS["segments"], DS["q_fy24"]], NAMES, "en")
+    spec = to_spec(
+        {"kind": "bar", "datasets": ["D1"], "series": ["D1 · Revenue FY24"], "periods": ["Q3 FY24", "FY24"]}, cat, "en"
+    )
+    assert spec is not None and spec.periods == ["FY24"]  # Q3 FY24 is another table's period
+    from .canvas_helpers import DATES_HI, typed
+
+    dates = typed(DATES_HI, dataset_id="ds_dates")
+    cat = build_catalog([dates], NAMES, "hi")
+    spec = to_spec({"kind": "timeline", "datasets": ["D1"], "series": list(cat.series)[:2]}, cat, "hi")
+    assert spec is not None and spec.series == [] and spec.datasets == ["ds_dates"]
+
+
+def test_a_column_mixing_units_is_charted_in_its_main_unit():
+    from .canvas_helpers import typed
+
+    plants = typed(
+        [
+            ["Facility", "Installed capacity"],
+            ["Dahej Complex", "2,10,000 tpa"],
+            ["Vapi Unit I", "90,000 tpa"],
+            ["Bengaluru Centre", "1,300 seats"],
+        ],
+        dataset_id="ds_plants",
+    )
+    pool = {"ds_plants": plants}
+    spec = VisualSpec(kind="bar", datasets=["ds_plants"], series=["ds_plants:installed_capacity"])
+    valid = first_valid(spec, pool, builds(pool))
+    assert valid is not None and valid.categories == ["ds_plants:dahej_complex", "ds_plants:vapi_unit_i"]
 
 
 # ------------------------------------------------------------------ planning with the model

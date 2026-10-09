@@ -176,7 +176,7 @@
   "strict_offline_local_hosts": ["qdrant", "host.docker.internal"],
 
   "canvas": {
-    "planner_timeout_ms": 6000,
+    "planner_timeout_ms": 8000,
     "planner_max_tokens": 200,
     "planner_candidates": 4,
     "max_panels": 12,

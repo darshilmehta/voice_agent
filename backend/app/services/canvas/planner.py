@@ -21,8 +21,10 @@ import asyncio
 import logging
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, create_model
@@ -30,10 +32,11 @@ from pydantic import BaseModel, ConfigDict, Field, create_model
 from ...domain.canvas import VISUAL_KINDS
 from ...domain.datasets import TypedDataset
 from ...providers.llm import LLMClient, LLMError, LLMMessage
+from .builder import build_visual
 from .chartability import series_columns
 from .overview import composition_spec, kpi_spec, trend_spec
 from .parsing import localized_label
-from .spec import MAX_CALCULATIONS, CalcRequest, SpecError, VisualSpec, ref, resolve, row_display
+from .spec import MAX_CALCULATIONS, CalcRequest, SpecError, VisualSpec, ref, resolve, row_display, split_ref
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +85,7 @@ _STOP = frozenset(
         r"\s+",
         "the a an of in on for to and or is was were what how show me please chart graph plot with by from at as it "
         "this that which compare between vs over did has have do does give tell can you their its our ka ki ke ko "
-        "aur hai dikhao dikhaiye का की के को और है दिखाओ",
+        "aur hai dikhao dikhaiye karo end against last year years at its whole का की के को और है दिखाओ",
     )
 )
 # Words that say which shape of table the question wants (English, Hindi, Hinglish).
@@ -144,7 +147,7 @@ def rank_candidates(
         title_hit = len(words & _words(ds.title))
         shape = sum(1.5 for pattern, fits in _WANTS if pattern.search(text) and fits(ds))
         boost = 3 if ds.chunk_id and ds.chunk_id in source_chunks else 0
-        score = overlap + title_hit + shape + boost + ds.chartability.confidence
+        score = overlap + 2 * title_hit + shape + boost + ds.chartability.confidence  # the title says most
         scored.append((score, -(ds.page_start or 0), ds))
     scored.sort(key=lambda t: (-t[0], -t[1]))
     return [ds for _, _, ds in scored[:limit]]
@@ -253,7 +256,8 @@ def planner_schema(cat: Catalog) -> type[BaseModel]:
 
 
 SYSTEM_PROMPT = """You pick ONE chart for the user's question from the tables listed. You never write numbers: code \
-fills them in from the tables. Answer with JSON only.
+fills them in from the tables. Answer with JSON only, on one line, without line breaks or indentation; leave out \
+empty lists.
 
 Kinds:
 - line: a trend over 3 or more periods
@@ -272,6 +276,8 @@ Rules:
 - "datasets": the tables you use (usually one).
 - "series": what is plotted. grouped_bar, stacked_bar, donut and waterfall need series in one unit.
 - For periods running across a table's columns, the series are its rows; for periods down its rows, its columns.
+- donut and waterfall plot ONE series (a column such as "Revenue FY24"); the slices or steps are "categories".
+- To compare two companies or documents, take the same row from each table (e.g. "D1 · Revenue" and "D3 · Revenue").
 - "periods": only the periods the user asked about (empty = all).
 - "categories": only the rows or columns to show (empty = all).
 - "highlight": the period or category the question is about, if any.
@@ -304,7 +310,9 @@ class PlanResult:
 
 
 def to_spec(choice: Mapping[str, Any], cat: Catalog, language: str) -> VisualSpec | None:
-    """The model's choice in VisualSpec form (labels → refs). None for kind "none"."""
+    """The model's choice in VisualSpec form (labels → refs). None for kind "none". Periods the chosen tables don't
+    have are dropped (the model fills the filter in for a table without periods); a timeline takes its dates from the
+    table's date column, so rows chosen as its series are let go."""
     if choice.get("kind") == "none":
         return None
     series = [cat.series[s] for s in dict.fromkeys(choice.get("series") or []) if s in cat.series]
@@ -315,6 +323,14 @@ def to_spec(choice: Mapping[str, Any], cat: Catalog, language: str) -> VisualSpe
             datasets.append(dataset_id)
     if not datasets:
         return None
+    by_id = {ds.id: ds for ds in cat.aliases.values()}
+    available = {
+        p.label
+        for d in datasets
+        if d in by_id
+        for p in [*(c.period for c in by_id[d].columns), *(r.period for r in by_id[d].rows)]
+        if p is not None
+    }
     categories = [cat.categories[c] for c in choice.get("categories") or [] if c in cat.categories]
     categories = [c for c in categories if c.split(":", 1)[0] in datasets]
     highlight = []
@@ -328,11 +344,12 @@ def to_spec(choice: Mapping[str, Any], cat: Catalog, language: str) -> VisualSpe
         for c in choice.get("calculations") or []
         if c.get("series") in cat.series and cat.series[c["series"]] in series
     ][:MAX_CALCULATIONS]
+    kind = choice["kind"]
     return VisualSpec(
-        kind=choice["kind"],
+        kind=kind,
         datasets=datasets[:3],
-        series=series,
-        periods=list(dict.fromkeys(choice.get("periods") or [])),
+        series=[] if kind == "timeline" else series,
+        periods=[p for p in dict.fromkeys(choice.get("periods") or []) if p in available],
         categories=categories,
         highlight=highlight[:3],
         calculations=calcs,
@@ -349,47 +366,199 @@ _KIND_FALLBACK = {
     "waterfall": "bar",
     "comparison": "bar",
 }
+# Kinds that show one series over categories: rows chosen as their "series" are the categories.
+_ONE_SERIES = frozenset({"donut", "waterfall"})
 
 
-def variants(spec: VisualSpec) -> list[VisualSpec]:
-    """Simpler forms of the same choice, tried in order when the spec doesn't resolve."""
+def _rows_of_one_dataset(
+    spec: VisualSpec, datasets: Mapping[str, TypedDataset]
+) -> tuple[TypedDataset, list[str]] | None:
+    refs = [split_ref(s) for s in spec.series]
+    if len(refs) < 2 or len({d for d, _ in refs}) != 1:
+        return None
+    ds = datasets.get(refs[0][0])
+    if ds is None:
+        return None
+    keys = [k for _, k in refs if (r := ds.row(k)) is not None and r.type != "section"]
+    return (ds, keys) if len(keys) == len(refs) else None
+
+
+def _measure_column(ds: TypedDataset, periods: Sequence[str]) -> str | None:
+    """The column a transposed spec runs down: the asked period's (or the latest) column of the first measure."""
+    cols = series_columns(ds)
+    if periods:
+        cols = [c for c in cols if c.period is not None and c.period.label in periods] or cols
+    measures = list(dict.fromkeys(c.measure for c in cols if c.measure))
+    if measures:
+        cols = [c for c in cols if c.measure == measures[0]]
+    if not cols:
+        return None
+    return max(cols, key=lambda c: c.period.sort_key if c.period else (0, 0)).key
+
+
+def transposed(spec: VisualSpec, datasets: Mapping[str, TypedDataset]) -> VisualSpec | None:
+    """Several rows of one table chosen as "series" (segments for a donut, cash flows for a waterfall) read as the
+    categories of one measured column: the period asked for, else the latest."""
+    found = _rows_of_one_dataset(spec, datasets)
+    if found is None:
+        return None
+    ds, rows = found
+    col = _measure_column(ds, spec.periods)
+    if col is None:
+        return None
+    return spec.model_copy(
+        update={
+            "datasets": [ds.id],
+            "series": [ref(ds.id, col)],
+            "categories": [ref(ds.id, k) for k in rows],
+            "periods": [],
+            "highlight": [],
+            "calculations": [],
+        }
+    )
+
+
+def bridges(spec: VisualSpec, datasets: Mapping[str, TypedDataset]) -> list[VisualSpec]:
+    """Waterfalls that add up: each checked total of the table with its parts before it (the cash flows before
+    "Net increase in cash"), those whose parts the model chose first."""
+    if spec.kind != "waterfall" or not spec.datasets or spec.datasets[0] not in datasets:
+        return []
+    ds = datasets[spec.datasets[0]]
+    chosen = {split_ref(r)[1] for r in [*spec.series, *spec.categories] if r.startswith(ds.id + ":")}
+    col = next(
+        (split_ref(s)[1] for s in spec.series if (c := ds.column(split_ref(s)[1])) is not None and c.period), None
+    )
+    col = col or _measure_column(ds, spec.periods)
+    if col is None:
+        return []
+    totals = [r for r in ds.rows if r.type == "total" and len(r.parts) >= 2 and r.period is None]
+    totals.sort(key=lambda r: -len(chosen & {*r.parts, r.key}))
+    return [
+        VisualSpec(
+            kind="waterfall",
+            datasets=[ds.id],
+            series=[ref(ds.id, col)],
+            categories=[ref(ds.id, k) for k in [*t.parts, t.key]],
+            title=spec.title,
+            language=spec.language,
+        )
+        for t in totals
+    ]
+
+
+def variants(spec: VisualSpec, datasets: Mapping[str, TypedDataset] | None = None) -> list[VisualSpec]:
+    """The spec, then forms of the same choice the model may have meant, tried in order when it doesn't build: its
+    rows as categories (``transposed``), waterfalls that add up (``bridges``), no highlight or calculations, no
+    filters, a compatible kind, its first series alone."""
+    datasets = datasets or {}
     out = [spec]
+    flipped = transposed(spec, datasets)
+    if flipped is not None and spec.kind in _ONE_SERIES:
+        out.append(flipped)
+    out += bridges(flipped or spec, datasets)
     plain = spec.model_copy(update={"highlight": [], "calculations": []})
     out.append(plain)
     out.append(plain.model_copy(update={"periods": [], "categories": []}))
+    if flipped is not None and spec.kind not in _ONE_SERIES:
+        out.append(flipped)
     kind = spec.kind
     while kind in _KIND_FALLBACK:
         kind = _KIND_FALLBACK[kind]  # type: ignore[assignment]
         out.append(plain.model_copy(update={"kind": kind}))
         out.append(plain.model_copy(update={"kind": kind, "periods": [], "categories": []}))
+        if flipped is not None:
+            out.append(flipped.model_copy(update={"kind": kind}))
     if len(spec.series) > 1:
         out.append(plain.model_copy(update={"series": spec.series[:1]}))
     return out
 
 
-def first_valid(spec: VisualSpec, datasets: Mapping[str, TypedDataset]) -> VisualSpec | None:
-    for candidate in variants(spec):
+def _single_unit_categories(spec: VisualSpec, datasets: Mapping[str, TypedDataset]) -> VisualSpec | None:
+    """A column mixing units ("tpa" for plants, "seats" for offices) charted over the rows in its main unit."""
+    if len(spec.series) != 1:
+        return None
+    dataset_id, key = split_ref(spec.series[0])
+    ds = datasets.get(dataset_id)
+    if ds is None or ds.column(key) is None:
+        return None
+    values = [
+        v for v in ds.values if v.col == key and v.value is not None and (r := ds.row(v.row)) and r.type == "data"
+    ]
+    units = Counter(v.unit for v in values)
+    if len(units) < 2:
+        return None
+    main = units.most_common(1)[0][0]
+    rows = [v.row for v in values if v.unit == main]
+    return (
+        spec.model_copy(update={"categories": [ref(ds.id, r) for r in rows], "periods": []}) if len(rows) >= 2 else None
+    )
+
+
+def first_valid(
+    spec: VisualSpec,
+    datasets: Mapping[str, TypedDataset],
+    check: Callable[[VisualSpec], bool] | None = None,
+) -> VisualSpec | None:
+    """The first of ``variants`` that resolves (and passes ``check``: the caller builds it, which also checks a
+    waterfall's arithmetic)."""
+    tried: list[VisualSpec] = []
+    for candidate in variants(spec, datasets):
+        if candidate in tried:
+            continue
+        tried.append(candidate)
         try:
             resolve(candidate, datasets)
-        except SpecError:
+        except SpecError as e:
+            if any("mixes units" in p for p in e.problems):
+                narrowed = _single_unit_categories(candidate, datasets)
+                if narrowed is not None and narrowed not in tried:
+                    tried.append(narrowed)
+                    try:
+                        resolve(narrowed, datasets)
+                    except SpecError:
+                        continue
+                    if check is None or check(narrowed):
+                        return narrowed
             continue
-        return candidate
+        if check is None or check(candidate):
+            return candidate
     return None
+
+
+def builds(
+    datasets: Mapping[str, TypedDataset], filenames: Mapping[str, str] | None = None
+) -> Callable[[VisualSpec], bool]:
+    """A check for ``first_valid``: the spec resolves and its visual builds (a waterfall's steps add up, a requested
+    calculation holds)."""
+
+    def check(spec: VisualSpec) -> bool:
+        try:
+            r = resolve(spec, datasets, filenames=filenames)
+            build_visual(r, visual_id="vis_plan", project_id="", chat_id=None, filenames=filenames or {}, now=_NOW)
+        except (SpecError, AssertionError):
+            return False
+        return True
+
+    return check
+
+
+_NOW = datetime(2000, 1, 1, tzinfo=UTC)
 
 
 def default_spec(ds: TypedDataset, pool: Sequence[TypedDataset], language: str) -> VisualSpec | None:
     """A sensible chart of one dataset without the model: its trend, KPI tiles or composition."""
+    by_id = {d.id: d for d in pool}
+    check = builds(by_id)
     makers = {
         "time_series": lambda: trend_spec(ds, pool, language),
         "kpi": lambda: kpi_spec(ds, language),
         "composition": lambda: composition_spec(ds, language),
     }
-    order = [o.kind for o in ds.chartability.options]
-    for kind in order:
+    for kind in [o.kind for o in ds.chartability.options]:
         maker = makers.get(kind)
         spec = maker() if maker else None
-        if spec is not None and first_valid(spec, {d.id: d for d in pool}) is not None:
-            return spec
+        if spec is not None and (valid := first_valid(spec, by_id, check)) is not None:
+            return valid
     cols = series_columns(ds)
     if ds.chartability.period_axis == "columns":
         rows = [r for r in ds.rows if r.type == "data"][:1]
@@ -398,7 +567,7 @@ def default_spec(ds: TypedDataset, pool: Sequence[TypedDataset], language: str) 
         series = [ref(ds.id, c.key) for c in cols[:1]]
     if not series:
         return None
-    return first_valid(VisualSpec(kind="bar", datasets=[ds.id], series=series, language=language), {ds.id: ds})  # type: ignore[arg-type]
+    return first_valid(VisualSpec(kind="bar", datasets=[ds.id], series=series, language=language), by_id, check)  # type: ignore[arg-type]
 
 
 class VisualPlanner:
@@ -489,7 +658,7 @@ class VisualPlanner:
             if spec is None:
                 result.reason = "the model chose no visual"
             else:
-                valid = first_valid(spec, pool)
+                valid = first_valid(spec, pool, builds(pool, filenames))
                 if valid is not None:
                     result.spec, result.source = valid, "model"
                 else:
