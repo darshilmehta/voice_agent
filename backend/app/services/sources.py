@@ -1,8 +1,9 @@
-"""Numbered sources for a grounded answer and validation of the answer's citations (docs/DESIGN.md §3.2).
+"""Numbered sources for a grounded answer and validation of the answer's citations (docs/DESIGN.md §3.2, §3.7).
 
 reranked chunks → only READY documents of the chat → dedupe → token budget (best first)
   → grouped by document section (reading order inside a group) → [S1] … [Sn]
-answer text → [S#] markers checked against the sources → unknown ids removed, "[S1, S2]" → "[S1][S2]"
+live web search results (services/web_search.py) → [W1] … [Wn], in arrival order
+answer text → [S#] / [W#] markers checked against the sources → unknown ids removed, "[S1, W2]" → "[S1][W2]"
   → citations = the sources actually cited, in order of first mention
 """
 
@@ -12,6 +13,7 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 from ..domain.projects import SNIPPET_CHARS, Citation
 from ..providers.ingestion import Chunk
@@ -19,9 +21,18 @@ from .retrieval import RankedChunk
 
 _DEVANAGARI = re.compile(r"[\u0900-\u097F]")
 _SPACE = re.compile(r"\s+")
-# [S1], [s2], [S1, S3], [S1; S2] — with the whitespace before it, so a removed marker leaves no gap.
-_MARKER = re.compile(r"(\s*)\[\s*(S\d+(?:\s*[,;]\s*S\d+)*)\s*\]", re.IGNORECASE)
-_ID = re.compile(r"S(\d+)", re.IGNORECASE)
+# [S1], [s2], [S1, S3], [S1; W2], [W1] — with the whitespace before it, so a removed marker leaves no gap.
+_MARKER = re.compile(r"(\s*)\[\s*([SW]\d+(?:\s*[,;]\s*[SW]\d+)*)\s*\]", re.IGNORECASE)
+_ID = re.compile(r"([SW])(\d+)", re.IGNORECASE)
+
+
+class Citable(Protocol):
+    """A numbered source an answer may cite: a document passage (``Source``) or a web result (``WebSource``)."""
+
+    @property
+    def source_id(self) -> str: ...
+
+    def citation(self) -> Citation: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,22 +152,23 @@ def trim_open_marker(text: str) -> str:
 
 
 def strip_markers(text: str) -> str:
-    """Text without [S#] markers (earlier answers in the prompt history: their numbers meant other sources)."""
+    """Text without [S#] / [W#] markers (earlier answers in the prompt history: their numbers meant other
+    sources)."""
     return _MARKER.sub("", text).strip()
 
 
-def finalize_answer(text: str, sources: Sequence[Source]) -> tuple[str, list[Citation]]:
+def finalize_answer(text: str, sources: Sequence[Citable]) -> tuple[str, list[Citation]]:
     """The answer as it is saved, and the citations it makes.
 
     Markers naming a source that doesn't exist are removed (with the space before them); lists are normalized to
-    one marker per source ("[S1, S2]" → "[S1][S2]"), which is the form the UI turns into chips. Citations are the
-    existing sources the text cites, in order of first mention.
+    one marker per source ("[S1, W2]" → "[S1][W2]"), which is the form the UI turns into chips. Citations are the
+    existing sources the text cites (documents and web results alike), in order of first mention.
     """
     by_id = {s.source_id: s for s in sources}
     cited: list[str] = []
 
     def replace(m: re.Match[str]) -> str:
-        ids = [f"S{int(n)}" for n in _ID.findall(m.group(2))]
+        ids = [f"{kind.upper()}{int(n)}" for kind, n in _ID.findall(m.group(2))]
         valid = [i for i in dict.fromkeys(ids) if i in by_id]
         for i in valid:
             if i not in cited:

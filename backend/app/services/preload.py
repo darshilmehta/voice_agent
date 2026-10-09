@@ -4,6 +4,9 @@ already serves requests, so the first spoken question isn't slowed by loading th
 Models load one after another (no memory spikes or GPU contention on a 16 GB machine, §8): VAD, STT, TTS, embedder,
 reranker, then the LLM is asked to load its chat model. A model that can't load (``ml`` group not installed, files
 missing) is reported and still loads on first use if that becomes possible; nothing here fails startup.
+
+With web search enabled, the voice filler ("Let me look that up.", §3.7) is synthesized right after TTS loads, in
+every configured language, so speaking it costs no TTS time.
 """
 
 from __future__ import annotations
@@ -19,6 +22,8 @@ from pydantic import BaseModel
 from ..providers.base import PlaceholderProvider
 from ..providers.models import ModelUnavailableError
 from ..providers.registry import Container
+from ..providers.speech import SpeechSynthesizer
+from .voice.fillers import filler_audio
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +85,19 @@ class ModelPreloader:
             state = "degraded"
         return PreloadReport(state=state, models=self._loads)
 
+    async def _fillers(self, tts: object) -> None:
+        """The web-search filler's audio, synthesized now (module docstring); a failure only means it is synthesized
+        on first use."""
+        settings = self.container.settings
+        if not settings.tools.web_search.enabled or not isinstance(tts, SpeechSynthesizer):
+            return
+        try:
+            await filler_audio(tts).preload(settings.client.languages)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("preload: the web search filler couldn't be synthesized: %s: %s", type(e).__name__, e)
+
     async def _run(self) -> None:
         started = time.perf_counter()
         for load in self._loads:
@@ -99,6 +117,8 @@ class ModelPreloader:
                 log.warning("preload %s (%s) failed: %s", load.capability, load.provider, load.detail)
             else:
                 load.state = "ready"
+                if load.capability == "tts":
+                    await self._fillers(provider)
             load.seconds = round(time.perf_counter() - t0, 2)
         log.info(
             "model preload finished in %.1fs: %s",

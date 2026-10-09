@@ -6,9 +6,16 @@ Services return these, never ORM rows, so callers can't trigger lazy database ac
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, NotRequired, TypedDict
 
-from pydantic import BaseModel, ConfigDict, computed_field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    SerializerFunctionWrapHandler,
+    computed_field,
+    field_validator,
+    model_serializer,
+)
 
 Role = Literal["user", "agent", "event"]
 Modality = Literal["voice", "text"]
@@ -115,9 +122,36 @@ class DocumentTable(Record):
 SNIPPET_CHARS = 300
 
 
+CitationKind = Literal["document", "web"]
+_WEB_FIELDS = ("kind", "url", "title", "site", "published")
+
+
+class CitationJSON(TypedDict):
+    """A citation as JSON (the API schema): the web fields appear on web citations only."""
+
+    source_id: str
+    document_id: str
+    filename: str
+    page_start: int | None
+    page_end: int | None
+    chunk_id: str
+    snippet: str
+    kind: NotRequired[CitationKind]
+    url: NotRequired[str | None]
+    title: NotRequired[str | None]
+    site: NotRequired[str | None]
+    published: NotRequired[str | None]
+
+
 class Citation(BaseModel):
-    """A source an agent answer cites. ``source_id`` is the marker used in the answer text (``[S1]``); ``snippet`` is
-    up to ~300 characters of the cited chunk."""
+    """A source an agent answer cites. ``source_id`` is the marker used in the answer text: ``[S1]`` for a passage
+    of the user's documents, ``[W1]`` for a live web search result (docs/DESIGN.md §3.7); ``snippet`` is up to ~300
+    characters of the cited chunk or result.
+
+    Web citations carry ``kind: "web"``, ``url``, ``title``, ``site`` (host) and ``published`` (when the engine gave
+    a date); their ``filename`` is the site, ``document_id`` and ``chunk_id`` are empty and there are no pages.
+    Document citations serialize exactly as before web search existed (no ``kind`` or web fields): a citation without
+    ``kind`` is a document passage."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -128,6 +162,19 @@ class Citation(BaseModel):
     page_end: int | None
     chunk_id: str
     snippet: str
+    kind: CitationKind = "document"
+    url: str | None = None
+    title: str | None = None
+    site: str | None = None
+    published: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _without_web_fields(self, handler: SerializerFunctionWrapHandler) -> CitationJSON:
+        data = handler(self)
+        if self.kind == "document":
+            for name in _WEB_FIELDS:
+                data.pop(name, None)
+        return data
 
     @classmethod
     def coerce(cls, value: Any, position: int) -> Citation | None:
@@ -141,14 +188,18 @@ class Citation(BaseModel):
         page = _int_or_none(value.get("page"))
         start = _int_or_none(value.get("page_start"))
         end = _int_or_none(value.get("page_end"))
+        web: dict[str, Any] = {}
+        if value.get("kind") == "web":
+            web = {"kind": "web", **{k: _str_or_none(value.get(k)) for k in ("url", "title", "site", "published")}}
         return cls(
-            source_id=str(value.get("source_id") or f"S{position}"),
+            source_id=str(value.get("source_id") or f"{'W' if web else 'S'}{position}"),
             document_id=str(value.get("document_id") or ""),
             filename=str(value.get("filename") or ""),
             page_start=start if start is not None else page,
             page_end=end if end is not None else (start if start is not None else page),
             chunk_id=str(value.get("chunk_id") or ""),
             snippet=str(value.get("snippet") or value.get("text") or "")[:SNIPPET_CHARS],
+            **web,
         )
 
 
@@ -157,6 +208,10 @@ def coerce_citations(values: Any) -> list[Citation]:
         return []
     coerced = (Citation.coerce(v, i) for i, v in enumerate(values, start=1))
     return [c for c in coerced if c is not None]
+
+
+def _str_or_none(value: Any) -> str | None:
+    return str(value) if value not in (None, "") else None
 
 
 def _int_or_none(value: Any) -> int | None:

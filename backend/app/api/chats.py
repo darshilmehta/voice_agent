@@ -55,7 +55,11 @@ _SSE_DOC = {
             "Server-Sent Events, in order: user_message (the saved user Message), sources ({sources: [Citation], "
             "confidence, abstained}), delta ({text}) zero or more times, agent_message (the saved agent Message). "
             "On failure: error ({detail, stage: retrieval | llm | storage}) and the stream ends. Closing the "
-            "connection mid-answer stops generation; the partial answer is saved with route.stopped = true."
+            "connection mid-answer stops generation; the partial answer is saved with route.stopped = true. "
+            "A turn that searches the web (live data) also sends tool events ({name: web_search, phase: start | "
+            "results | done | timeout | failed, query, …}) between user_message and agent_message: start before "
+            "sources; results (web Citations, kind: web, [W1]…) before sources and again before a continuation's "
+            "deltas; one of done / timeout / failed when the search ends."
         ),
         "content": {"text/event-stream": {"schema": {"type": "string"}}},
     }

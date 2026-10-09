@@ -185,6 +185,7 @@ class SpokenChunk:
     text: str
     start_ms: float  # position in the turn's audio (sum of the previous chunks' durations)
     duration_ms: float
+    filler: bool = False  # "Let me look that up." while the web is searched (§3.7): not part of the answer
 
     @property
     def end_ms(self) -> float:
@@ -192,10 +193,15 @@ class SpokenChunk:
 
 
 def heard_text(chunks: Sequence[SpokenChunk], played_ms: float) -> str:
-    """What the user heard of a turn whose audio played for ``played_ms``: every fully played chunk, plus the share of
-    the chunk playing at ``played_ms`` in proportion to its duration, counted in whole words (rounded down)."""
+    """What the user heard of a turn's answer whose audio played for ``played_ms``: every fully played chunk, plus
+    the share of the chunk playing at ``played_ms`` in proportion to its duration, counted in whole words (rounded
+    down). A filler is played but isn't the answer: its words don't count (its time does)."""
     words: list[str] = []
     for chunk in chunks:
+        if chunk.filler:
+            if played_ms < chunk.end_ms:
+                break
+            continue
         chunk_words = chunk.text.split()
         if played_ms >= chunk.end_ms:
             words += chunk_words

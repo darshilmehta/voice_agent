@@ -163,8 +163,13 @@
       "url": "http://searxng:8080",
       "api_key": null,
       "max_results": 5,
-      "timeout_s": 8,
-      "stream_partial_results": true
+      "timeout_s": 5,
+      "stream_partial_results": true,
+      "engines": ["duckduckgo", "duckduckgo news", "bing", "bing news", "brave", "yahoo", "wikipedia"],
+      "request_timeout_s": 3.5,
+      "partial_wait_ms": 150,
+      "max_continuations": 1,
+      "fetch_pages": 1
     }
   },
   "strict_offline_exceptions": [],

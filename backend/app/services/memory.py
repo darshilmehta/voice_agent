@@ -127,9 +127,11 @@ def transcript(messages: list[Message]) -> str:
         if len(text) > MESSAGE_CHARS:
             text = text[: MESSAGE_CHARS - 1] + "…"
         if m.role == "agent":
-            cited = sorted({f"{c.filename} p.{c.page_start}" for c in m.citations if c.page_start is not None})
-            if cited:
-                text += f" (sources: {', '.join(cited)})"
+            pages = [c for c in m.citations if c.kind == "document" and c.page_start is not None]
+            cited = sorted({f"{c.filename} p.{c.page_start}" for c in pages})
+            web = sorted({f"web: {c.site or c.url}" for c in m.citations if c.kind == "web"})  # live data, §3.7
+            if cited or web:
+                text += f" (sources: {', '.join([*cited, *web])})"
             if m.heard_text is not None:
                 text += " (interrupted)"
         lines.append(f"{'User' if m.role == 'user' else 'Assistant'}: {text}")

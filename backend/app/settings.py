@@ -230,13 +230,27 @@ class AudioTransportSection(Section):
 
 
 class WebSearchSection(Section):
+    """The live-data tool (docs/DESIGN.md §3.7). Off unless ``enabled``; under ``strict_offline`` it also needs
+    ``"web_search"`` in ``strict_offline_exceptions``."""
+
     enabled: bool
     provider: str
     url: str | None
     api_key: str | None
-    max_results: int = Field(gt=0)
+    max_results: int = Field(gt=0, le=10)
+    # The whole search: no results by then → a document-only answer saying live data couldn't be fetched.
     timeout_s: int = Field(gt=0)
+    # true: the answer starts on the first results and continues as more arrive; false: it waits for the search.
     stream_partial_results: bool
+    # SearXNG: one request per engine (engines=<name>), so whichever engine answers first is used first.
+    engines: list[str]
+    request_timeout_s: float = Field(gt=0)  # one engine request (SearXNG)
+    # After the first result, how long to wait for other engines before the answer starts (stream_partial_results).
+    partial_wait_ms: int = Field(ge=0)
+    # How many times an answer may continue with results that arrived after it started (each is one more LLM call).
+    max_continuations: int = Field(ge=0, le=3)
+    # Top result pages fetched and reduced to text (size-capped), used when ready in time. 0: snippets only.
+    fetch_pages: int = Field(ge=0, le=2)
 
 
 class ToolsSection(Section):

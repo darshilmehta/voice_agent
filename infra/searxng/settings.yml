@@ -1,0 +1,65 @@
+# SearXNG for poc_gibberlink's live-data tool (docs/DESIGN.md §3.7): a local, single-user instance on 127.0.0.1:8888.
+#
+#   docker compose -f infra/docker-compose.yml --profile websearch up -d searxng
+#
+# Only the JSON API is used: the backend sends one request per engine (engines=<name>, format=json) and streams
+# whichever answers first. Everything not set here comes from SearXNG's defaults (use_default_settings).
+# The secret comes from the SEARXNG_SECRET environment variable (a random one per start when it is unset, see
+# infra/docker-compose.yml); it only signs image-proxy URLs, which this instance doesn't serve.
+
+use_default_settings:
+  engines:
+    # Only these engines exist in this instance; the backend's tools.web_search.engines picks among them.
+    keep_only:
+      - duckduckgo
+      - duckduckgo news
+      - brave
+      - brave.news
+      - bing
+      - bing news
+      - yahoo
+      - wikipedia
+
+general:
+  instance_name: "gibberlink-local"
+  debug: false
+  enable_metrics: false  # no per-engine statistics are kept
+
+search:
+  safe_search: 1
+  autocomplete: ""
+  default_lang: "auto"
+  formats:
+    - html
+    - json  # the backend's API
+
+server:
+  # Overridden by SEARXNG_SECRET (always set by the compose service). Never "ultrasecretkey": SearXNG refuses it.
+  secret_key: "overridden-by-SEARXNG_SECRET"
+  limiter: false  # one local client; the limiter needs valkey and would throttle API-style traffic
+  public_instance: false
+  image_proxy: false
+  method: "GET"
+  default_http_headers:
+    X-Content-Type-Options: nosniff
+    X-Robots-Tag: noindex, nofollow
+    Referrer-Policy: no-referrer
+
+valkey:
+  url: false  # no cache or limiter database
+
+outgoing:
+  request_timeout: 3.0  # per engine; the backend has its own per-request and overall timeouts as well
+  max_request_timeout: 5.0
+  pool_connections: 20
+  pool_maxsize: 10
+
+engines:
+  - name: wikipedia
+    display_type: ["infobox", "list"]  # also an ordinary result, so it can be cited
+  - name: bing
+    disabled: false
+  - name: bing news
+    disabled: false
+  - name: yahoo
+    disabled: false

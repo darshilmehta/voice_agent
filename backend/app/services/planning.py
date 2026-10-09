@@ -18,6 +18,11 @@
       resume without a question                                              → no search, fixed text
       stop, or a backchannel right after "Anything else?"                    → nothing is said
       document search off for the chat → general answer saying so; no READY documents → abstain (mixed: general)
+    live data (§3.7, router.with_live_tools): a question with a live-data cue gets tools=["web_search"] when the
+      tool is available, and the search query built from its English standalone question (live_data.web_query);
+      no search otherwise (``live_hint``: the answer never guesses current figures); with web search turned on but
+      unavailable now, or no English question to search for, ``live_note`` lets the answer say so (turned off: no
+      note, nothing to apologise for)
 
 The speculative retrieval is handed to the turn when the route keeps its query (see ``SpeculativeRetrieval``) and
 discarded otherwise, so a document turn that agrees with the raw utterance pays for retrieval and the router once,
@@ -36,6 +41,7 @@ from ..domain.conversation import Intent, TurnRoute
 from ..domain.projects import Message
 from ..settings import Language
 from .language import message_language
+from .live_data import LiveNote, web_query
 from .prompts import AckKind, AnswerMode, GeneralNote
 from .retrieval import RetrievalService, SpeculativeRetrieval
 from .router import (
@@ -49,6 +55,7 @@ from .router import (
     retrieval_route,
     standalone_question,
     validate,
+    with_live_tools,
 )
 
 log = logging.getLogger(__name__)
@@ -75,14 +82,27 @@ class TurnPlan:
     interrupted: InterruptedAnswer | None = None
     ack: AckKind | None = None  # the fixed reply of an "ack" turn
     speculated: bool = False  # a speculative retrieval was started (and, without ``speculation``, discarded)
+    web_query: str | None = None  # the web search to run (§3.7): only this leaves the machine
+    # Web search is on, but this answer won't have live data (unavailable, nothing to search for, or it failed): the
+    # answer may say so (``ChatTurnService`` decides when). None when web search is turned off.
+    live_note: LiveNote | None = None
+    live_hint: bool = False  # the question wants live data and gets no search: never guess current figures
 
     @property
     def route(self) -> TurnRoute | None:
         return self.decision.route if self.decision is not None else None
 
+    @property
+    def tools(self) -> list[str]:
+        return list(self.route.tools) if self.route is not None else []
+
     def as_general(self, note: GeneralNote) -> TurnPlan:
         """A mixed question the documents don't cover: answered from general knowledge, saying so."""
         return replace(self, mode="general", general_note=note)
+
+    def without_live_data(self, note: LiveNote) -> TurnPlan:
+        """The web search gave nothing (timeout, failure, no results): answer without it, saying so."""
+        return replace(self, live_note=note)
 
 
 class DocumentQARouter:
@@ -187,6 +207,23 @@ def policy(
     return Policy(decision, mode, note, ack)
 
 
+def live_search(decision: RouteDecision, req: RouteRequest) -> tuple[RouteDecision, str | None, LiveNote | None]:
+    """The web search a live question runs (its query), or why it runs none (§3.7): the tool isn't available, or
+    there is no English question to search for (a Hindi turn the router couldn't translate: the utterance itself
+    never leaves the machine)."""
+    if decision.live is None:
+        return decision, None, None
+    route = decision.route
+    if "web_search" not in route.tools:  # turned off (no note: nothing to apologise for), or can't run now
+        return decision, None, "unavailable" if "web_search" in req.enabled_tools | req.available_tools else None
+    english = route.query_en or route.rewritten_query or req.utterance
+    query = web_query(english, documents=req.documents, utterance=req.utterance)
+    if query is None:
+        overrides = (*decision.overrides, "web_search dropped: no English search query")
+        return replace(decision, route=route.model_copy(update={"tools": []}), overrides=overrides), None, "failed"
+    return decision, query, None
+
+
 class TurnPlanner:
     def __init__(
         self,
@@ -224,6 +261,7 @@ class TurnPlanner:
         try:
             if decision is None:
                 decision = await self._ask_router(req, speculation)
+            decision = with_live_tools(decision, req)
             p = policy(
                 decision,
                 req,
@@ -239,6 +277,7 @@ class TurnPlanner:
         route = p.decision.route
         if speculation is not None and not route.needs_retrieval:
             speculation.discard()
+        decision, query, note = live_search(p.decision, req)
         return TurnPlan(
             query=route.rewritten_query or req.utterance,
             language=req.language,
@@ -247,12 +286,15 @@ class TurnPlanner:
             query_en=route.query_en,
             mode=p.mode,
             general_note=p.note,
-            decision=p.decision,
+            decision=decision,
             speculation=speculation if route.needs_retrieval else None,
             router_ms=round((time.perf_counter() - t0) * 1000, 1),
             interrupted=req.interrupted,
             ack=p.ack,
             speculated=speculation is not None,
+            web_query=query,
+            live_note=note,
+            live_hint=decision.live is not None and query is None,
         )
 
     async def _ask_router(self, req: RouteRequest, speculation: SpeculativeRetrieval | None) -> RouteDecision:

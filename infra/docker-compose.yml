@@ -2,6 +2,8 @@
 #
 #   docker compose -f infra/docker-compose.yml up -d qdrant                 # default: Qdrant only
 #   docker compose -f infra/docker-compose.yml --profile full up -d --build # Qdrant + backend + frontend
+#   docker compose -f infra/docker-compose.yml --profile websearch up -d searxng     # opt-in: live web search
+#   docker compose -f infra/docker-compose.yml --profile websearch rm -sf searxng    # stop + remove it only
 #
 # Default (development on macOS): only Qdrant runs in Docker. Docker on macOS has no Metal GPU access,
 # so Ollama, the backend and the ML models run natively on the host.
@@ -31,6 +33,12 @@
 #   mlx-whisper), which containers cannot. This profile is for Linux servers and larger machines.
 #   `docker compose ... --profile full config` shows the effective limits; BACKEND_MEM_LIMIT changes the backend's.
 #   Docker Desktop's own memory setting (Settings > Resources) is yours to change; nothing here touches it.
+#
+# Profile "websearch" (opt-in, docs/DESIGN.md §3.7): SearXNG on 127.0.0.1:8888 for the live-data tool. It
+# forwards search queries to public engines, so the backend uses it only with tools.web_search.enabled and
+# "web_search" in strict_offline_exceptions (config/README.md). Set SEARXNG_SECRET to fix its secret; unset,
+# a random one is generated at each start. To stop it, name the service (`rm -sf searxng` or `stop searxng`):
+# `down` acts on the whole project, so `--profile websearch down` would also remove the Qdrant container.
 
 name: poc_gibberlink
 
@@ -53,6 +61,32 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+
+  searxng:
+    profiles: [websearch]
+    image: ${SEARXNG_IMAGE:-searxng/searxng:2026.9.23-3cd69d30e}
+    container_name: gibberlink-searxng
+    ports:
+      - "127.0.0.1:8888:8080" # loopback only
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      SEARXNG_BASE_URL: http://127.0.0.1:8888/
+      # Passed through from the host; empty → a random secret per start (the shell below; $$ escapes compose).
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        export SEARXNG_SECRET="$${SEARXNG_SECRET:-$$(head -c 24 /dev/urandom | base64 | tr -dc A-Za-z0-9)}" &&
+        exec /usr/local/searxng/entrypoint.sh
+    mem_limit: 256m
+    restart: "no"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
 
   backend:
     profiles: [full]
