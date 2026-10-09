@@ -154,6 +154,7 @@ from .prompts import (
     live_user_prompt,
     names_note,
     on_screen_note,
+    own_subject_note,
     passage_correction,
     resume_text,
     short_document_name,
@@ -189,7 +190,7 @@ from .sources import (
     strip_markers,
     trim_open_marker,
 )
-from .subjects import misheard_names, misheard_words, respell
+from .subjects import label_words, misheard_names, misheard_words, respell, subject_names
 from .web_search import ToolEvent, WebSearchRun, WebSource
 
 if TYPE_CHECKING:
@@ -896,7 +897,7 @@ class ChatTurnService:
             style = ANSWER_LENGTHS[turn.length]
             budget = self.settings.retrieval.context_token_budget
             p.sources = build_sources(
-                p.result.chunks,
+                self._own_documents(turn, p, p.result.chunks),
                 ready,
                 budget_tokens=min(budget, style.context_tokens or budget),
                 max_sources=style.max_sources,
@@ -1767,6 +1768,11 @@ class ChatTurnService:
                 notes.append(fiscal_year_end_note(year_ends))
             if renames:
                 notes.append(names_note(renames))
+            if (own := self._own_subject(turn, plan, p)) is not None:
+                notes.append(own_subject_note(own))
+                # Without the conversation: with the old topic in its history the 4B model answered the age rule
+                # again however the question and its sources read (3 of 3 runs, with the note and Valmora's passages).
+                history = []
             on_screen = None
             if p is not None and p.draft is not None and p.draft_sources:
                 ids = [s.source_id for s in p.draft_sources]
@@ -1793,6 +1799,30 @@ class ChatTurnService:
         if plan.language_request:
             question = f"{question}\n\n{language_request_note(language)}"
         return [*self._context(system, history, memory), LLMMessage("user", question)]
+
+    @staticmethod
+    def _own_subject(turn: Turn, plan: TurnPlan, p: _Progress | None) -> list[str] | None:
+        """What the question names when the router's rewrite was dropped for losing it or carrying the last topic over
+        (last round, item 4): the answer is told to keep to it (the history still holds the old topic, and the 4B model
+        answered "Valmuraka, FY24, Meerajesh" with the age rule again)."""
+        if plan.decision is None or not any(o.startswith("rewrite dropped") for o in plan.decision.overrides):
+            return None
+        labels = {d: document_label(f, None) for d, f in (p.ready if p is not None else {}).items()}
+        names = [n[:1].upper() + n[1:] for n in sorted(subject_names(turn.text, labels))]
+        periods = [f"FY{y:02d}" for y in sorted(asked_periods(turn.text))]
+        return [*names, *periods] or None
+
+    def _own_documents(self, turn: Turn, p: _Progress, chunks: Sequence[RankedChunk]) -> list[RankedChunk]:
+        """The passages for the answer: when the router's rewrite was dropped (``_own_subject``) and the question names
+        documents of the chat, only theirs (if any were found). With the old topic still in the history, a passage of
+        the other document among the sources was what the model answered from (the age rule, 3 of 3 runs)."""
+        if self._own_subject(turn, p.plan, p) is None:
+            return list(chunks)
+        labels = {d: document_label(f, None) for d, f in p.ready.items()}
+        names = subject_names(turn.text, labels)
+        docs = {d for d, label in labels.items() if label_words(label) & names}
+        own = [c for c in chunks if c.chunk.document_id in docs]
+        return own or list(chunks)
 
     @staticmethod
     def _context(system: str, history: Sequence[Message], memory: str | None) -> list[LLMMessage]:

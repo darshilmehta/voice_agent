@@ -15,6 +15,7 @@ from app.services.chats import ChatService
 from app.services.projects import ProjectService
 from app.services.prompts import ACK_TEXTS, abstention
 from app.services.retrieval import RetrievalService
+from app.services.router import RouteRequest, RouterProposal, heuristic_topic, rewrite_loses, validate
 
 from .conftest import add_document
 from .fakes import make_chunk, vector_for
@@ -267,3 +268,97 @@ async def test_a_hindi_general_answer_says_its_disclaimer_once(world, fakes):
     fakes.llm.reply = "यह आपके दस्तावेज़ों से नहीं है, लेकिन बृहस्पति सबसे बड़ा ग्रह है।"
     events = await turn(service, chat_id, "सबसे बड़ा ग्रह कौन सा है?", modality="voice", language="hi")
     assert saved(events).text == "यह आपके दस्तावेज़ों से नहीं है, लेकिन बृहस्पति सबसे बड़ा ग्रह है।"
+
+
+# ------------------------------------------------------------------ item 4: the rewrite keeps the utterance's subject
+#
+# The last real run: "वालमोरा का FY24 में राजस्व" (heard "Valmuraka, FY24, Meerajesh"), in a chat whose last topic was
+# the Hindi notice's age rule, was rewritten by the router as an age question.
+
+FILES = ["valmora_annual_report_fy24.pdf", "suryodaya_yojana_soochna.docx"]
+AGE_REWRITE = "What is the minimum age to apply for the Suryodaya scheme?"
+
+
+def routed(utterance: str, query: str | None, *, language: str = "en", intent: str = "document_qa"):
+    req = RouteRequest(utterance, language, documents=FILES)  # type: ignore[arg-type]
+    return validate(RouterProposal(intent=intent, query=query), req)  # type: ignore[arg-type]
+
+
+def test_a_rewrite_that_drops_the_company_and_year_the_utterance_names_is_not_used():
+    decision = routed("Valmuraka, FY24, Meerajesh", AGE_REWRITE)
+    assert decision.route.rewritten_query == "Valmora, FY24, Meerajesh"  # the utterance, its misheard name respelled
+    assert "rewrite dropped: it doesn't name Valmora, FY24, which the utterance does" in decision.overrides
+    hindi = routed("वालमोरा का FY24 में राजस्व", "What is the age limit for the scheme?", language="hi")
+    assert (hindi.route.rewritten_query, hindi.route.query_en) == (None, None)  # searched in the user's own words
+    assert hindi.route.topic != heuristic_topic("What is the age limit for the scheme?")
+
+
+@pytest.mark.parametrize(
+    ("utterance", "query", "language"),
+    [
+        ("वालमोरा का FY24 में राजस्व", "What was Valmora's revenue in FY24?", "hi"),
+        ("and in FY23?", "What was Valmora's revenue in FY23?", "en"),  # names nothing: the conversation decides
+        ("what about Suryodaya's age limit?", AGE_REWRITE, "en"),
+    ],
+)
+def test_a_rewrite_that_keeps_what_the_utterance_names_is_used(utterance, query, language):
+    decision = routed(utterance, query, language=language)
+    assert query in (decision.route.rewritten_query, decision.route.query_en)
+    assert not any(o.startswith("rewrite dropped") for o in decision.overrides)
+
+
+def test_rewrite_loses_names_and_periods():
+    assert rewrite_loses("Valmuraka, FY24, Meerajesh", [AGE_REWRITE], FILES) == "Valmora, FY24"
+    assert rewrite_loses("ज़ेफायरा का FY24", ["What is Valmora's revenue in FY24?"], FILES) is None  # no Zephyra file
+    assert rewrite_loses("no, I meant FY23", ["What was revenue in FY24?"], FILES) == "FY23"
+
+
+REAL_RUN_REWRITE = "What is the age requirement for applicants in the Valmora Annual Report FY24 for Meerajesh?"
+
+
+@pytest.mark.parametrize(
+    ("intent", "rewrite"),
+    [("document_qa", AGE_REWRITE), ("resume_document", REAL_RUN_REWRITE)],  # the second: what the real router wrote
+)
+async def test_a_question_about_another_document_after_the_age_rule_is_not_answered_as_an_age_question(
+    db, load_local, fakes, intent, rewrite
+):
+    settings = load_local()
+    project = await ProjectService(db).create("Both")
+    report = await add_document(db, project.id, FILES[0], status="READY", page_count=29)
+    scheme = await add_document(db, project.id, FILES[1], status="READY")
+    passages = [
+        (
+            report,
+            "| Metric | FY24 | FY23 |\n|---|---|---|\n| Revenue from operations (₹ crore) | 7,365 | 6,482 |",
+            "en",
+        ),
+        (scheme, NOTICE[0][1], "hi"),
+    ]
+    for i, (doc, text, language) in enumerate(passages):
+        chunk = make_chunk(i, project_id=project.id, document_id=doc, text=text, language=language)
+        await fakes.store.upsert([IndexedChunk(chunk, vector_for(text))])
+    chat = await ChatService(db).create(project.id)
+    retrieval = RetrievalService(fakes.embedder, fakes.reranker, fakes.store, settings.retrieval)
+    service = ChatTurnService(db, retrieval=retrieval, llm=fakes.llm, settings=settings)
+    fakes.reranker.scorer = lambda q, p: 0.9 if ("आयु" in p and "age" in q.casefold()) or "7,365" in p else 0.0
+    fakes.llm.route = {"intent": "document_qa", "query": "What is the minimum age for the scheme?"}
+    fakes.llm.reply = "आवेदक की आयु 18 से 35 वर्ष होनी चाहिए [S1]।"
+    await turn(service, chat.id, "आवेदक की आयु कितनी होनी चाहिए?", modality="voice", language="hi")
+    fakes.llm.route = {"intent": intent, "query": rewrite}  # the topic carried over
+    fakes.llm.reply = "FY24 में Valmora का राजस्व ₹ 7,365 करोड़ था [S1]।"
+    events = await turn(service, chat.id, "Valmuraka, FY24, Meerajesh", modality="voice", language="hi")
+    message = saved(events)
+    assert message.route["rewritten_query"] == "Valmora, FY24, Meerajesh"
+    prompt = answer_prompts(fakes.llm)[-1]
+    assert "Question: Valmora, FY24, Meerajesh" in prompt
+    assert "This question is about Valmora, FY24, not the earlier topic" in prompt
+    assert NOTICE[0][1] not in prompt  # only Valmora's passages: the age rule's would be answered again
+    # and without the conversation: with the age exchange in it, the real model answered the age rule 3 of 3 times
+    assert [m.role for m in fakes.llm.calls[-1]["messages"]] == ["system", "user"]
+    assert "7,365" in message.text
+    assert any(o.startswith("rewrite dropped") for o in message.route["router"]["overrides"])
+    # a plain translation of the same question is kept: it names the subject and brings no age words in
+    fakes.llm.route = {"intent": "document_qa", "query": "What was Valmora's revenue in FY24?"}
+    events = await turn(service, chat.id, "वालमोरा का FY24 में राजस्व", modality="voice", language="hi")
+    assert saved(events).route["query_en"] == "What was Valmora's revenue in FY24?"

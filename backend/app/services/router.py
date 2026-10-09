@@ -49,14 +49,16 @@ from pydantic import BaseModel
 
 from ..domain.conversation import SILENT_INTENTS, TOPIC_NEUTRAL_INTENTS, ConversationState, Intent, TurnRoute
 from ..domain.projects import Message
+from ..providers.ingestion import document_label
 from ..providers.llm import LLMClient, LLMMessage
 from ..settings import Language
 from .canvas.conversation import CanvasEdit, parse_edit, refers_to_screen
 from .canvas.planner import visual_intent
 from .language import asked_language, is_devanagari, message_language, wordset
 from .live_data import live_data_cue
-from .retrieval import fiscal_year_ends
+from .retrieval import asked_periods, fiscal_year_ends
 from .sources import strip_markers
+from .subjects import label_words, misheard_names, respell, subject_names
 
 ROUTER_PROMPT_VERSION = "router-v1"
 ROUTER_MAX_TOKENS = 96  # the JSON needs ~15-60 tokens; the cap bounds a runaway (it then fails validation)
@@ -733,6 +735,14 @@ def validate(proposal: RouterProposal, req: RouteRequest, *, llm_ms: float | Non
                 query_en = proposed
             if refers_back(text) or is_correction(text) or intent in ("correction", "resume_document"):
                 query = proposed
+    if query is not None or query_en is not None:
+        strays = rewrite_strays(req, (query, query_en))
+        if strays:
+            # "Valmuraka, FY24, Meerajesh" (वालमोरा का FY24 में राजस्व) after a talk about the scheme's age rule was
+            # rewritten as an age question (last round, item 4): the utterance's own subject wins over the topic.
+            overrides.append(f"rewrite dropped: {strays}")
+            renames = misheard_names([text], _filename_labels(req.documents))
+            query, query_en = (respell(text, renames) if renames else None), None
     if intent == "correction" and query is None:
         query = f"{previous} — {text}"
         overrides.append("correction: no rewrite, previous question kept")
@@ -747,6 +757,66 @@ def validate(proposal: RouterProposal, req: RouteRequest, *, llm_ms: float | Non
     confidence = CONFIDENCE["llm_overridden" if overrides else "llm"]
     route = _route(req, intent, confidence=confidence, query=query, query_en=query_en)
     return RouteDecision(route, "llm", proposal=proposal, overrides=tuple(overrides), llm_ms=llm_ms)
+
+
+def _filename_labels(filenames: Sequence[str]) -> dict[str, str]:
+    return {f: document_label(f, None) for f in filenames}
+
+
+def rewrite_loses(utterance: str, rewrites: Sequence[str | None], filenames: Sequence[str]) -> str | None:
+    """What the utterance names that its rewrite doesn't, or None: a document's subject ("Valmora", also misheard or in
+    Devanagari: ``subjects.subject_names``) or a fiscal period ("FY24"). The router writes its query from the
+    conversation as well as the utterance, and the 4B model carries the last topic over even when the utterance is
+    about another document's subject."""
+    rewritten = " ".join(r for r in rewrites if r)
+    labels = _filename_labels(filenames)
+    named = subject_names(utterance, labels)
+    missing = sorted(named - subject_names(rewritten, labels))
+    periods = asked_periods(utterance)
+    if periods and not periods & asked_periods(rewritten):
+        missing += [f"FY{p:02d}" for p in sorted(periods)]
+    return ", ".join(m[:1].upper() + m[1:] for m in missing) or None
+
+
+def _content(text: str | None) -> set[str]:
+    return {
+        w.removesuffix("'s")
+        for w in words(text or "")
+        if len(w) > 2 and w not in _TOPIC_STOP and not any(ch.isdigit() for ch in w)
+    }
+
+
+def carried_topic(req: RouteRequest, rewrites: Sequence[str | None]) -> set[str]:
+    """Words of the previous question (as asked, rewritten or in English, and its topic) that the rewrite of an
+    utterance naming a subject of its own brings in although the utterance doesn't say them: the last topic carried
+    over ("age", "applicants" in "What is the age requirement for applicants in the Valmora Annual Report FY24?" for
+    "Valmuraka, FY24, Meerajesh" after the scheme's age rule, the last real run). Empty for an utterance that names no
+    subject, or that leans on the conversation ("and FY23?", "what about Zephyra?": the topic is meant to carry)."""
+    text = req.utterance
+    labels = _filename_labels(req.documents)
+    if refers_back(text) or is_correction(text) or not subject_names(text, labels):
+        return set()
+    previous: list[str | None] = [req.previous_question]
+    last = req.last_answer
+    if last is not None and last.route:
+        previous += [last.route.get("rewritten_query"), last.route.get("query_en"), last.route.get("topic")]
+    before = set().union(*(_content(t) for t in previous))
+    rewritten = set().union(*(_content(r) for r in rewrites))
+    names = set().union(*(label_words(label) for label in labels.values()))  # whose document: not a topic
+    return (rewritten & before) - _content(text) - names
+
+
+def rewrite_strays(req: RouteRequest, rewrites: Sequence[str | None]) -> str | None:
+    """Why the router's rewrite can't stand for the utterance, or None: it drops a subject or period the utterance names
+    (``rewrite_loses``), or carries the previous topic into an utterance about a subject of its own
+    (``carried_topic``)."""
+    lost = rewrite_loses(req.utterance, rewrites, req.documents)
+    if lost:
+        return f"it doesn't name {lost}, which the utterance does"
+    carried = carried_topic(req, rewrites)
+    if carried:
+        return f"it carries the last topic over ({', '.join(sorted(carried))})"
+    return None
 
 
 _SEARCHING: frozenset[Intent] = frozenset({"document_qa", "mixed", "correction", "resume_document"})

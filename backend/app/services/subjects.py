@@ -195,6 +195,9 @@ def _sounds_like(said: str, names: Mapping[str, str]) -> str | None:
     return names[found.pop()] if len(found) == 1 else None
 
 
+_HINDI_POSSESSIVES = frozenset({"ka", "ki", "ke"})  # "Valmora ka FY24" may come out as "Valmuraka, FY24"
+
+
 def misheard_names(texts: Sequence[str | None], labels: Mapping[str, str]) -> dict[str, str]:
     """Words of the question (one capitalised word, or two adjacent words one of which is capitalised) that sound like
     a name in the documents' labels without being spelled like it: misheard words → the documents' spelling
@@ -222,6 +225,8 @@ def misheard_names(texts: Sequence[str | None], labels: Mapping[str, str]) -> di
                 if said.casefold() in names or any(w.casefold() in names for w in words):
                     continue  # spelled as the documents spell it
                 name = _sounds_like(said, names)
+                if name is None and len(said) >= 7 and said[-2:].casefold() in _HINDI_POSSESSIVES:
+                    name = _sounds_like(said[:-2], names)  # "Valmuraka": "Valmora ka" heard as one word
                 if name is not None:
                     out[" ".join(words)] = name
                     i += span - 1
@@ -305,6 +310,47 @@ def _one_off(a: str, b: str) -> bool:
         return sum(x != y for x, y in zip(a, b, strict=True)) == 1
     short, long_ = sorted((a, b), key=len)
     return any(long_[:i] + long_[i + 1 :] == short for i in range(len(long_)))
+
+
+# ------------------------------------------------------------------ the subject a question names (last round, item 4)
+
+# Devanagari consonants as the Latin letters ``sound_key`` keeps: "वालमोरा" → "vlmr" (Valmora), "ज़ेफायरा" → "sfr"
+# (Zephyra), "सूर्योदय" → "srd" (Suryodaya). A nukta changes a few (ज़ → z → s, फ़ → f, ड़ → r).
+_LATIN_SOUNDS = {
+    **dict.fromkeys("कख", "k"), **dict.fromkeys("गघ", "g"), **dict.fromkeys("चछ", "k"), **dict.fromkeys("जझ", "j"),
+    **dict.fromkeys("टठतथ", "t"), **dict.fromkeys("डढदध", "d"), **dict.fromkeys("णनञङंँ", "n"), "प": "p", "फ": "f",
+    **dict.fromkeys("बभ", "b"), "म": "m", "र": "r", **dict.fromkeys("लळ", "l"), "व": "v", **dict.fromkeys("शषस", "s"),
+}  # fmt: skip
+_NUKTA_SOUNDS = {"ज": "s", "फ": "f", "ड": "r", "ढ": "r", "क": "k", "ख": "k", "ग": "g"}
+
+
+def devanagari_sound_key(word: str) -> str:
+    """A Devanagari word's consonants as ``sound_key`` writes a Latin name's, repeats merged."""
+    chars = unicodedata.normalize("NFD", word)
+    keys = []
+    for i, ch in enumerate(chars):
+        nukta = i + 1 < len(chars) and chars[i + 1] == "़"
+        key = _NUKTA_SOUNDS.get(ch) if nukta else None
+        key = key or _LATIN_SOUNDS.get(ch, "")
+        if key:
+            keys.append(key)
+    return "".join(k for i, k in enumerate(keys) if i == 0 or k != keys[i - 1])
+
+
+def subject_names(text: str | None, labels: Mapping[str, str]) -> frozenset[str]:
+    """The documents' names (lower case, from their labels: "valmora", "suryodaya") that ``text`` names: spelled as
+    they are, misheard (``misheard_names``: "Valmuraka" is Valmora), or in Devanagari ("वालमोरा")."""
+    names = _label_names(labels)
+    if not text or not names:
+        return frozenset()
+    said = {re.sub(r"['\u2019]s$", "", w).casefold() for w in _LATIN_WORD.findall(text)}
+    found = {n for n in names if n in said}
+    found |= {name.casefold() for name in misheard_names([text], labels).values()}
+    for word in _DEVANAGARI_WORD.findall(text):
+        key = devanagari_sound_key(word)
+        if len(key) >= 3:
+            found |= {n for n in names if sound_key(n) == key}
+    return frozenset(found)
 
 
 def respell(text: str, renames: Mapping[str, str]) -> str:

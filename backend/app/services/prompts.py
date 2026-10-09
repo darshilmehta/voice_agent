@@ -607,6 +607,16 @@ def fiscal_year_end_note(years: Sequence[int]) -> str:
     )
 
 
+def own_subject_note(subjects: Sequence[str]) -> str:
+    """The question names its own subject, and the conversation before it was about something else (last round, item
+    4): keep to what it names."""
+    named = ", ".join(subjects)
+    return (
+        f"(This question is about {named}, not the earlier topic of the conversation: answer about {named} only. Some "
+        "of its words may be misheard.)"
+    )
+
+
 def names_note(renames: Mapping[str, str]) -> str:
     """The user's words for a name (or a Hindi word), as speech recognition heard them, and the documents' spelling
     (item 10; last round, item 1)."""

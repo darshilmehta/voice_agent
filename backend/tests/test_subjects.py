@@ -18,6 +18,7 @@ from app.services.retrieval import (
 from app.services.subjects import (
     asked_names,
     compares_documents,
+    devanagari_sound_key,
     documents_by_name,
     label_words,
     mentions,
@@ -26,6 +27,7 @@ from app.services.subjects import (
     named_documents,
     respell,
     sound_key,
+    subject_names,
 )
 from app.settings import RetrievalSection
 
@@ -371,6 +373,36 @@ def test_respelling_keeps_the_rest_of_the_question():
 def test_a_question_that_puts_the_documents_side_by_side_without_naming_them(question, compares):
     assert compares_documents([question]) is compares
     assert compares_documents([None, question]) is compares  # (the English query may be missing)
+
+
+# ------------------------------------------------------------------ last round: the subject an utterance names (item 4)
+
+FILE_LABELS = {
+    f: document_label(f, None)
+    for f in ("valmora_annual_report_fy24.pdf", "suryodaya_yojana_soochna.docx", "zephyra_investor_deck_q4fy24.pptx")
+}
+
+
+@pytest.mark.parametrize(
+    ("said", "names"),
+    [
+        ("Valmuraka, FY24, Meerajesh", {"valmora"}),  # "वालमोरा का FY24 में राजस्व" as Whisper wrote it
+        ("वालमोरा का FY24 में राजस्व", {"valmora"}),
+        ("ज़ेफायरा का एबिटडा मार्जिन", {"zephyra"}),
+        ("सूर्योदय योजना में कितनी सीटें हैं?", {"suryodaya"}),
+        ("What was Valmora's revenue?", {"valmora"}),
+        ("and FY23?", set()),
+        ("आवेदक की आयु कितनी होनी चाहिए?", set()),
+    ],
+)
+def test_the_documents_subject_an_utterance_names_spelled_misheard_or_in_devanagari(said, names):
+    assert subject_names(said, FILE_LABELS) == names
+
+
+def test_a_hindi_possessive_glued_to_a_misheard_name():
+    assert misheard_names(["Valmuraka, FY24, Meerajesh"], FILE_LABELS) == {"Valmuraka": "Valmora"}
+    assert devanagari_sound_key("वालमोरा") == sound_key("Valmora") == "vlmr"
+    assert devanagari_sound_key("ज़ेफायरा") == sound_key("Zephyra") == "sfr"
 
 
 # ------------------------------------------------------------------ last round: misheard Hindi words (item 1)
