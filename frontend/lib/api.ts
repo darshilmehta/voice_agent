@@ -265,7 +265,9 @@ export type ChatEvent =
   | { type: "sources"; payload: SourcesPayload }
   | { type: "delta"; text: string }
   | { type: "agent_message"; message: Message }
-  | { type: "error"; failure: StreamFailure };
+  | { type: "error"; failure: StreamFailure }
+  /** A visual preparing / ready / failed, or the whole canvas (`event: visual` / `event: canvas`): read by lib/canvas. */
+  | { type: "canvas"; name: "visual" | "canvas"; data: unknown };
 
 export interface SendMessageBody {
   /** 1–4000 characters. */
@@ -550,6 +552,18 @@ async function* sendMessage(
           type: "error",
           failure: { detail: typeof e.detail === "string" ? e.detail : "Something went wrong", stage: e.stage ?? null },
         };
+        break;
+      }
+      case "visual":
+      case "canvas": {
+        // Visuals are optional: a payload that can't be read is skipped, never an error for the answer.
+        let data: unknown = null;
+        try {
+          data = JSON.parse(ev.data);
+        } catch {
+          break;
+        }
+        yield { type: "canvas", name: ev.event, data };
         break;
       }
     }
