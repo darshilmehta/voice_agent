@@ -41,7 +41,10 @@ async def get_canvas(chat_id: str, canvas: Canvas) -> CanvasPanels:
 
 @router.post("/api/chats/{chat_id}/canvas/ops")
 async def canvas_op(chat_id: str, body: CanvasOp, canvas: Canvas) -> CanvasPanels:
-    """``remove``, ``pin``, ``unpin`` or ``move`` (to ``position``, 0-based, clamped) a panel; returns the canvas."""
+    """``remove``, ``pin``, ``unpin`` or ``move`` (to ``position``, 0-based, clamped) a panel, or ``add`` a copy of
+    another visual of the chat's project (an overview panel: "show in chat") as a new panel at ``position`` or at the
+    end; returns the canvas. ``add``: a visual of another project → 404, one built from documents outside the chat's
+    scope → 422."""
     return await canvas.apply(chat_id, body)
 
 

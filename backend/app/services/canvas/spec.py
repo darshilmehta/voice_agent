@@ -47,7 +47,9 @@ LIMITS: Final[dict[str, tuple[int, int, int, int]]] = {
     "timeline": (0, 1, 1, 20),
 }
 MAX_TILES: Final = 6
-SINGLE_UNIT_KINDS: Final = frozenset({"line", "bar", "grouped_bar", "stacked_bar", "waterfall", "donut"})
+# Kinds that put every series on one value axis. Lines and bars may mix units: the renderer draws small multiples on
+# a shared x axis (never a second y axis), each series with its own unit.
+SINGLE_UNIT_KINDS: Final = frozenset({"grouped_bar", "stacked_bar", "waterfall", "donut"})
 
 
 class SpecError(ValueError):
@@ -117,6 +119,8 @@ class ResolvedSeries:
     points: dict[str, Point]  # x label → point
     dataset_ids: list[str] = field(default_factory=list)
     total: Point | None = None  # donut / share: the table's total for this series, when it has one
+    metric: str = ""  # the label before it was told apart from a same-named series ("Revenue from operations")
+    source: str = ""  # what told it apart: the document's name or the table's title
 
 
 @dataclass(slots=True)
@@ -394,7 +398,15 @@ def resolve(
                 if {c.key for c in candidates if not c.is_total} <= parts:
                     total = Point(tv, ds)
         rs = ResolvedSeries(
-            key=key, label=label, unit=None, refs=[s], points=points, dataset_ids=[dataset_id], total=total
+            key=key,
+            label=label,
+            unit=None,
+            refs=[s],
+            points=points,
+            dataset_ids=[dataset_id],
+            total=total,
+            metric=label,
+            source=ds.title,
         )
         raw_series.append((s, rs, axis, candidates))
     if problems:
@@ -499,10 +511,11 @@ def resolve(
             key, n = f"{s.key}_{n}", n + 1
         used.add(key)
         s.key = key
+        ds = chosen[s.dataset_ids[0]]
+        name = document_name((filenames or {}).get(ds.document_id, "")) if len(documents_of[s.label]) > 1 else ""
+        s.source = name or ds.title
         if labels_seen[s.label] > 1:  # the same metric from two tables: name the document (or the table)
-            ds = chosen[s.dataset_ids[0]]
-            name = document_name((filenames or {}).get(ds.document_id, "")) if len(documents_of[s.label]) > 1 else ""
-            s.label = f"{s.label} ({name or ds.title})"
+            s.label = f"{s.label} ({s.source})"
     if len(series) < lo_s:
         problems.append(f"a {spec.kind} needs at least {lo_s} series ({len(series)} given)")
     if spec.kind in SINGLE_UNIT_KINDS and len({unit_name(s.unit) + str(s.unit) for s in series}) > 1:

@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001  (documents print en dashes and minus signs: the tests use them on purpose)
 """Numbers, units and periods as documents print them (services/canvas/parsing.py)."""
 
 from __future__ import annotations
@@ -160,7 +161,12 @@ def test_split_footnote():
 )
 def test_amount_units(text, label, currency, scale):
     unit = detect_amount_unit(text)
-    assert unit is not None and (unit.label, unit.currency, unit.scale, unit.kind) == (label, currency, scale, "currency")
+    assert unit is not None and (unit.label, unit.currency, unit.scale, unit.kind) == (
+        label,
+        currency,
+        scale,
+        "currency",
+    )
 
 
 @pytest.mark.parametrize(

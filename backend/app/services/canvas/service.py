@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import suppress
@@ -240,10 +241,15 @@ class CanvasService:
                 filenames = await self.store.filenames(project_id)
                 by_id = {d.id: d for d in datasets}
                 built: list[tuple[Visual, dict[str, object], list[str]]] = []
+                # a panel rebuilt from the same spec keeps its id (a "show in chat" from a page loaded earlier works)
+                previous = await self.store.overview_ids_by_spec(project_id)
 
                 def check(spec: VisualSpec) -> bool:
+                    key = _spec_key(spec.model_dump(mode="json", by_alias=True))
                     try:
-                        visual = self._build(spec, by_id, filenames, project_id=project_id, chat_id=None)
+                        visual = self._build(
+                            spec, by_id, filenames, project_id=project_id, chat_id=None, visual_id=previous.get(key)
+                        )
                     except (SpecError, AssertionError) as e:
                         log.info("canvas overview: skipped a %s (%s)", spec.kind, e)
                         return False
@@ -273,7 +279,7 @@ class CanvasService:
     async def apply(self, chat_id: str, op: CanvasOp) -> CanvasPanels:
         if op.op == "move" and op.position is None:
             raise InvalidInput("move needs a position")
-        return CanvasPanels(panels=await self.store.apply(chat_id, op))
+        return CanvasPanels(panels=await self.store.apply(chat_id, op, max_panels=self.cfg.max_panels))
 
     def _build(
         self,
@@ -376,6 +382,10 @@ class CanvasService:
         yield VisualEvent(phase="ready", visual_id=visual_id, visual=stored)
         with suppress(Exception):
             yield CanvasEvent(panels=await self.store.panels(chat_id))
+
+
+def _spec_key(spec: dict[str, object]) -> str:
+    return json.dumps(spec, sort_keys=True, ensure_ascii=False)
 
 
 def _documents(spec: VisualSpec, datasets: dict[str, TypedDataset]) -> list[str]:

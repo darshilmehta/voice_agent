@@ -57,7 +57,12 @@ def test_multi_row_header_with_spanning_cells():
     assert list(cols) == ["segment", "revenue_fy24", "revenue_fy23", "ebitda_fy24", "ebitda_fy23"]
     assert cols["revenue_fy23"].header == ["Revenue", "FY23"]
     assert (cols["ebitda_fy24"].measure, cols["ebitda_fy24"].period.label) == ("EBITDA", "FY24")  # type: ignore[union-attr]
-    assert values(ds, "chemicals") == {"revenue_fy24": 3568, "revenue_fy23": 3214, "ebitda_fy24": 862, "ebitda_fy23": 745}
+    assert values(ds, "chemicals") == {
+        "revenue_fy24": 3568,
+        "revenue_fy23": 3214,
+        "ebitda_fy24": 862,
+        "ebitda_fy23": 745,
+    }
     assert ds.row("total").parts == ["chemicals", "plastics"]  # type: ignore[union-attr]
     assert ds.chartability.period_order == ["FY23", "FY24"]
 
@@ -146,7 +151,10 @@ def test_unit_from_caption_header_cell_and_note():
 
 def test_document_unit_only_for_amount_rows():
     report = table(HIGHLIGHTS, index=0)
-    note = table([["Matter", "31 Mar 2024", "31 Mar 2023"], ["Disputed tax demands", "38", "31"], ["Employees", "9", "8"]], index=1)
+    note = table(
+        [["Matter", "31 Mar 2024", "31 Mar 2023"], ["Disputed tax demands", "38", "31"], ["Employees", "9", "8"]],
+        index=1,
+    )
     contexts = {0: TableContext(before=["Amounts are in ₹ crore unless stated otherwise."])}
     assert document_unit([report, note], contexts).label == "₹ crore"  # type: ignore[union-attr]
     _, ds = typed_document([report, note], contexts)
@@ -256,7 +264,11 @@ def test_chartability_of_the_report():
         "glossary": "none",
     }
     q = ds["q_fy24"].chartability
-    assert (q.period_axis, q.granularity, q.period_order) == ("rows", "quarter", ["Q1 FY24", "Q2 FY24", "Q3 FY24", "Q4 FY24"])
+    assert (q.period_axis, q.granularity, q.period_order) == (
+        "rows",
+        "quarter",
+        ["Q1 FY24", "Q2 FY24", "Q3 FY24", "Q4 FY24"],
+    )
     h = ds["highlights"].chartability
     assert h.period_axis == "columns" and h.period_order == ["FY23", "FY24"]  # printed FY24 first
     assert {o.kind for o in h.options} >= {"kpi", "time_series"}
@@ -264,7 +276,13 @@ def test_chartability_of_the_report():
 
 
 def test_shares_adding_to_100_are_a_composition():
-    rows = [["Category", "Share of equity capital"], ["Promoters", "54.8%"], ["FPIs", "17.3%"], ["Mutual funds", "14.6%"], ["Public", "13.3%"]]
+    rows = [
+        ["Category", "Share of equity capital"],
+        ["Promoters", "54.8%"],
+        ["FPIs", "17.3%"],
+        ["Mutual funds", "14.6%"],
+        ["Public", "13.3%"],
+    ]
     assert typed(rows).chartability.kind == "composition"
     rows[1][1] = "60.0%"
     assert typed(rows).chartability.kind == "categorical"
@@ -274,7 +292,7 @@ def test_dates_make_a_timeline():
     ds = typed(DATES_HI)
     assert ds.chartability.kind == "timeline"
     assert ds.columns[1].type == "date"
-    assert [t.text for t in ds.texts if t.col == ds.columns[1].key][0] == "20 सितंबर 2024"
+    assert next(t.text for t in ds.texts if t.col == ds.columns[1].key) == "20 सितंबर 2024"
 
 
 def test_confidence_grows_with_periods():
@@ -287,9 +305,15 @@ def test_confidence_grows_with_periods():
 
 def test_table_contexts_from_the_parsed_document():
     items = [
-        ParsedItem(ref="#/texts/0", label="section_header", text="Segment results", page=18, heading_path=["Segment results"]),
-        ParsedItem(ref="#/texts/1", label="text", text="Shown below (₹ crore).", page=18, heading_path=["Segment results"]),
-        ParsedItem(ref="#/tables/0", label="table", text="|…|", page=18, heading_path=["Segment results"], table_index=0),
+        ParsedItem(
+            ref="#/texts/0", label="section_header", text="Segment results", page=18, heading_path=["Segment results"]
+        ),
+        ParsedItem(
+            ref="#/texts/1", label="text", text="Shown below (₹ crore).", page=18, heading_path=["Segment results"]
+        ),
+        ParsedItem(
+            ref="#/tables/0", label="table", text="|…|", page=18, heading_path=["Segment results"], table_index=0
+        ),
         ParsedItem(ref="#/texts/2", label="text", text="1. Net of inter-segment sales.", page=18, heading_path=[]),
         ParsedItem(ref="#/texts/3", label="section_header", text="Next", page=19, heading_path=["Next"]),
     ]

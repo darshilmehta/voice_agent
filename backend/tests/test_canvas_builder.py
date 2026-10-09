@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001  (documents print en dashes and minus signs: the tests use them on purpose)
 """Building visuals from resolved specs, and the grounding invariant (services/canvas/builder.py).
 
 Every number in a Visual is a cell value (its CellRef's printed text parses back to it) or a Calculation listed in
@@ -27,7 +28,9 @@ from .canvas_helpers import DATES_HI, DISTRICTS_HI, report_datasets, typed
 
 NOW = datetime(2026, 10, 9, 12, tzinfo=UTC)
 DS = report_datasets()
-DS["districts"] = typed(DISTRICTS_HI, dataset_id="ds_districts", document_id="doc_hi", heading=("जिलेवार बजट",), page=None)
+DS["districts"] = typed(
+    DISTRICTS_HI, dataset_id="ds_districts", document_id="doc_hi", heading=("जिलेवार बजट",), page=None
+)
 DS["dates"] = typed(DATES_HI, dataset_id="ds_dates", document_id="doc_hi", heading=("तिथियाँ",), page=None)
 BY_ID = {d.id: d for d in DS.values()}
 FILENAMES = {"doc_1": "valmora_annual_report_fy24.pdf", "doc_hi": "suryodaya_notice.docx"}
@@ -37,7 +40,13 @@ H, SEG, Q24, Q23, CF = "ds_highlights", "ds_segments", "ds_q_fy24", "ds_q_fy23",
 def build(sources: list[Citation] | None = None, **kw) -> Visual:
     r = resolve(VisualSpec.model_validate(kw), BY_ID, filenames=FILENAMES)
     return build_visual(
-        r, visual_id="vis_t", project_id="prj_t", chat_id="cht_t", filenames=FILENAMES, now=NOW, existing_sources=sources or []
+        r,
+        visual_id="vis_t",
+        project_id="prj_t",
+        chat_id="cht_t",
+        filenames=FILENAMES,
+        now=NOW,
+        existing_sources=sources or [],
     )
 
 
@@ -75,8 +84,12 @@ def assert_grounded(v: Visual) -> None:
             assert t.delta.calculation in v.calculations and t.delta.value == t.delta.calculation.value
     shown = [x for r in v.rows for x in r.values.values() if x is not None] + [t.value for t in v.tiles] + calc_values
     labels = " ".join(
-        [r.x for r in v.rows] + [s.label for s in v.series] + [t.label for t in v.tiles] + [e.date for e in v.events]
-        + [e.label for e in v.events] + [c.label for c in v.calculations]
+        [r.x for r in v.rows]
+        + [s.label for s in v.series]
+        + [t.label for t in v.tiles]
+        + [e.date for e in v.events]
+        + [e.label for e in v.events]
+        + [c.label for c in v.calculations]
         + [str(p) for s in v.sources for p in (s.page_start, s.page_end) if p is not None]
     )
     label_numbers = {t.replace(",", "").replace("−", "-").lstrip("+") for t in _NUM.findall(labels)}
@@ -97,7 +110,9 @@ def all_specs():
     for ds in DS.values():
         rows = [r.key for r in ds.rows if r.type != "section"]
         cols = [c.key for c in series_columns(ds)]
-        periods = list(dict.fromkeys(p.label for p in [*(c.period for c in ds.columns), *(r.period for r in ds.rows)] if p))
+        periods = list(
+            dict.fromkeys(p.label for p in [*(c.period for c in ds.columns), *(r.period for r in ds.rows)] if p)
+        )
         series_options = [[k] for k in rows + cols] + [rows[:2], rows[:3], cols[:2], cols[:3], rows[1:4], cols[1:3]]
         for kind, series in itertools.product(VISUAL_KINDS, series_options):
             if not series and kind != "timeline":
@@ -112,11 +127,17 @@ def all_specs():
                 calcs = [{"op": op, "series": base["series"][0]} for op in CALC_OPS if op != "ratio"]
                 variants += [{**base, "calculations": [c]} for c in calcs]
             if len(series) >= 2:
-                variants.append({**base, "calculations": [{"op": "ratio", "series": base["series"][0], "other": base["series"][1]}]})
+                variants.append(
+                    {**base, "calculations": [{"op": "ratio", "series": base["series"][0], "other": base["series"][1]}]}
+                )
             for language in ("en", "hi"):
                 for v in variants:
                     yield {**v, "language": language}
-    yield {"kind": "line", "datasets": [Q23, Q24], "series": [f"{Q23}:revenue", f"{Q24}:revenue", f"{Q23}:ebitda", f"{Q24}:ebitda"]}
+    yield {
+        "kind": "line",
+        "datasets": [Q23, Q24],
+        "series": [f"{Q23}:revenue", f"{Q24}:revenue", f"{Q23}:ebitda", f"{Q24}:ebitda"],
+    }
     yield {"kind": "timeline", "datasets": ["ds_dates"]}
     cf = DS["cash_flow"]
     yield {
@@ -163,7 +184,12 @@ def tampered(v: Visual, **changes) -> list[str]:
 
 
 def test_tampering_is_detected():
-    v = build(kind="line", datasets=[Q24], series=[f"{Q24}:revenue"], calculations=[{"op": "growth", "series": f"{Q24}:revenue"}])
+    v = build(
+        kind="line",
+        datasets=[Q24],
+        series=[f"{Q24}:revenue"],
+        calculations=[{"op": "growth", "series": f"{Q24}:revenue"}],
+    )
     assert check_grounding(v) == []
     row = v.rows[0]
     assert tampered(v, rows=[row.model_copy(update={"values": {"revenue": 9999.0}}), *v.rows[1:]])
@@ -192,7 +218,16 @@ def test_tile_deltas_must_be_listed_calculations():
 
 def test_line_over_merged_quarterly_tables():
     v = build(kind="line", datasets=[Q23, Q24], series=[f"{Q23}:revenue", f"{Q24}:revenue"])
-    assert [r.x for r in v.rows] == ["Q1 FY23", "Q2 FY23", "Q3 FY23", "Q4 FY23", "Q1 FY24", "Q2 FY24", "Q3 FY24", "Q4 FY24"]
+    assert [r.x for r in v.rows] == [
+        "Q1 FY23",
+        "Q2 FY23",
+        "Q3 FY23",
+        "Q4 FY23",
+        "Q1 FY24",
+        "Q2 FY24",
+        "Q3 FY24",
+        "Q4 FY24",
+    ]
     assert (v.x.key, v.x.label, v.x.type, v.unit.label) == ("quarter", "Quarter", "period", "₹ crore")  # type: ignore[union-attr]
     assert v.summary == "Revenue went from ₹1,512 crore in Q1 FY23 to ₹1,933 crore in Q4 FY24 (+27.8%)."
     assert [c.op for c in v.calculations] == ["growth"]
@@ -202,10 +237,19 @@ def test_line_over_merged_quarterly_tables():
 
 
 def test_kpi_tiles_with_deltas():
-    v = build(kind="kpi", datasets=[H], series=[f"{H}:revenue_from_operations", f"{H}:ebitda_margin", f"{H}:net_debt_to_ebitda"])
+    v = build(
+        kind="kpi",
+        datasets=[H],
+        series=[f"{H}:revenue_from_operations", f"{H}:ebitda_margin", f"{H}:net_debt_to_ebitda"],
+    )
     assert v.x is None and v.rows == [] and len(v.tiles) == 3
     rev, margin, nd = v.tiles
-    assert (rev.label, rev.value, rev.delta.kind, rev.delta.value) == ("Revenue from operations (FY24)", 7365, "pct", 13.6)  # type: ignore[union-attr]
+    assert (rev.label, rev.value, rev.delta.kind, rev.delta.value) == (
+        "Revenue from operations (FY24)",
+        7365,
+        "pct",
+        13.6,
+    )  # type: ignore[union-attr]
     assert (margin.delta.kind, margin.delta.value) == ("pp", 1.2)  # type: ignore[union-attr]
     assert (nd.delta.kind, nd.delta.value) == ("abs", -0.39)  # type: ignore[union-attr]
     assert v.summary.startswith("Revenue from operations (FY24): ₹7,365 crore (+13.6%)")
@@ -228,7 +272,13 @@ def test_waterfall_reconciles_and_uses_magnitudes():
     keys = [r.key for r in cf.rows]
     begin = next(k for k in keys if k.startswith("cash_and_cash_equivalents_at_the_beginning"))
     end = next(k for k in keys if k.startswith("cash_and_cash_equivalents_at_the_end"))
-    order = [begin, "net_cash_generated_from_operating_activities", "net_cash_used_in_investing_activities", "net_cash_used_in_financing_activities", end]
+    order = [
+        begin,
+        "net_cash_generated_from_operating_activities",
+        "net_cash_used_in_investing_activities",
+        "net_cash_used_in_financing_activities",
+        end,
+    ]
     v = build(kind="waterfall", datasets=[CF], series=[f"{CF}:fy24"], categories=[ref(CF, k) for k in order])
     assert [s.key for s in v.series] == ["total", "increase", "decrease"]
     assert [{k: x for k, x in r.values.items() if x is not None} for r in v.rows] == [
@@ -238,6 +288,7 @@ def test_waterfall_reconciles_and_uses_magnitudes():
         {"decrease": 446},
         {"total": 612},
     ]
+    assert [r.kind for r in v.rows] == ["total", "delta", "delta", "delta", "total"]
     assert v.rows[2].cells["decrease"].text == "(712)"  # type: ignore[union-attr]
     (bridge,) = v.calculations
     assert bridge.formula_text == "486 + 1,284 − 712 − 446 = 612"
@@ -245,12 +296,125 @@ def test_waterfall_reconciles_and_uses_magnitudes():
         build(kind="waterfall", datasets=[CF], series=[f"{CF}:fy24"], categories=[ref(CF, k) for k in order[:-1]])
 
 
+def test_waterfall_subtotals_are_totals():
+    rows = [
+        ["Particulars", "FY24"],
+        ["Cash at the beginning of the year", "486"],
+        ["Net cash from operating activities", "1,284"],
+        ["Net cash used in investing activities", "(712)"],
+        ["Subtotal before financing", "1,058"],
+        ["Net cash used in financing activities", "(446)"],
+        ["Cash at the end of the year", "612"],
+    ]
+    ds = typed(rows, dataset_id="ds_bridge", before=["(₹ crore)"])
+    keys = [r.key for r in ds.rows]
+    spec = VisualSpec(
+        kind="waterfall",
+        datasets=["ds_bridge"],
+        series=["ds_bridge:fy24"],
+        categories=[ref("ds_bridge", k) for k in keys],
+    )
+    v = build_visual(
+        resolve(spec, {"ds_bridge": ds}), visual_id="v", project_id="p", chat_id=None, filenames={}, now=NOW
+    )
+    assert [(r.x, r.kind) for r in v.rows] == [
+        ("Cash at the beginning of the year", "total"),
+        ("Net cash from operating activities", "delta"),
+        ("Net cash used in investing activities", "delta"),
+        ("Subtotal before financing", "total"),
+        ("Net cash used in financing activities", "delta"),
+        ("Cash at the end of the year", "total"),
+    ]
+    assert v.rows[3].values["total"] == 1058
+    assert v.calculations[0].formula_text == "486 + 1,284 − 712 − 446 = 612"  # the subtotal is shown, not added
+    assert check_grounding(v) == []
+
+
+def test_donut_of_printed_percentages_keeps_them():
+    rows = [["Category", "Share of equity capital"], ["Promoters", "54.8%"], ["FPIs", "17.3%"], ["Public", "27.9%"]]
+    ds = typed(rows, dataset_id="ds_holding")
+    spec = VisualSpec(kind="donut", datasets=["ds_holding"], series=["ds_holding:share_of_equity_capital"])
+    v = build_visual(
+        resolve(spec, {"ds_holding": ds}), visual_id="v", project_id="p", chat_id=None, filenames={}, now=NOW
+    )
+    assert [r.values["share_of_equity_capital"] for r in v.rows] == [54.8, 17.3, 27.9]  # 54.8 means 54.8%
+    assert v.unit is not None and v.unit.kind == "percent" and v.calculations == []
+
+
 def test_comparison_of_two_periods_and_hindi_summary():
-    v = build(kind="comparison", datasets=[H], series=[f"{H}:ebitda"], language="hi")
-    assert [t.label for t in v.tiles] == ["EBITDA (FY23)", "EBITDA (FY24)"]
-    assert v.tiles[1].delta is not None and v.tiles[1].delta.value == 20.4
+    v = build(kind="comparison", datasets=[H], series=[f"{H}:ebitda", f"{H}:ebitda_margin"], language="hi")
+    # the sides are the series, the metrics the rows, each metric's change the tile with the row's label
+    assert v.x is None
+    assert [(s.key, s.label, s.unit) for s in v.series] == [("fy23", "FY23", None), ("fy24", "FY24", None)]
+    assert [(r.x, r.values) for r in v.rows] == [
+        ("EBITDA", {"fy23": 1283, "fy24": 1545}),
+        ("EBITDA margin", {"fy23": 19.8, "fy24": 21.0}),
+    ]
+    assert [t.label for t in v.tiles] == [r.x for r in v.rows]
+    assert [(t.value, t.delta.kind, t.delta.value) for t in v.tiles] == [(1545, "pct", 20.4), (21.0, "pp", 1.2)]  # type: ignore[union-attr]
+    assert v.highlight is None
     assert "बनाम" in v.summary and "करोड़" in v.summary
     assert v.language == "hi" and "पृ." in (v.subtitle or "")
+
+
+def test_comparison_of_two_documents():
+    other = typed(
+        [["Metric", "FY24", "FY23"], ["Revenue from operations (₹ crore)", "4,986", "4,437"]],
+        dataset_id="ds_zephyra",
+        document_id="doc_z",
+        heading=("Zephyra at a glance",),
+    )
+    pool = {**BY_ID, "ds_zephyra": other}
+    names = {**FILENAMES, "doc_z": "zephyra_investor_deck_q4fy24.pptx"}
+    spec = VisualSpec(
+        kind="comparison",
+        datasets=[H, "ds_zephyra"],
+        series=[f"{H}:revenue_from_operations", "ds_zephyra:revenue_from_operations"],
+        periods=["FY24"],
+    )
+    v = build_visual(
+        resolve(spec, pool, filenames=names), visual_id="v", project_id="p", chat_id=None, filenames=names, now=NOW
+    )
+    assert [s.label for s in v.series] == ["Valmora annual report fy24", "Zephyra investor deck q4fy24"]
+    assert [s.better for s in v.series] == ["up", "up"]
+    (row,) = v.rows
+    assert row.x == "Revenue from operations (FY24)" and list(row.values.values()) == [7365, 4986]
+    (tile,) = v.tiles
+    assert tile.label == row.x and tile.value == 4986
+    assert tile.delta is not None and (tile.delta.kind, tile.delta.value) == ("abs", -2379)
+    assert tile.delta.calculation.formula_text == "4,986 − 7,365 = −₹2,379 crore"
+    assert check_grounding(v) == []
+
+
+def test_kpi_lists_a_series_per_tile_with_its_direction():
+    v = build(
+        kind="kpi",
+        datasets=[H],
+        series=[f"{H}:revenue_from_operations", f"{H}:net_debt_to_ebitda", f"{H}:number_of_employees"],
+    )
+    assert [(s.label, s.better) for s in v.series] == [
+        ("Revenue from operations (FY24)", "up"),
+        ("Net debt to EBITDA (FY24)", "down"),
+        ("Number of employees (FY24)", None),
+    ]
+    assert [s.label for s in v.series] == [t.label for t in v.tiles] and v.rows == []
+
+
+def test_better_direction():
+    from app.services.canvas.builder import better_direction
+
+    up = ["Revenue from operations", "EBITDA margin", "Profit after tax", "Return on capital employed", "राजस्व"]
+    down = [
+        "Net debt to EBITDA",
+        "Cost of materials consumed",
+        "Finance costs",
+        "Voluntary attrition rate",
+        "Borrowings",
+    ]
+    unclear = ["Total assets", "Number of employees", "Net cash used in investing activities", "Inventories"]
+    assert [better_direction(m) for m in up] == ["up"] * len(up)
+    assert [better_direction(m) for m in down] == ["down"] * len(down)
+    assert [better_direction(m) for m in unclear] == [None] * len(unclear)
 
 
 def test_timeline_events_in_date_order():
@@ -270,8 +434,24 @@ def test_highlight_note_and_titles():
 
 def test_sources_reuse_the_turns_ids():
     existing = [
-        Citation(source_id="S1", document_id="doc_1", filename="r.pdf", page_start=7, page_end=7, chunk_id="doc_1:v1:0099", snippet="…"),
-        Citation(source_id="S2", document_id="doc_1", filename="r.pdf", page_start=19, page_end=19, chunk_id=DS["q_fy24"].chunk_id, snippet="…"),
+        Citation(
+            source_id="S1",
+            document_id="doc_1",
+            filename="r.pdf",
+            page_start=7,
+            page_end=7,
+            chunk_id="doc_1:v1:0099",
+            snippet="…",
+        ),
+        Citation(
+            source_id="S2",
+            document_id="doc_1",
+            filename="r.pdf",
+            page_start=19,
+            page_end=19,
+            chunk_id=DS["q_fy24"].chunk_id,
+            snippet="…",
+        ),
     ]
     v = build(sources=existing, kind="line", datasets=[Q23, Q24], series=[f"{Q23}:revenue", f"{Q24}:revenue"])
     by_page = {c.page_start: c.source_id for c in v.sources}
@@ -298,8 +478,25 @@ def test_contract_shape():
     }  # fmt: skip
     assert set(v["unit"]) == {"kind", "currency", "scale", "label"}
     assert set(v["x"]) == {"key", "label", "type"}
-    assert set(v["series"][0]) == {"key", "label", "unit", "calculated"}
-    assert set(v["rows"][0]) == {"x", "values", "cells"}
-    assert set(v["rows"][0]["cells"]["revenue"]) == {"source_id", "document_id", "table_id", "page", "row", "col", "text"}
-    assert set(v["sources"][0]) == {"source_id", "document_id", "filename", "page_start", "page_end", "chunk_id", "snippet"}
+    assert set(v["series"][0]) == {"key", "label", "unit", "calculated", "better"}  # better: additive
+    assert set(v["rows"][0]) == {"x", "values", "cells", "kind"}  # kind: additive, waterfall only
+    assert v["rows"][0]["kind"] is None
+    assert set(v["rows"][0]["cells"]["revenue"]) == {
+        "source_id",
+        "document_id",
+        "table_id",
+        "page",
+        "row",
+        "col",
+        "text",
+    }
+    assert set(v["sources"][0]) == {
+        "source_id",
+        "document_id",
+        "filename",
+        "page_start",
+        "page_end",
+        "chunk_id",
+        "snippet",
+    }
     assert set(Calculation.model_fields) == {"label", "op", "value", "unit", "inputs", "formula_text"}

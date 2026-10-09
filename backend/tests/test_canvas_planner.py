@@ -56,7 +56,10 @@ def test_visual_intent(question, intent):
 
 def test_an_answer_full_of_numbers_suggests_a_visual():
     assert visual_intent("What were the results?") == "none"
-    assert visual_intent("What were the results?", "Revenue ₹7,365 crore, EBITDA ₹1,545 crore, margin 21.0%.") == "suggested"
+    assert (
+        visual_intent("What were the results?", "Revenue ₹7,365 crore, EBITDA ₹1,545 crore, margin 21.0%.")
+        == "suggested"
+    )
 
 
 def test_candidates_ranked_by_the_question():
@@ -146,11 +149,19 @@ def planner(llm: FakeLLM, **kw) -> VisualPlanner:
 
 async def test_plan_with_the_model():
     llm = FakeLLM()
-    llm.route = {"kind": "line", "datasets": ["D1"], "series": ["D1 · Revenue", "D1 · EBITDA"], "title": "Revenue and EBITDA"}
+    llm.route = {
+        "kind": "line",
+        "datasets": ["D1"],
+        "series": ["D1 · Revenue", "D1 · EBITDA"],
+        "title": "Revenue and EBITDA",
+    }
     result = await planner(llm).plan_detailed("Show me revenue and EBITDA by quarter", "en", POOL, filenames=NAMES)
     assert result.source == "model" and result.intent == "requested"
     assert result.spec == VisualSpec(
-        kind="line", datasets=["ds_q_fy24"], series=["ds_q_fy24:revenue", "ds_q_fy24:ebitda"], title="Revenue and EBITDA"
+        kind="line",
+        datasets=["ds_q_fy24"],
+        series=["ds_q_fy24:revenue", "ds_q_fy24:ebitda"],
+        title="Revenue and EBITDA",
     )
     (call,) = llm.json_calls
     assert call["model"] == "qwen3:4b-instruct" and call["max_tokens"] == 160
@@ -197,11 +208,13 @@ async def test_timeouts_and_failures():
 
 async def test_no_candidates():
     llm = FakeLLM()
-    assert (await planner(llm).plan_detailed("show the glossary", "en", [DS["glossary"]])).reason == "no chartable table"
+    assert (
+        await planner(llm).plan_detailed("show the glossary", "en", [DS["glossary"]])
+    ).reason == "no chartable table"
 
 
 def test_prompt_in_hindi_keeps_the_catalog():
     cat = build_catalog([DS["q_fy24"]], NAMES, "hi")
-    system, user = planner_messages("तिमाही राजस्व दिखाओ", "hi", cat, answer="राजस्व बढ़ा।")
+    _system, user = planner_messages("तिमाही राजस्व दिखाओ", "hi", cat, answer="राजस्व बढ़ा।")
     assert "Language for the title: Hindi" in user.content and "Spoken answer: राजस्व बढ़ा।" in user.content
     assert 'D1 "Q Fy24"' in user.content

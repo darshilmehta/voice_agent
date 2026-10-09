@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001  (documents print en dashes and minus signs: the tests use them on purpose)
 """VisualSpec validation against real datasets, and the calculator (services/canvas/spec.py, calculator.py)."""
 
 from __future__ import annotations
@@ -57,7 +58,10 @@ def test_same_named_series_of_continuing_tables_merge():
 
 
 def test_measure_by_period_columns_pick_one_measure():
-    r = resolve(spec(kind="stacked_bar", datasets=[SEG], series=[f"{SEG}:specialty_chemicals", f"{SEG}:engineered_plastics"]), BY_ID)
+    r = resolve(
+        spec(kind="stacked_bar", datasets=[SEG], series=[f"{SEG}:specialty_chemicals", f"{SEG}:engineered_plastics"]),
+        BY_ID,
+    )
     assert [i.label for i in r.x_items] == ["FY23", "FY24"]
     assert r.series[0].label == "Specialty Chemicals · Revenue"
     r = resolve(
@@ -75,7 +79,12 @@ def test_measure_by_period_columns_pick_one_measure():
 
 def test_categories_pick_and_order_x_values():
     r = resolve(
-        spec(kind="donut", datasets=[SEG], series=[f"{SEG}:revenue_fy24"], categories=[f"{SEG}:digital_services", f"{SEG}:specialty_chemicals"]),
+        spec(
+            kind="donut",
+            datasets=[SEG],
+            series=[f"{SEG}:revenue_fy24"],
+            categories=[f"{SEG}:digital_services", f"{SEG}:specialty_chemicals"],
+        ),
         BY_ID,
     )
     assert [i.label for i in r.x_items] == ["Digital Services", "Specialty Chemicals"]
@@ -127,18 +136,29 @@ def test_rejects_the_x_axis_contradicting_the_series():
     assert "is not an axis" in p
 
 
-def test_rejects_mixed_units_on_one_axis():
-    (p,) = problems(kind="line", datasets=[Q24], series=[f"{Q24}:revenue", f"{Q24}:ebitda_margin"])
+def test_mixed_units_only_where_the_renderer_draws_small_multiples():
+    (p,) = problems(kind="grouped_bar", datasets=[Q24], series=[f"{Q24}:revenue", f"{Q24}:ebitda_margin"])
     assert "plots one unit" in p and "%" in p and "₹ crore" in p
-    resolve(spec(kind="table", datasets=[Q24], series=[f"{Q24}:revenue", f"{Q24}:ebitda_margin"]), BY_ID)  # fine
+    assert any(
+        "plots one unit" in p
+        for p in problems(kind="stacked_bar", datasets=[Q24], series=[f"{Q24}:revenue", f"{Q24}:ebitda_margin"])
+    )
+    for kind in ("line", "bar", "table"):  # each series keeps its own unit
+        r = resolve(spec(kind=kind, datasets=[Q24], series=[f"{Q24}:revenue", f"{Q24}:ebitda_margin"]), BY_ID)
+        assert [s.unit.label for s in r.series] == ["₹ crore", "%"]  # type: ignore[union-attr]
 
 
 def test_kind_specific_rules():
     assert any("needs periods" in p for p in problems(kind="line", datasets=[SEG], series=[f"{SEG}:revenue_fy24"]))
     assert any("not periods" in p for p in problems(kind="donut", datasets=[Q24], series=[f"{Q24}:revenue"]))
-    assert any("negative" in p for p in problems(kind="stacked_bar", datasets=[CF], series=[f"{CF}:fy24", f"{CF}:fy23"]))
+    assert any(
+        "negative" in p for p in problems(kind="stacked_bar", datasets=[CF], series=[f"{CF}:fy24", f"{CF}:fy23"])
+    )
     assert any("at least 2 series" in p for p in problems(kind="grouped_bar", datasets=[H], series=[f"{H}:ebitda"]))
-    assert any("needs at least 2 x values" in p for p in problems(kind="line", datasets=[H], series=[f"{H}:ebitda"], periods=["FY24"]))
+    assert any(
+        "needs at least 2 x values" in p
+        for p in problems(kind="line", datasets=[H], series=[f"{H}:ebitda"], periods=["FY24"])
+    )
 
 
 def test_size_limits():
@@ -158,11 +178,23 @@ def test_size_limits():
 def test_rejects_unresolvable_highlights_and_calculations():
     (p,) = problems(kind="bar", datasets=[H], series=[f"{H}:ebitda"], highlight=["FY21"])
     assert "highlight 'FY21'" in p
-    (p,) = problems(kind="bar", datasets=[H], series=[f"{H}:ebitda"], calculations=[{"op": "growth", "series": f"{H}:revenue_from_operations"}])
+    (p,) = problems(
+        kind="bar",
+        datasets=[H],
+        series=[f"{H}:ebitda"],
+        calculations=[{"op": "growth", "series": f"{H}:revenue_from_operations"}],
+    )
     assert "not one of the visual's series" in p
-    (p,) = problems(kind="bar", datasets=[H], series=[f"{H}:ebitda"], calculations=[{"op": "ratio", "series": f"{H}:ebitda"}])
+    (p,) = problems(
+        kind="bar", datasets=[H], series=[f"{H}:ebitda"], calculations=[{"op": "ratio", "series": f"{H}:ebitda"}]
+    )
     assert "needs 'other'" in p
-    (p,) = problems(kind="bar", datasets=[H], series=[f"{H}:ebitda"], calculations=[{"op": "growth", "series": f"{H}:ebitda", "from": "FY20"}])
+    (p,) = problems(
+        kind="bar",
+        datasets=[H],
+        series=[f"{H}:ebitda"],
+        calculations=[{"op": "growth", "series": f"{H}:ebitda", "from": "FY20"}],
+    )
     assert "'FY20' is not an x value" in p
 
 
@@ -211,7 +243,9 @@ def test_cagr_uses_the_periods():
 
 
 def test_diff_in_percentage_points_and_units():
-    c = calc.diff(op(19.8, "19.8%", PERCENT, period="FY23"), op(21.0, "21.0%", PERCENT, period="FY24"), series="EBITDA margin")
+    c = calc.diff(
+        op(19.8, "19.8%", PERCENT, period="FY23"), op(21.0, "21.0%", PERCENT, period="FY24"), series="EBITDA margin"
+    )
     assert (c.value, c.unit.label, c.formula_text) == (1.2, "pp", "21.0 − 19.8 = +1.2 pp")  # type: ignore[union-attr]
     c = calc.diff(op(0.93, "0.93x", RATIO), op(0.54, "0.54x", RATIO), series="ND/EBITDA")
     assert c.value == -0.39 and c.unit == RATIO
@@ -220,7 +254,11 @@ def test_diff_in_percentage_points_and_units():
 def test_ratio_share_and_sum():
     c = calc.ratio(op(1545, "1,545"), op(7365, "7,365"), series="EBITDA", other="Revenue", at="FY24")
     assert (c.value, c.unit) == (0.21, RATIO)
-    parts = [op(3568, "3,568", label="Chemicals"), op(2303, "2,303", label="Plastics"), op(1494, "1,494", label="Digital")]
+    parts = [
+        op(3568, "3,568", label="Chemicals"),
+        op(2303, "2,303", label="Plastics"),
+        op(1494, "1,494", label="Digital"),
+    ]
     s = calc.share(parts[0], parts, total_label="Revenue")
     assert s.value == 48.4 and len(s.inputs) == 4  # the part, then the whole it is a share of
     assert s.formula_text == "3,568 ÷ (3,568 + 2,303 + 1,494) × 100 = 48.4%"

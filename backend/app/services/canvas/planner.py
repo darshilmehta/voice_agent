@@ -270,7 +270,7 @@ Kinds:
 
 Rules:
 - "datasets": the tables you use (usually one).
-- "series": what is plotted. Charts other than kpi and table need series in one unit.
+- "series": what is plotted. grouped_bar, stacked_bar, donut and waterfall need series in one unit.
 - For periods running across a table's columns, the series are its rows; for periods down its rows, its columns.
 - "periods": only the periods the user asked about (empty = all).
 - "categories": only the rows or columns to show (empty = all).

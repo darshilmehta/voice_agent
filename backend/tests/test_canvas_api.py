@@ -29,7 +29,10 @@ Revenue grew in every quarter.\f| Metric | FY24 | FY23 |
 | Digital Services | 1,494 | 1,142 |
 | Total | 7,365 | 6,482 |
 """.encode()
-POLICY = b"Travel policy\n\nHotel limits apply per night.\f| Grade | Tier-1 city (\xe2\x82\xb9 per night) |\n| L1 to L2 | 5,500 |\n| L3 to L4 | 7,500 |"
+POLICY = (
+    "Travel policy\n\nHotel limits apply per night.\f"
+    "| Grade | Tier-1 city (₹ per night) |\n| L1 to L2 | 5,500 |\n| L3 to L4 | 7,500 |"
+).encode()
 
 
 def run(api: TestClient, fn, *args, **kwargs):
@@ -83,9 +86,13 @@ def ready_report(api: TestClient) -> tuple[str, str, dict[str, dict]]:
 
 
 def test_tables_are_typed_after_ingestion(app):
-    p, doc, ds = ready_report(app)
+    _p, doc, ds = ready_report(app)
     assert list(ds) == ["p2", "p3", "p4"]
-    assert {k: d["chartability"]["kind"] for k, d in ds.items()} == {"p2": "kpi", "p3": "time_series", "p4": "composition"}
+    assert {k: d["chartability"]["kind"] for k, d in ds.items()} == {
+        "p2": "kpi",
+        "p3": "time_series",
+        "p4": "composition",
+    }
     assert ds["p2"]["document_id"] == doc and ds["p2"]["filename"] == "report.txt"
     rows = {r["key"]: r for r in ds["p2"]["rows"]}
     assert rows["revenue_from_operations"]["unit"]["label"] == "₹ crore"
@@ -95,7 +102,7 @@ def test_tables_are_typed_after_ingestion(app):
 
 
 def test_overview_is_built_from_the_most_chartable_tables(app):
-    p, _, ds = ready_report(app)
+    p, _, _ds = ready_report(app)
     body = app.get(f"/api/projects/{p}/overview").json()
     assert body["status"] == "ready"
     kinds = [v["kind"] for v in body["panels"]]
@@ -152,11 +159,17 @@ def test_add_visuals_and_edit_the_canvas(app):
     p, _, ds = ready_report(app)
     c = chat(app, p)
     q = ds["p3"]["id"]
-    r = add(app, c, kind="line", datasets=[q], series=[f"{q}:revenue"], highlight=["Q4 FY24"], title="Revenue by quarter")
+    r = add(
+        app, c, kind="line", datasets=[q], series=[f"{q}:revenue"], highlight=["Q4 FY24"], title="Revenue by quarter"
+    )
     assert r.status_code == 201, r.text
     first = r.json()
     assert first["id"].startswith("vis_") and first["chat_id"] == c and first["position"] == 0 and not first["pinned"]
-    assert first["title"] == "Revenue by quarter" and first["highlight"] == {"x": ["Q4 FY24"], "series": [], "note": "Highest"}
+    assert first["title"] == "Revenue by quarter" and first["highlight"] == {
+        "x": ["Q4 FY24"],
+        "series": [],
+        "note": "Highest",
+    }
     h = ds["p2"]["id"]
     second = add(app, c, kind="kpi", datasets=[h], series=[f"{h}:revenue_from_operations", f"{h}:ebitda_margin"]).json()
     third = add(app, c, kind="donut", datasets=[ds["p4"]["id"]], series=[f"{ds['p4']['id']}:revenue_fy24"]).json()
@@ -168,7 +181,11 @@ def test_add_visuals_and_edit_the_canvas(app):
         assert r.status_code == 200, r.text
         return [(v["id"], v["position"], v["pinned"]) for v in r.json()["panels"]]
 
-    assert op(op="pin", visual_id=second["id"]) == [(first["id"], 0, False), (second["id"], 1, True), (third["id"], 2, False)]
+    assert op(op="pin", visual_id=second["id"]) == [
+        (first["id"], 0, False),
+        (second["id"], 1, True),
+        (third["id"], 2, False),
+    ]
     assert op(op="move", visual_id=third["id"], position=0) == [
         (third["id"], 0, False),
         (first["id"], 1, False),
@@ -203,7 +220,7 @@ def test_invalid_specs_are_rejected_with_every_problem(app):
 
 
 def test_a_chat_only_sees_the_documents_in_its_scope(app):
-    p, doc, ds = ready_report(app)
+    p, _doc, ds = ready_report(app)
     other = upload(app, p, "policy.txt", POLICY)
     drain(app)
     scoped = chat(app, p, document_scope=[other])
@@ -218,7 +235,10 @@ def test_oldest_unpinned_panels_make_room(make_app):
         p, _, ds = ready_report(api)
         c = chat(api, p)
         h = ds["p2"]["id"]
-        ids = [add(api, c, kind="bar", datasets=[h], series=[f"{h}:{k}"]).json()["id"] for k in ("ebitda", "revenue_from_operations")]
+        ids = [
+            add(api, c, kind="bar", datasets=[h], series=[f"{h}:{k}"]).json()["id"]
+            for k in ("ebitda", "revenue_from_operations")
+        ]
         api.post(f"/api/chats/{c}/canvas/ops", json={"op": "pin", "visual_id": ids[0]})
         third = add(api, c, kind="bar", datasets=[h], series=[f"{h}:ebitda_margin"]).json()["id"]
         panels = api.get(f"/api/chats/{c}/canvas").json()["panels"]
@@ -247,7 +267,9 @@ def test_deleting_a_document_deletes_its_datasets_and_visuals(app):
     h = ds["p2"]["id"]
     from_report = add(app, c, kind="bar", datasets=[h], series=[f"{h}:ebitda"]).json()["id"]
     policy_ds = next(d for d in app.get(f"/api/projects/{p}/datasets").json()["items"] if d["document_id"] == other)
-    from_policy = add(app, c, kind="bar", datasets=[policy_ds["id"]], series=[f"{policy_ds['id']}:tier_1_city"]).json()["id"]
+    from_policy = add(app, c, kind="bar", datasets=[policy_ds["id"]], series=[f"{policy_ds['id']}:tier_1_city"]).json()[
+        "id"
+    ]
     assert run(app, count, db(app), orm.TableDataset, orm.TableDataset.document_id == doc) == 3
 
     assert app.delete(f"/api/documents/{doc}").status_code == 204
@@ -279,7 +301,7 @@ async def forget_canvas(database) -> None:
 
 
 def test_backfill_types_documents_ingested_before_the_canvas(app):
-    p, doc, _ = ready_report(app)
+    p, _doc, _ = ready_report(app)
     run(app, forget_canvas, db(app))
     assert app.get(f"/api/projects/{p}/datasets").json()["items"] == []
     assert run(app, canvas(app).backfill) == 1
@@ -291,7 +313,7 @@ def test_backfill_types_documents_ingested_before_the_canvas(app):
 
 def test_backfill_runs_as_a_long_lane_job_at_startup(make_app, fakes):
     with make_app() as api:
-        p, doc, _ = ready_report(api)
+        p, _doc, _ = ready_report(api)
         run(api, forget_canvas, db(api))
     with make_app() as api:  # restart: the backfill is queued at startup
         drain(api)
@@ -321,7 +343,7 @@ def test_typing_failure_leaves_the_document_ready(app, monkeypatch):
 
 
 def test_prepare_visual_yields_contract_events(app, fakes):
-    p, _, ds = ready_report(app)
+    p, _, _ds = ready_report(app)
     c = chat(app, p)
     labels = {}
 
@@ -359,3 +381,50 @@ def test_prepare_visual_stays_quiet_for_plain_questions(app, fakes):
     fakes.llm.route = {"kind": "none", "datasets": ["D1"], "series": []}
     events = run(app, collect, "Compare EBITDA across segments")
     assert [(e.phase, e.detail) for e in events] == [("preparing", None), ("failed", "no table fits this question")]  # type: ignore[union-attr]
+
+
+# ------------------------------------------------------------------ "add": an existing visual onto a chat
+
+
+def test_add_copies_an_overview_panel_onto_a_chat(app):
+    p, _, ds = ready_report(app)
+    c = chat(app, p)
+    h = ds["p2"]["id"]
+    first = add(app, c, kind="bar", datasets=[h], series=[f"{h}:ebitda"]).json()
+    overview = app.get(f"/api/projects/{p}/overview").json()["panels"]
+    trend = next(v for v in overview if v["kind"] == "line")
+
+    r = app.post(f"/api/chats/{c}/canvas/ops", json={"op": "add", "visual_id": trend["id"]})
+    assert r.status_code == 200, r.text
+    panels = r.json()["panels"]
+    assert panels[0]["id"] == first["id"] and len(panels) == 2
+    copy = panels[1]
+    assert copy["id"] != trend["id"] and copy["chat_id"] == c and copy["position"] == 1 and not copy["pinned"]
+    same = ("kind", "title", "rows", "series", "sources")
+    assert {k: copy[k] for k in same} == {k: trend[k] for k in same}
+    assert check_grounding(Visual.model_validate(copy)) == []
+    # the overview keeps its panel; a copy can go to a position; a chat's panel can be copied to another chat
+    assert trend["id"] in [v["id"] for v in app.get(f"/api/projects/{p}/overview").json()["panels"]]
+    r = app.post(f"/api/chats/{c}/canvas/ops", json={"op": "add", "visual_id": trend["id"], "position": 0})
+    assert [v["kind"] for v in r.json()["panels"]] == ["line", "bar", "line"]
+    other = chat(app, p)
+    r = app.post(f"/api/chats/{other}/canvas/ops", json={"op": "add", "visual_id": first["id"]})
+    assert [v["kind"] for v in r.json()["panels"]] == ["bar"]
+
+
+def test_add_is_scoped_to_the_project_and_the_chats_documents(app):
+    p, doc, _ = ready_report(app)
+    trend = next(v for v in app.get(f"/api/projects/{p}/overview").json()["panels"] if v["kind"] == "line")
+    elsewhere = chat(app, project(app, "Another project"))
+    r = app.post(f"/api/chats/{elsewhere}/canvas/ops", json={"op": "add", "visual_id": trend["id"]})
+    assert r.status_code == 404  # another project's visual is not found
+    policy = upload(app, p, "policy.txt", POLICY)
+    drain(app)
+    scoped = chat(app, p, document_scope=[policy])
+    r = app.post(f"/api/chats/{scoped}/canvas/ops", json={"op": "add", "visual_id": trend["id"]})
+    assert r.status_code == 422 and "outside this chat's document scope" in r.json()["detail"]
+    assert app.post(f"/api/chats/{scoped}/canvas/ops", json={"op": "add", "visual_id": "vis_nope"}).status_code == 404
+    in_scope = chat(app, p, document_scope=[doc])
+    assert (
+        app.post(f"/api/chats/{in_scope}/canvas/ops", json={"op": "add", "visual_id": trend["id"]}).status_code == 200
+    )

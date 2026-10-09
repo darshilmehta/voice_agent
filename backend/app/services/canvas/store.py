@@ -8,16 +8,19 @@ called inside ``DocumentService.delete``'s transaction).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...db import models as orm
+from ...db.types import new_id
 from ...domain.canvas import CanvasOp, Visual
 from ...domain.datasets import DatasetSummary, TypedDataset
-from ..base import NotFound, Service, get_or_404
+from ..base import InvalidInput, NotFound, Service, get_or_404
 
 # Document statuses (as in ``services.documents``, which imports this module for its cascade)
 PENDING, PROCESSING, READY = "PENDING", "PROCESSING", "READY"
@@ -251,23 +254,33 @@ class CanvasStore(Service):
             )
             s.add(row)
             rows.append(row)
-            unpinned = sorted((r for r in rows if not r.pinned and r is not row), key=lambda r: r.created_at)
-            while len(rows) > max_panels and unpinned:
-                old = unpinned.pop(0)
-                rows.remove(old)
-                await s.delete(old)
+            await self._evict(s, rows, row, max_panels)
             self._renumber(rows)
             await s.flush()
             return _visual(row)
 
-    async def apply(self, chat_id: str, op: CanvasOp) -> list[Visual]:
+    @staticmethod
+    async def _evict(s: AsyncSession, rows: list[orm.CanvasVisual], keep: orm.CanvasVisual, max_panels: int) -> None:
+        """Past ``max_panels``, remove the oldest unpinned panels (never ``keep``, the one just added)."""
+        unpinned = sorted((r for r in rows if not r.pinned and r is not keep), key=lambda r: r.created_at)
+        while len(rows) > max_panels and unpinned:
+            old = unpinned.pop(0)
+            rows.remove(old)
+            await s.delete(old)
+
+    async def apply(self, chat_id: str, op: CanvasOp, *, max_panels: int) -> list[Visual]:
         async with self.db.session() as s:
-            await get_or_404(s, orm.Chat, chat_id, "chat")
+            chat = await get_or_404(s, orm.Chat, chat_id, "chat")
             rows = await self._chat_rows(s, chat_id)
+            now = self.now()
+            if op.op == "add":
+                await self._copy_into(s, chat, rows, op, now, max_panels)
+                self._renumber(rows)
+                await s.flush()
+                return [_visual(r) for r in rows]
             target = next((r for r in rows if r.id == op.visual_id), None)
             if target is None:
                 raise NotFound("visual", op.visual_id)
-            now = self.now()
             if op.op == "remove":
                 rows.remove(target)
                 await s.delete(target)
@@ -283,6 +296,44 @@ class CanvasStore(Service):
             await s.flush()
             return [_visual(r) for r in rows]
 
+    async def _copy_into(
+        self,
+        s: AsyncSession,
+        chat: orm.Chat,
+        rows: list[orm.CanvasVisual],
+        op: CanvasOp,
+        now: datetime,
+        max_panels: int,
+    ) -> None:
+        """``add``: a copy of another visual of the chat's project (an overview panel, another chat's) as a new panel.
+        A visual of another project is not found (404); one built from documents outside the chat's scope is refused
+        (422)."""
+        source = await s.get(orm.CanvasVisual, op.visual_id)
+        if source is None or source.project_id != chat.project_id:
+            raise NotFound("visual", op.visual_id)
+        if chat.document_scope is not None and not set(source.document_ids or []) <= set(chat.document_scope):
+            raise InvalidInput(f"visual {op.visual_id} is built from documents outside this chat's document scope")
+        visual_id = new_id("vis")
+        copy = Visual.model_validate(source.visual).model_copy(
+            update={"id": visual_id, "chat_id": chat.id, "created_at": now, "updated_at": now, "pinned": False}
+        )
+        row = orm.CanvasVisual(
+            id=visual_id,
+            project_id=chat.project_id,
+            chat_id=chat.id,
+            position=len(rows),
+            pinned=False,
+            kind=source.kind,
+            document_ids=list(source.document_ids or []),
+            spec=dict(source.spec),
+            visual=copy.model_dump(mode="json"),
+            created_at=now,
+            updated_at=now,
+        )
+        s.add(row)
+        rows.insert(min(op.position, len(rows)) if op.position is not None else len(rows), row)
+        await self._evict(s, rows, row, max_panels)
+
     # -------------------------------------------------------------- overview
 
     async def overview_panels(self, project_id: str) -> list[Visual]:
@@ -294,6 +345,15 @@ class CanvasStore(Service):
         async with self.db.session() as s:
             await get_or_404(s, orm.Project, project_id, "project")
             return [_visual(r) for r in (await s.scalars(stmt)).all()]
+
+    async def overview_ids_by_spec(self, project_id: str) -> dict[str, str]:
+        """The overview's panel ids by their spec (JSON with sorted keys)."""
+        stmt = select(orm.CanvasVisual.spec, orm.CanvasVisual.id).where(
+            orm.CanvasVisual.project_id == project_id, orm.CanvasVisual.chat_id.is_(None)
+        )
+        async with self.db.session() as s:
+            rows = (await s.execute(stmt)).all()
+        return {json.dumps(spec, sort_keys=True, ensure_ascii=False): visual_id for spec, visual_id in rows}
 
     async def overview_fingerprint(self, project_id: str) -> str | None:
         async with self.db.session() as s:

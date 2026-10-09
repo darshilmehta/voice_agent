@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from typing import Literal
 
 from ...domain.canvas import (
     Calculation,
@@ -38,7 +39,7 @@ from ..sources import snippet
 from . import calculator as calc
 from .calculator import CalculationError, Operand, format_value
 from .parsing import Quantity, localized_label, parse_period, parse_quantity
-from .spec import Point, Resolved, ResolvedSeries, SpecError, same_unit
+from .spec import Point, Resolved, ResolvedSeries, SpecError, document_name, same_unit
 
 _SOURCE_ID = re.compile(r"^S(\d+)$")
 
@@ -309,7 +310,9 @@ def build_visual(
     rows: list[Row] = []
     tiles: list[Tile] = []
     events: list[TimelineEvent] = []
-    series: list[Series] = [Series(key=s.key, label=s.label, unit=s.unit) for s in r.series]
+    series: list[Series] = [
+        Series(key=s.key, label=s.label, unit=s.unit, better=better_direction(s.metric or s.label)) for s in r.series
+    ]
     x_axis: XAxis | None = None
     xs = [i.label for i in r.x_items]
     summary = ""
@@ -345,11 +348,23 @@ def build_visual(
     elif r.kind == "kpi":
         tiles, deltas, summary = _kpi_tiles(book, r, language)
         calculations += deltas
-        series = []
+        # one series per tile, same label: what each tile measures and which way is good
+        by_label = {}
+        for t in tiles:
+            base = next((s for s in r.series if t.label.startswith(s.label)), None)
+            by_label.setdefault(
+                t.label,
+                Series(
+                    key=_series_key(t.label, by_label),
+                    label=t.label,
+                    unit=t.unit,
+                    better=better_direction(base.metric if base else t.label),
+                ),
+            )
+        series = list(by_label.values())
     elif r.kind == "comparison":
-        tiles, deltas, summary = _comparison_tiles(book, r, language)
+        rows, series, tiles, deltas, summary = _comparison(book, r, filenames, language)
         calculations += deltas
-        series = []
     elif r.kind == "timeline":
         events = _events(book, r)
         summary = _t(language, "timeline", first=events[0].date, last=events[-1].date)
@@ -357,7 +372,8 @@ def build_visual(
     if calculations and r.kind not in ("kpi", "comparison", "donut", "waterfall") and r.calcs:
         summary += " " + "; ".join(f"{c.label}: {_show_calc(c, language)}" for c in calculations[: len(r.calcs)]) + "."
     calculations = _dedupe(calculations)
-    highlight = _highlight(r, language) if rows else None  # tiles and events have nothing to highlight on an axis
+    # tiles, events and a comparison's metric rows have nothing to highlight on an x axis
+    highlight = _highlight(r, language) if rows and r.kind != "comparison" else None
     unit = _visual_unit(r)
     title = _title(r, language)
     visual = Visual(
@@ -550,43 +566,60 @@ def _donut(book: SourceBook, r: Resolved, language: str) -> tuple[str, list[Calc
 
 
 def _waterfall(book: SourceBook, r: Resolved, language: str) -> tuple[list[Row], list[Series], Calculation, str]:
+    """Start, steps, end (and any subtotal in between that equals the running total and is a total row of its table).
+    The steps must take the start to the end: as printed (a negative cell decreases), or all subtracted (revenue
+    less costs gives profit). Steps are magnitudes in ``increase`` / ``decrease``; totals in ``total``."""
     s = r.series[0]
     pts = [(x.label, s.points.get(x.label)) for x in r.x_items]
     if any(p is None or p.value.value is None for _, p in pts) or len(pts) < 3:
         raise SpecError(["a waterfall needs a start, at least one step and an end, all with numbers"])
     values = [p.value.value for _, p in pts]  # type: ignore[union-attr]
-    start, steps, end = values[0], values[1:-1], values[-1]
     decimals = max(p.value.decimals for _, p in pts)  # type: ignore[union-attr]
     tolerance = 0.5 * 10**-decimals * len(values) + 1e-9
-    signed = abs(start + sum(steps) - end) <= tolerance  # type: ignore[operator]
-    subtract = not signed and all(v >= 0 for v in steps) and abs(start - sum(steps) - end) <= tolerance  # type: ignore[operator]
-    if not (signed or subtract):
+
+    def walk(subtract: bool) -> list[str] | None:
+        roles, running = ["total"], values[0]
+        for (_, p), v in zip(pts[1:-1], values[1:-1], strict=True):
+            row = p.dataset.row(p.value.row)  # type: ignore[union-attr]
+            if row is not None and row.type == "total" and abs(v - running) <= tolerance:  # type: ignore[operator]
+                roles.append("subtotal")
+                continue
+            if subtract:
+                if v < 0:  # type: ignore[operator]
+                    return None
+                running -= v  # type: ignore[operator]
+                roles.append("decrease")
+            else:
+                running += v  # type: ignore[operator]
+                roles.append("decrease" if v < 0 else "increase")  # type: ignore[operator]
+        if abs(running - values[-1]) > tolerance:  # type: ignore[operator]
+            return None
+        return [*roles, "total"]
+
+    roles = walk(subtract=False) or walk(subtract=True)
+    if roles is None:
         raise SpecError(
             [f"the waterfall's steps don't take {pts[0][0]} to {pts[-1][0]}: pick the rows that add up to the end"]
         )
+    subtract = "increase" not in roles and walk(subtract=False) is None
     keys = {"total": _t(language, "total"), "increase": _t(language, "increase"), "decrease": _t(language, "decrease")}
     series = [Series(key=k, label=v, unit=s.unit) for k, v in keys.items()]
     rows: list[Row] = []
     operands: list[Operand] = []
-    for i, (x, p) in enumerate(pts):
+    for i, ((x, p), role) in enumerate(zip(pts, roles, strict=True)):
         assert p is not None and p.value.value is not None
         ref = cell_ref(book, p.dataset, p.value)
         v = p.value.value
-        if i in (0, len(pts) - 1):
-            role = "total"
-        elif subtract or v < 0:
-            role = "decrease"
-        else:
-            role = "increase"
-        shown = abs(v) if role != "total" else v
+        key = "total" if role in ("total", "subtotal") else role
         rows.append(
             Row(
                 x=x,
-                values={k: (shown if k == role else None) for k in keys},
-                cells={k: (ref if k == role else None) for k in keys},
+                values={k: ((v if key == "total" else abs(v)) if k == key else None) for k in keys},
+                cells={k: (ref if k == key else None) for k in keys},
+                kind="total" if key == "total" else "delta",
             )
         )
-        if i < len(pts) - 1:
+        if i == 0 or role in ("increase", "decrease"):
             op = _operand(book, p, x)
             if subtract and i > 0:
                 op = Operand(value=-v, unit=op.unit, cell=op.cell, decimals=op.decimals, label=x, period=op.period)
@@ -647,35 +680,50 @@ def _kpi_tiles(book: SourceBook, r: Resolved, language: str) -> tuple[list[Tile]
     return tiles, deltas, _t(language, "kpi", items="; ".join(items))
 
 
-def _comparison_tiles(book: SourceBook, r: Resolved, language: str) -> tuple[list[Tile], list[Calculation], str]:
+def _comparison(
+    book: SourceBook, r: Resolved, filenames: Mapping[str, str], language: str
+) -> tuple[list[Row], list[Series], list[Tile], list[Calculation], str]:
+    """Two sides side by side. ``series`` are the sides, ``rows`` the metrics (``x`` = the metric), and each metric's
+    change is the tile with the row's label.
+
+    - two x values (FY23 and FY24, or two segments): the sides are those x values, the metrics the spec's series;
+    - one x value and several series (the same metric from two documents): the sides are the series, named after
+      their documents (or tables), the metric their shared name; the change is the last side minus the first."""
+    xs = [i.label for i in r.x_items]
+    rows: list[Row] = []
     tiles: list[Tile] = []
     deltas: list[Calculation] = []
-    xs = [i.label for i in r.x_items]
     items: list[str] = []
+    used: dict[str, Series] = {}
     if len(xs) == 2:
         a, b = xs
-        for s in r.series:
-            pa, pb = s.points.get(a), s.points.get(b)
-            if pa is None or pb is None or pa.value.value is None or pb.value.value is None:
-                continue
-            found = _delta_calc(book, s, a, b, language)
+        metrics = [s for s in r.series if all(x in s.points and s.points[x].value.value is not None for x in xs)]
+        if not metrics:
+            raise SpecError(["a comparison needs numbers on both sides"])
+        unit = metrics[0].unit if all(same_unit(metrics[0].unit, m.unit) for m in metrics) else None
+        key_a = _series_key(a, used)
+        used[key_a] = Series(key=key_a, label=a, unit=unit)
+        key_b = _series_key(b, used)
+        used[key_b] = Series(key=key_b, label=b, unit=unit)
+        for s in metrics:
+            pa, pb = s.points[a], s.points[b]
+            rows.append(
+                Row(
+                    x=s.label,
+                    values={key_a: pa.value.value, key_b: pb.value.value},
+                    cells={key_a: cell_ref(book, pa.dataset, pa.value), key_b: cell_ref(book, pb.dataset, pb.value)},
+                )
+            )
             delta = None
+            found = _delta_calc(book, s, a, b, language)
             if found is not None:
                 c, kind = found
                 delta = Delta(value=c.value, kind=kind, calculation=c)  # type: ignore[arg-type]
                 deltas.append(c)
             tiles.append(
                 Tile(
-                    label=f"{s.label} ({a})",
-                    value=pa.value.value,
-                    unit=pa.value.unit,
-                    cell=cell_ref(book, pa.dataset, pa.value),
-                )
-            )
-            tiles.append(
-                Tile(
-                    label=f"{s.label} ({b})",
-                    value=pb.value.value,
+                    label=s.label,
+                    value=pb.value.value,  # type: ignore[arg-type]
                     unit=pb.value.unit,
                     cell=cell_ref(book, pb.dataset, pb.value),
                     delta=delta,
@@ -685,46 +733,99 @@ def _comparison_tiles(book: SourceBook, r: Resolved, language: str) -> tuple[lis
             if delta is not None:
                 text += f" ({_show_calc(delta.calculation, language)})"
             items.append(f"{s.label}: {text}")
-    else:
-        x = xs[0]
-        base: tuple[ResolvedSeries, Point] | None = None
-        for s in r.series:
-            p = s.points.get(x)
-            if p is None or p.value.value is None:
-                continue
-            delta = None
-            if base is not None and same_unit(base[0].unit, s.unit):
-                try:
-                    c = calc.diff(
-                        _operand(book, base[1], base[0].label),
-                        _operand(book, p, s.label),
-                        series=s.label,
-                        language=language,
-                        label=_t(language, "gap", a=base[0].label, b=s.label, x=x),
-                    )
-                    delta = Delta(
-                        value=c.value,
-                        kind="pp" if s.unit is not None and s.unit.kind == "percent" else "abs",
-                        calculation=c,
-                    )
-                    deltas.append(c)
-                except CalculationError:
-                    delta = None
-            tiles.append(
-                Tile(
-                    label=f"{s.label} ({x})",
-                    value=p.value.value,
-                    unit=p.value.unit,
-                    cell=cell_ref(book, p.dataset, p.value),
-                    delta=delta,
-                )
-            )
-            items.append(f"{s.label}: {_show_point(p, language)}")
-            if base is None:
-                base = (s, p)
-    if len(tiles) < 2:
+        return rows, list(used.values()), tiles, deltas, _t(language, "comparison", items="; ".join(items))
+
+    x = xs[0]
+    sides = [(s, p) for s in r.series if (p := s.points.get(x)) is not None and p.value.value is not None]
+    if len(sides) < 2:
         raise SpecError(["a comparison needs two numbers"])
-    return tiles, deltas, _t(language, "comparison", items="; ".join(items))
+    documents = {p.dataset.document_id for _, p in sides}
+    metric_names = list(dict.fromkeys(s.metric or s.label for s, _ in sides))
+    metric = metric_names[0] if len(metric_names) == 1 else " / ".join(metric_names)
+    values: dict[str, float | None] = {}
+    cells: dict[str, CellRef | None] = {}
+    for s, p in sides:
+        name = document_name(filenames.get(p.dataset.document_id, "")) if len(documents) > 1 else ""
+        label = name or (s.source if len(metric_names) == 1 else s.label) or s.label
+        key = _series_key(label, used)
+        used[key] = Series(key=key, label=label, unit=s.unit, better=better_direction(s.metric or s.label))
+        values[key], cells[key] = p.value.value, cell_ref(book, p.dataset, p.value)
+        items.append(f"{label}: {_show_point(p, language)}")
+    row_x = f"{metric} ({x})"
+    rows.append(Row(x=row_x, values=values, cells=cells))
+    (first, p0), (last, p1) = sides[0], sides[-1]
+    delta = None
+    if same_unit(first.unit, last.unit):
+        try:
+            names = list(used.values())
+            c = calc.diff(
+                _operand(book, p0, names[0].label),
+                _operand(book, p1, names[-1].label),
+                series=metric,
+                language=language,
+                label=_t(language, "gap", a=names[0].label, b=names[-1].label, x=f"{metric}, {x}"),
+            )
+            kind = "pp" if last.unit is not None and last.unit.kind == "percent" else "abs"
+            delta = Delta(value=c.value, kind=kind, calculation=c)  # type: ignore[arg-type]
+            deltas.append(c)
+        except CalculationError:
+            delta = None
+    tiles.append(
+        Tile(
+            label=row_x,
+            value=p1.value.value,
+            unit=p1.value.unit,
+            cell=cell_ref(book, p1.dataset, p1.value),
+            delta=delta,
+        )  # type: ignore[arg-type]
+    )
+    return rows, list(used.values()), tiles, deltas, _t(language, "comparison", items=f"{row_x}: " + "; ".join(items))
+
+
+_KEY = re.compile(r"[^a-z0-9]+")
+
+
+def _series_key(label: str, used: Mapping[str, object]) -> str:
+    base = _KEY.sub("_", label.lower()).strip("_")[:40] or "s"
+    key, n = base, 2
+    while key in used:
+        key, n = f"{base}_{n}", n + 1
+    return key
+
+
+# Which way is good, read from the metric's name (first rule that matches). Unclear metrics (assets, headcount,
+# investing cash flows) stay None: the renderer then doesn't colour their change.
+_BETTER: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"net\s+debt|debt\s+to|leverage|gearing", re.I), "down"),
+    (
+        re.compile(
+            r"profit|earnings|\beps\b|ebitda|revenue|sales|income|margin|dividend|\broce\b|return\s+on|turnover|"
+            r"राजस्व|आय|लाभ|मुनाफ",
+            re.I,
+        ),
+        "up",
+    ),
+    (
+        re.compile(
+            r"cost|expense|borrowing|\bloans?\b|\bdebt\b|attrition|injur|\bltifr\b|\bloss|liabilit|contingent|claim|"
+            r"disputed|\btax|depreciation|outflow|payable|लागत|व्यय|ऋण|कर्ज|घाटा",
+            re.I,
+        ),
+        "down",
+    ),
+    (
+        re.compile(r"cash\s+generated|on-time|\botif\b|capacity|\bseats\b|customers|women|training", re.I),
+        "up",
+    ),
+)
+
+
+def better_direction(metric: str) -> Literal["up", "down"] | None:
+    """ "up" when a rise is good (revenue, margins), "down" when a fall is (costs, debt), None when unclear."""
+    for pattern, direction in _BETTER:
+        if pattern.search(metric):
+            return direction  # type: ignore[return-value]
+    return None
 
 
 def _events(book: SourceBook, r: Resolved) -> list[TimelineEvent]:
@@ -864,12 +965,13 @@ def check_grounding(v: Visual) -> list[str]:
     )
     label_numbers = {_num(t) for text in label_texts for t in _NUMBER.findall(text)}
     pages = {str(p) for c in v.sources for p in (c.page_start, c.page_end) if p is not None}
-    printed = label_numbers | {_num(t) for c in v.sources for t in _NUMBER.findall(c.snippet)}  # the tables' own text
+    # the cited tables' printed titles ("… as at 31 March 2024"): each source's snippet starts with its table's title
+    titles = {_num(t) for c in v.sources for t in _NUMBER.findall(c.snippet.split(" · ", 1)[0])}
     checks = (
-        ("summary", v.summary, label_numbers | pages),
+        ("summary", v.summary, label_numbers | pages | titles),
         ("subtitle", v.subtitle or "", label_numbers | pages),
         ("note", (v.highlight.note if v.highlight else "") or "", label_numbers),
-        ("title", v.title, printed),
+        ("title", v.title, label_numbers | titles),
     )
     for field, text, free in checks:
         for token in _NUMBER.findall(text):

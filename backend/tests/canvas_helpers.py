@@ -38,7 +38,7 @@ def table(
         for c, cell in enumerate(row):
             if cell is SPAN:
                 continue
-            text, rs, cs = (cell if isinstance(cell, tuple) else (cell, 1, 1))  # type: ignore[misc]
+            text, rs, cs = cell if isinstance(cell, tuple) else (cell, 1, 1)  # type: ignore[misc]
             cells.append(
                 {
                     "row": r,
@@ -86,7 +86,9 @@ def typed(
     )
 
 
-def typed_document(tables: Sequence[DocumentTable], contexts: dict[int, TableContext] | None = None) -> list[TypedDataset]:
+def typed_document(
+    tables: Sequence[DocumentTable], contexts: dict[int, TableContext] | None = None
+) -> list[TypedDataset]:
     return type_document(tables, contexts or {}, new_id=lambda: f"ds_{next(_ids)}")
 
 
@@ -171,7 +173,12 @@ def report_datasets(document_id: str = "doc_1") -> dict[str, TypedDataset]:
     """The miniature annual report typed, by name."""
     specs = {
         "highlights": (HIGHLIGHTS, ["Amounts are in ₹ crore unless stated otherwise."], [], 3),
-        "segments": (SEGMENTS, ["Segment revenue and EBITDA are shown below (₹ crore)."], ["1. Net of inter-segment sales."], 18),
+        "segments": (
+            SEGMENTS,
+            ["Segment revenue and EBITDA are shown below (₹ crore)."],
+            ["1. Net of inter-segment sales."],
+            18,
+        ),
         "q_fy24": (QUARTERS_FY24, ["The fourth quarter was the strongest (₹ crore)."], [], 19),
         "q_fy23": (QUARTERS_FY23, ["FY23 started slowly (₹ crore)."], [], 20),
         "cash_flow": (CASH_FLOW, ["All amounts are in ₹ crore."], [], 25),

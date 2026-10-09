@@ -5,14 +5,22 @@ Every number in a Visual is either the value of a table cell (``CellRef``) or th
 ``Calculation`` whose inputs are cells. Values are numbers in their unit's scale (4210 with ``scale: "crore"`` is
 ₹4,210 crore); the frontend formats them.
 
-Conventions inside the contract (additive, documented for the renderer):
+Conventions inside the contract (additive, matching the renderer):
 
 - ``rows`` are in display order: chronological for periods, document order for categories.
+- Percentages are numbers of percent: 18.4 with ``unit.kind: "percent"`` is 18.4%, never 0.184.
+- Series in different units carry their own ``unit`` (``line`` and ``bar`` may mix units: drawn as small multiples on a
+  shared x axis; the visual's ``unit`` is then null). ``series[].better`` ("up", "down" or null) says which way is good
+  when the metric's name makes it clear (revenue up, costs and debt down).
 - ``waterfall``: three series ``total`` (bars from zero), ``increase`` and ``decrease`` (floating steps); each row has
-  a value in exactly one of them. A step's value is the magnitude of its cell (a cell printed "(712)" contributes
-  712 to ``decrease``); its CellRef carries the printed text.
-- ``donut``: one series; rows are the slices.
-- ``kpi`` / ``comparison``: ``tiles`` only (``x`` null, ``rows`` empty).
+  a value in exactly one of them and ``rows[].kind`` "total" (the first, the last and any subtotal) or "delta". A
+  step's value is the magnitude of its cell (a cell printed "(712)" contributes 712 to ``decrease``); its CellRef
+  carries the printed text.
+- ``donut``: one series; rows are the slices; one ``share`` Calculation per slice (the slice named in its label) unless
+  the slices are already printed percentages.
+- ``kpi``: ``tiles`` (``x`` null, no rows); ``series`` lists one entry per tile with the tile's label (unit, better).
+- ``comparison``: ``x`` null; ``series`` are the two sides (two periods, or two documents), ``rows`` the metrics
+  (``rows[].x`` is the metric) and each metric's change is the tile with the same label as the row's ``x``.
 - ``timeline``: ``events`` only.
 """
 
@@ -88,12 +96,14 @@ class Series(_Frozen):
     label: str
     unit: Unit | None
     calculated: bool = False
+    better: Literal["up", "down"] | None = None  # additive: which way is good, when the metric makes it clear
 
 
 class Row(_Frozen):
     x: str
     values: dict[str, float | None]
     cells: dict[str, CellRef | None]
+    kind: Literal["total", "delta"] | None = None  # additive, waterfall only: a total bar or a step
 
 
 class Delta(_Frozen):
@@ -162,11 +172,13 @@ class ProjectOverview(BaseModel):
 
 
 class CanvasOp(BaseModel):
-    """An edit of a chat's canvas. ``move`` needs ``position`` (0-based, clamped to the canvas)."""
+    """An edit of a chat's canvas. ``move`` needs ``position`` (0-based, clamped to the canvas). ``add`` (additive)
+    copies another visual of the same project (an overview panel, or another chat's) onto this canvas as a new panel,
+    at ``position`` or at the end."""
 
     model_config = ConfigDict(extra="forbid")
 
-    op: Literal["remove", "pin", "unpin", "move"]
+    op: Literal["remove", "pin", "unpin", "move", "add"]
     visual_id: str
     position: int | None = Field(default=None, ge=0)
 
