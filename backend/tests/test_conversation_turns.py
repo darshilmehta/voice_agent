@@ -53,7 +53,7 @@ RERANKED: list[str] = []  # the reranker's last query (the English one for Hindi
 def scripted_reply(messages: list[LLMMessage]) -> str:
     """Answers by prompt kind: grounded answers quote and cite the source that best matches what was searched."""
     system = messages[0].content
-    hindi = "in Hindi" in system
+    hindi = "in Hindi" in messages[-1].content
     if system.startswith("You keep the memory"):
         return MEMORY
     if system.startswith("You answer questions about the user's documents"):
@@ -366,8 +366,9 @@ async def test_hinglish_hindi_and_switching_languages(world):
     assert agent.language == "hi" and agent.route["input_language"] == "hi"
     assert agent.route["query_en"] == "How much was revenue in FY24?" and agent.route["speculation"] == "reused_search"
     assert world.fakes.reranker.calls[-1][0] == "How much was revenue in FY24?"  # the English query is scored
-    assert agent.text.startswith("दस्तावेज़ के अनुसार") and [c.source_id for c in agent.citations] == ["S3"]
-    assert "Answer in Hindi" in answer_calls(world)[-1]["messages"][0].content
+    # a short answer gets the best 3 passages (§9.5): the revenue passage is S2 of them
+    assert agent.text.startswith("दस्तावेज़ के अनुसार") and [c.source_id for c in agent.citations] == ["S2"]
+    assert "Answer in Hindi" in answer_calls(world)[-1]["messages"][-1].content
     json_calls = len(world.fakes.llm.json_calls)
     _, english = await say(world, "Now answer in English please")  # asked: English from now on
     assert english.language == "en" and len(world.fakes.llm.json_calls) == json_calls  # no router call
@@ -434,6 +435,24 @@ async def test_b5_an_answer_still_in_the_other_script_is_saved_as_what_it_is(wor
     assert agent.language == "en"
 
 
+async def test_latency_the_next_answers_prompt_prefix_is_read_while_this_one_is_spoken(world):
+    """§9.5: after a turn, the model reads the next answer's prompt up to its evidence (system prompt, memory,
+    history), and the history window only grows at its end between moves: the next answer reads its sources and
+    question only."""
+    world.fakes.llm.route = routes({"What was the EBITDA margin in FY24?": {"intent": "document_qa", "query": None}})
+    prompts = []
+    for _ in range(6):
+        await say(world, "What was the EBITDA margin in FY24?")
+        prompts.append(answer_calls(world)[-1]["messages"])
+    warmed = world.fakes.llm.warmed
+    assert len(warmed) == 6 and all(w[-1].content == "Sources:" for w in warmed)
+    for before, after in zip(warmed[:-1], prompts[1:], strict=True):
+        assert after[: len(before) - 1] == before[:-1]  # everything but the evidence and question was read already
+    # The window's start moved once (at the 9th message): turns 2-4 extend the same history, turn 5 starts anew.
+    histories = [len(p) - 2 for p in prompts]
+    assert histories == [0, 2, 4, 6, 4, 6]
+
+
 async def test_the_memory_summary_is_refreshed_in_the_background_and_used(world):
     world.fakes.llm.route = routes({"What was the EBITDA margin in FY24?": {"intent": "document_qa", "query": None}})
     for _ in range(3):  # 3 exchanges = 6 messages: all still in the prompt's window, no summary needed
@@ -450,7 +469,8 @@ async def test_the_memory_summary_is_refreshed_in_the_background_and_used(world)
     system = answer_calls(world)[-1]["messages"][0].content
     assert f"Earlier in this conversation (summary; the recent messages follow):\n{MEMORY}" in system
     assert agent.route["memory"] is True
-    assert len(answer_calls(world)[-1]["messages"]) == 1 + 6 + 1  # system, the recent window, the question
+    # system, the recent window (the 9th message moved its start to the 5th: messages 5-8), the question
+    assert len(answer_calls(world)[-1]["messages"]) == 1 + 4 + 1
 
 
 async def test_memory_summaries_never_run_while_a_turn_is_answering():
@@ -608,7 +628,7 @@ async def test_drift_document_general_hindi_and_back(world):
     script = [
         ("What was the EBITDA margin in FY24?", "document_qa", "en", ["S1"]),
         ("By the way, what's the capital of France?", "general_qa", "en", []),
-        ("वित्त वर्ष 2024 में राजस्व कितना बढ़ा?", "document_qa", "hi", ["S3"]),
+        ("वित्त वर्ष 2024 में राजस्व कितना बढ़ा?", "document_qa", "hi", ["S2"]),
         ("भारत की राजधानी क्या है?", "general_qa", "hi", []),
         ("Okay, let's go back to the annual report.", "resume_document", "en", []),
         ("And what about the margin in FY23?", "document_qa", "en", ["S2"]),

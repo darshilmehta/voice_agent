@@ -333,7 +333,7 @@ def test_spoken_language_is_detected_per_utterance(voice):
     assert (user["language"], agent["language"]) == ("hi", "hi")
     assert voice.fakes.stt.calls[0]["languages"] == ["en", "hi"]  # detection restricted to the configured languages
     assert voice.fakes.tts.calls == [("वित्त वर्ष 2024 में EBITDA", "hi"), ("मार्जिन 18.2% था।", "hi")]
-    assert "Answer in Hindi" in voice.fakes.llm.calls[0]["messages"][0].content
+    assert "Answer in Hindi" in voice.fakes.llm.calls[0]["messages"][-1].content
 
 
 # ------------------------------------------------------------------ barge-in and stop

@@ -142,7 +142,12 @@ __all__ = [  # the turn API used by the transports, and the router slot (phase 1
 ]
 
 TEXT_MAX = 4000
-HISTORY_MESSAGES = 6  # recent messages sent as conversation context (three exchanges)
+# Recent messages sent as conversation context: at least HISTORY_MIN, and the window's start moves HISTORY_STEP
+# messages at a time, so between moves the prompt's history only grows at its end and Ollama's prompt cache keeps
+# all of it (a window sliding by one message every turn made the model read the whole history again, §9.5).
+HISTORY_MIN = 4  # two exchanges
+HISTORY_STEP = 4
+HISTORY_MESSAGES = HISTORY_MIN + HISTORY_STEP - 1  # the most the window holds (7)
 HISTORY_CHARS = 1000  # per message
 SHORT_REPLY_TOKENS = 96  # conversation replies and clarifying questions: one sentence
 CONTINUATION_TOKENS = 96  # one sentence about results that arrived after the answer started (§3.7)
@@ -424,7 +429,9 @@ class ChatTurnService:
         self.web_search = web_search  # None: no live-data tool (questions that want live data say so)
         self.router: TurnRouter = router if router is not None else LLMTurnRouter(llm)
         self.planner = TurnPlanner(retrieval, self.router, timeout_s=settings.llm.router_timeout_ms / 1000)
-        self.memory = MemoryKeeper(db, llm, settings, window=HISTORY_MESSAGES)
+        # The memory summary starts once the chat outgrows six messages: by the time the window's start moves past
+        # a message (the 9th message moves it to the 5th), the summary has covered it.
+        self.memory = MemoryKeeper(db, llm, settings, window=6)
 
     @classmethod
     def from_container(cls, container: Container) -> ChatTurnService:
@@ -538,7 +545,7 @@ class ChatTurnService:
                 async for event in events:
                     yield event
         finally:
-            job = functools.partial(self.memory.refresh_if_due, turn.chat.id)
+            job = functools.partial(self._after_turn, turn)
             activity.turn_finished(turn.chat.id, job, spawn=detach)
 
     async def _run(self, turn: Turn, stop: AnswerStop | None, user: Message | None) -> AsyncGenerator[ChatEvent, None]:
@@ -673,8 +680,14 @@ class ChatTurnService:
         covered = plan.needs_retrieval and confidence is not None and confidence.above_threshold
         if covered:
             assert p.result is not None
+            style = ANSWER_LENGTHS[turn.length]
+            budget = self.settings.retrieval.context_token_budget
             p.sources = build_sources(
-                p.result.chunks, ready, budget_tokens=self.settings.retrieval.context_token_budget
+                p.result.chunks,
+                ready,
+                budget_tokens=min(budget, style.context_tokens or budget),
+                max_sources=style.max_sources,
+                best_budget_tokens=budget,
             )
             p.documents_part = "sources"
             p.name_documents = self._name_documents(p)
@@ -919,11 +932,36 @@ class ChatTurnService:
         topic = state.document_topic if state is not None else None
         return resume_text(plan.language, topic, active or list(p.ready.values()))
 
+    async def _after_turn(self, turn: Turn) -> None:
+        """After a turn, while its answer is spoken and nobody is asking yet (``ChatActivity``: cancelled the moment
+        the next turn starts): refresh the memory summary if it is due, then have the model read the next answer's
+        prompt prefix (system prompt, memory, history up to this answer), so the next answer reads only its evidence
+        and question (§9.5)."""
+        await self.memory.refresh_if_due(turn.chat.id)
+        await self._warm_next_prompt(turn)
+
+    async def _warm_next_prompt(self, turn: Turn) -> None:
+        chat = await self.chats.get(turn.chat.id)
+        state = await self.states.get(chat.id)
+        language = state.preferred_language or self._fallback_language(chat, state)
+        history = await self._history(chat.id, before=chat.message_count + 1)
+        if not history:
+            return
+        system = answer_system_prompt(language, turn.length)  # most next turns are document questions
+        messages = [*self._context(system, history, await self.memory.current(chat.id)), LLMMessage("user", "Sources:")]
+        await self.llm.warm_up([messages])
+
     async def _history(self, chat_id: str, *, before: int) -> list[Message]:
-        """Recent user and agent messages, oldest first, without "stop" turns (they got no answer)."""
+        """Recent user and agent messages, oldest first, without "stop" turns (they got no answer): the messages from
+        the window's start (``HISTORY_MIN``/``HISTORY_STEP`` above) up to ``before``."""
         if before <= 1:
             return []
-        items = (await self.messages.list(chat_id, before=before, limit=HISTORY_MESSAGES)).items
+        start = max(1, (before - 1 - HISTORY_MIN) // HISTORY_STEP * HISTORY_STEP + 1)
+        items = [
+            m
+            for m in (await self.messages.list(chat_id, before=before, limit=HISTORY_MESSAGES)).items
+            if m.seq >= start
+        ]
         kept = []
         for i, m in enumerate(items):
             if m.role == "event":

@@ -479,7 +479,7 @@ Server → client:
 - After a cut, the state goes straight to `thinking` when the interrupting utterance is already being answered.
 - **Live data (§3.7).** A turn that searches the web sends `tool` messages after `turn` (never after a cut). Its filler `audio_chunk` (`filler: true`, chunk 0) and all its frames come right after `tool start` and **before `sources`**: the one audio that may precede `sources` (it carries no answer text and no citation; `sources` still precedes every `delta`). `state: speaking` comes with the answer's first audio, not the filler's. `tool done` may arrive between deltas, and a continuation (`tool results`, more `delta`s and `audio_chunk`s) may follow seconds after the answer's text: only `agent_message` ends the turn. The answer's last sentence is spoken as soon as its text is complete, not after the continuation, and a kept continuation sentence is spoken as soon as it is kept, not at the end of the turn. Speech after the answer has fully played, while only a continuation was still to come, is not a barge-in: no `barge_in` decision, no `interrupted` state; the answer's `agent_message` (complete, no `heard_text`) comes before the next `user_message`.
 
-**Startup.** The backend preloads the embedder, reranker, STT and TTS models and the Ollama model (with the answers' `num_ctx`) at startup, in the background (~20–35 s, reported by `/health`), so the first spoken question isn't slowed by model loading (§9 measured ~3.7 s for a cold reranker).
+**Startup.** The backend preloads the embedder, reranker, STT and TTS models and the Ollama model (every Ollama request uses the same `num_ctx` and `keep_alive`, `OllamaLLM.runtime_options`, so nothing reloads it), then has it read the router's prompt and the answers' system prompt once (B6: the first routed turns used to read the router prompt cold, 3.0 s instead of 1.6 s, past the 2.5 s router timeout), at startup, in the background (~20–35 s, reported by `/health`), so the first spoken question isn't slowed by model loading (§9 measured ~3.7 s for a cold reranker).
 
 Repeated input errors (odd-length audio frames, VAD failures) are reported at most once per kind every 5 s.
 
@@ -860,6 +860,26 @@ Expected after these: **~2.5–3 s** to the first content audio on this Mac. The
 - Browser side: first audio frame ≈ server + 0.12 s; duck 60–77 ms after speech onset; barge-in `stop` 0.61–0.67 s after speech start; backchannel `resume` ~0.7–0.78 s; local Stop/Esc 1–2 ms.
 - What remains is mostly Ollama prompt prefill (~370 tokens/s, ≈ 2.7 ms per prompt token of sources). Next steps (phase 9): fewer or shorter passages for voice answers, a speculative answer started before routing, an instant acknowledgement, Kokoro on MPS under load.
 - Measured with other apps (and, for the browser run, another agent's Ollama calls) running: slightly pessimistic.
+
+**Answer latency, quality round (2026-10-09).** The voice answer's time to its first token was 3.3–4.7 s in the combined run. Profiled with `tests/integration/test_answer_latency.py` (Ollama only; the real turn pipeline with cached retrieval over eval-corpus passages: three voice chats of five turns, run-tagged passages so no earlier run's prompts are in the cache). Prompt reading runs at ~350 tokens/s on this machine, and an answer's prompt was ~1,300 tokens, nearly all of it read anew each turn: the evidence (five passages, up to 3,000 tokens), the history (a 6-message window sliding by one message every turn) and, on a mode or language change, the system prompt. What changed:
+
+| Change | Effect |
+|---|---|
+| Short (voice) answers get the best 3 passages, the best one whole and the others within ~600 tokens (`ANSWER_LENGTHS["short"]`: `max_sources`, `context_tokens`); full answers are unchanged | evidence ~1,000 → ~500 tokens |
+| Markdown tables in the prompt without padding or long rules (`compact_tables`) | tables ~12% fewer tokens, lossless |
+| History window: at least 4 messages, its start moving 4 messages at a time, so it only grows at its end between moves | the history stays in Ollama's prompt cache |
+| After a turn (while its answer is spoken; given up when the next turn starts), the model reads the next answer's prompt up to its evidence: system prompt, memory, history | the next answer reads only its evidence and question |
+| One answer system prompt for English and Hindi: the question asks for the language (`ANSWER_LANGUAGE_RULE`); B5's script check catches a wrong-script answer | a language switch no longer re-reads the system prompt and history |
+| Startup warm-up of the router and answer system prompts (B6) | first turns after startup |
+
+| LLM first token (model's own time, 14 answers) | p50 | p95 | max | grounding (expected figure in the answer) |
+|---|---|---|---|---|
+| main before the round | 3,281 ms | 4,488 ms | 4,624 ms | 10/13 |
+| this round | **1,355 ms** | 1,937 ms | 2,218 ms | 13/13 |
+
+Wall clock (same runs, Ollama otherwise idle): 3,313 → 1,452 ms p50. Per kind after: English document question 1.35 s, follow-up 1.2 s, routed fact 1.36 s, general 0.8 s, Hindi 1.85 s (Devanagari costs ~0.9 tokens per character), first turn of a chat ~2 s (no history yet, its evidence all new). No model reload in any run. Ollama 0.40.1 keeps at least five prompt prefixes cached at once (measured), so the router's call, titles and summaries don't evict the answer's prefix; another client's traffic on a shared Ollama can.
+
+Not done: an instant spoken acknowledgement ("Sure,") for slow routed turns. The protocol lets only the web search filler precede `sources` (§3.10), the acknowledgement would be spoken before the route is known (wrong for "stop", a backchannel or an abstention), and with the first token at ~1.4 s plus the router's ~1 s and the first chunk's TTS, the remaining wait is short enough to measure in the full voice run first.
 
 ### 9.6 Smoke test 12 results (network off)
 

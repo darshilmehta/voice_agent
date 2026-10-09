@@ -220,7 +220,7 @@ async def test_voice_spoken_language_and_stt_timings_are_saved_on_the_user_messa
     [e async for e in pipeline.run(turn)]
     user, agent = await transcript(db, chat_id)
     assert (user.language, user.latency) == ("hi", stt)  # Hinglish, spoken as Hindi
-    assert agent.route["language"] == "hi" and "Answer in Hindi" in fakes.llm.calls[0]["messages"][0].content
+    assert agent.route["language"] == "hi" and "Answer in Hindi" in fakes.llm.calls[0]["messages"][-1].content
     assert agent.language == "en"  # the fake answered in English (twice: B5): saved as what it is
 
 

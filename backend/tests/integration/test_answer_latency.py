@@ -211,6 +211,11 @@ def _pct(values: list[float], q: float) -> float:
     return ordered[min(len(ordered) - 1, round(q * (len(ordered) - 1)))]
 
 
+def _spent(c: dict[str, Any]) -> float:
+    """A whole model call's own time (ms): loading, reading the prompt, generating."""
+    return (c.get("load_duration", 0) + c.get("prompt_eval_duration", 0) + c.get("eval_duration", 0)) / 1e6
+
+
 def _model_first(a: dict[str, Any]) -> float:
     """The model's own time to the first token (ms): loading, reading the uncached prompt, one token."""
     return (a.get("load_duration", 0) + a.get("prompt_eval_duration", 0)) / 1e6 + a.get("eval_duration", 0) / 1e6 / max(
@@ -243,6 +248,7 @@ async def test_time_to_the_first_token_of_voice_answers(tmp_path):
             service = ChatTurnService(db, retrieval=retrieval, llm=llm, settings=settings)
             titles = TitleService(db, llm=llm, settings=settings)
             project = await ProjectService(db).create("Latency")
+            run = f"run {time.time_ns() % 10**9}"
             ids = {}
             for doc in (REPORT, DECK):
                 ids[doc] = await add_document(db, project.id, FILENAMES[doc], status="READY", page_count=30)
@@ -256,7 +262,9 @@ async def test_time_to_the_first_token_of_voice_answers(tmp_path):
                     chunking_version="v1",
                     page_start=p["page_start"],
                     page_end=p["page_end"],
-                    heading_path=p["heading_path"],
+                    # A run tag in each passage's heading: earlier runs' prompts in Ollama's cache don't make the
+                    # evidence look cheap (the system prompt and the history are cached legitimately).
+                    heading_path=[*p["heading_path"], run],
                     content_type=p["content_type"],
                     language="en",
                     text=p["text"],
@@ -298,7 +306,10 @@ async def test_time_to_the_first_token_of_voice_answers(tmp_path):
                             "router_source": ((agent.route or {}).get("router") or {}).get("source"),
                             "prompt": a.get("prompt_eval_count"),
                             "read_ms": a.get("prompt_eval_duration", 0) / 1e6,
-                            "model_first": _model_first(a) if a else None,
+                            # a retried answer (B5) pays for its first attempt too
+                            "model_first": _model_first(a) + sum(_spent(c) for c in texts[:-1]) if a else None,
+                            "calls": len(texts),
+                            "retry": (agent.route or {}).get("language_retry"),
                         }
                     )
                     if n == 0:
@@ -346,6 +357,7 @@ async def test_time_to_the_first_token_of_voice_answers(tmp_path):
     METRICS["model reloads during the run (load_duration > 0.5 s)"] = len(reloads)
     METRICS["turns"] = "\n  " + "\n  ".join(
         f"{r['kind']}: {r['text'][:60]!r} → {r['mode']}{' (abstained)' if r['abstained'] else ''} [{r['language']}] "
+        f"first token {r['model_first'] or 0:.0f} ms ({r['prompt'] or 0} tokens){' RETRIED' if r['retry'] else ''} "
         f"{'' if r['ok'] is None else 'OK' if r['ok'] else 'MISSING'} {r['answer'][:110]!r}"
         for r in rows
     )

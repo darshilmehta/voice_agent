@@ -199,8 +199,9 @@ async def test_warm_prompts_reads_the_router_and_answer_prompts_once(load_local)
     llm, rec = make_llm(load_local, lambda r: httpx.Response(200, content=chunks("ok")))
     await warm_prompts(llm, load_local())
     systems = [rec.body(i)["messages"][0]["content"] for i in range(len(rec.requests))]
-    assert systems == [ROUTER_SYSTEM_PROMPT, answer_system_prompt("en", "short"), answer_system_prompt("hi", "short")]
-    assert {rec.body(i)["options"]["num_predict"] for i in range(3)} == {1}  # read, not answered
+    # the answer's system prompt is the same in English and Hindi (the question asks for the language): read once
+    assert systems == [ROUTER_SYSTEM_PROMPT, answer_system_prompt("en", "short")]
+    assert {rec.body(i)["options"]["num_predict"] for i in range(2)} == {1}  # read, not answered
 
 
 def test_openai_compatible_placeholder_raises(cloud_settings):

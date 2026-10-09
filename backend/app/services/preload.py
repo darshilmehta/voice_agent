@@ -153,8 +153,6 @@ async def warm_prompts(llm: LLMClient, settings: Settings) -> None:
     (one token each: Ollama's prompt cache keeps them; the JSON schema only constrains sampling)."""
     request = RouteRequest("Hello, can you hear me?", settings.client.default_language)
     await llm.warm_up([router_messages(request)], model=settings.llm.router_model)
-    answers = [
-        [LLMMessage("system", answer_system_prompt(language, "short")), LLMMessage("user", "Hello")]
-        for language in settings.client.languages
-    ]
+    systems = dict.fromkeys(answer_system_prompt(language, "short") for language in settings.client.languages)
+    answers = [[LLMMessage("system", system), LLMMessage("user", "Hello")] for system in systems]
     await llm.warm_up(answers, model=settings.llm.chat_model)

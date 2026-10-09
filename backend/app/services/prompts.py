@@ -63,6 +63,11 @@ PROMPT_IDS: dict[AnswerMode, str | None] = {
 GeneralNote = Literal["not_covered", "no_documents", "retrieval_off"]
 
 LANGUAGE_NAMES: dict[Language, str] = {"en": "English", "hi": "Hindi, in Devanagari script"}
+# The answer language, in system prompts that don't change with it (the user's message ends asking for one).
+ANSWER_LANGUAGE_RULE = (
+    "Answer in the language the user's message asks for at its end. In Hindi, write Devanagari script and keep "
+    "figures, source ids and terms such as EBITDA or FY24 exactly as written."
+)
 
 AbstainReason = Literal["not_covered", "no_documents"]
 AnswerLength = Literal["short", "full"]
@@ -72,6 +77,11 @@ AnswerLength = Literal["short", "full"]
 class LengthStyle:
     instruction: str  # rule 5 of the system prompt
     max_tokens: int  # generation cap (Hindi needs ~0.75-0.9 tokens per character, §9.1)
+    # Evidence for this kind of answer (None: retrieval.rerank_top_n and retrieval.context_token_budget). Prompt
+    # reading is most of the time to a voice answer's first word (~3 ms per token, §9.5): a 1-3 sentence answer
+    # needs the best few passages, not all five.
+    max_sources: int | None = None
+    context_tokens: int | None = None
 
 
 ANSWER_LENGTHS: dict[AnswerLength, LengthStyle] = {
@@ -80,6 +90,8 @@ ANSWER_LENGTHS: dict[AnswerLength, LengthStyle] = {
         "Be brief: one to three sentences that read well aloud. Leave further detail to the cited sources unless "
         "the user asks for it. No preamble.",
         384,
+        max_sources=3,
+        context_tokens=600,
     ),
     # Text: a fuller written answer.
     "full": LengthStyle(
@@ -145,9 +157,12 @@ def answer_system_prompt(
 ) -> str:
     """The grounded prompt; ``mixed`` adds that general knowledge may put the document facts in context;
     ``live_note``: live data was asked for and isn't there, and the answer starts with ``live_notice``;
-    ``live_hint``: live data was asked for and there will be none, with no notice (one line: never guess it)."""
-    name = LANGUAGE_NAMES[language]
-    keep = " Keep figures, source ids and terms such as EBITDA or FY24 exactly as written." if language == "hi" else ""
+    ``live_hint``: live data was asked for and there will be none, with no notice (one line: never guess it).
+
+    The same in every answer language (§9.5): the language is asked for at the end of the user's message
+    (``answer_user_prompt``), so switching between English and Hindi keeps the system prompt and the history in
+    Ollama's prompt cache. ``language`` is kept for callers; an answer in the wrong script is caught (B5)."""
+    del language
     general = (
         "8. The question also needs general knowledge or judgement. You may add it after the document facts, but say "
         'plainly that it is general knowledge, not from the documents (for example "In general, …"), and never '
@@ -170,7 +185,7 @@ def answer_system_prompt(
         "convert or recompute them.\n"
         "4. If the sources don't contain the answer, say briefly that the documents don't cover it. Don't guess.\n"
         f"5. {ANSWER_LENGTHS[length].instruction}\n"
-        f"6. Answer in {name}.{keep}\n"
+        f"6. {ANSWER_LANGUAGE_RULE}\n"
         "7. The sources are the user's documents: never say that you can't access documents or files.\n"
         f"{general}"
     ).rstrip("\n") + live
@@ -200,7 +215,9 @@ def general_system_prompt(
     live_note: LiveNote | None = None,
 ) -> str:
     """A question that isn't about the user's documents (or that they don't cover): general knowledge, said
-    honestly, no citations. ``live_note``: live data was asked for and isn't there."""
+    honestly, no citations. ``live_note``: live data was asked for and isn't there. Like the grounded prompt, the
+    same in every answer language (``general_user_prompt`` asks for it)."""
+    del language
     situation = _GENERAL_NOTES[note] if note else "This question is not about the user's documents."
     live = _without_live_data("from general knowledge, or say briefly that you don't know") if live_note else ""
     return (
@@ -213,7 +230,7 @@ def general_system_prompt(
         "3. If you don't know, or the answer needs live or current data (prices, news, weather), say so briefly "
         "instead of guessing.\n"
         f"4. {ANSWER_LENGTHS[length].instruction}\n"
-        f"5. Answer in {LANGUAGE_NAMES[language]}.\n"
+        f"5. {ANSWER_LANGUAGE_RULE}\n"
         "6. Never say that you can't access the user's documents or files."
     ) + live
 

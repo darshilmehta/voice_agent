@@ -97,19 +97,30 @@ def _truncate_to_tokens(text: str, budget: int) -> str:
     return text[:lo].rstrip() + " …"
 
 
-def build_sources(ranked: Sequence[RankedChunk], filenames: Mapping[str, str], *, budget_tokens: int) -> list[Source]:
+def build_sources(
+    ranked: Sequence[RankedChunk],
+    filenames: Mapping[str, str],
+    *,
+    budget_tokens: int,
+    max_sources: int | None = None,
+    best_budget_tokens: int | None = None,
+) -> list[Source]:
     """Sources for the prompt from reranked chunks (best first).
 
     Chunks of documents not in ``filenames`` (not READY, deleted) are dropped, as are repeats (same chunk, or the
-    same text). Chunks are taken best first while their headers and text fit ``budget_tokens``; the best one is
-    always kept (cut to the budget if it alone is too long). The kept chunks are then grouped by document section,
-    groups ordered by their best chunk and chunks in reading order inside a group, and numbered S1, S2, …
+    same text). Chunks are taken best first while their headers and text fit ``budget_tokens`` (and, with
+    ``max_sources``, until there are that many); the best one is always kept, whole up to ``best_budget_tokens``
+    (default: the budget) and cut to that beyond it: a short answer's budget is for the passages besides the best
+    one, never a reason to cut the table that holds the answer. The kept chunks are then grouped by document
+    section, groups ordered by their best chunk and chunks in reading order inside a group, and numbered S1, S2, …
     """
     kept: list[tuple[int, RankedChunk, Chunk]] = []
     seen_ids: set[str] = set()
     seen_texts: set[str] = set()
     used = 0
     for rank, r in enumerate(ranked):
+        if max_sources is not None and len(kept) >= max_sources:
+            break
         chunk = r.chunk
         if chunk.document_id not in filenames or chunk.chunk_id in seen_ids:
             continue
@@ -117,11 +128,12 @@ def build_sources(ranked: Sequence[RankedChunk], filenames: Mapping[str, str], *
         if key in seen_texts:
             continue
         cost = estimate_tokens(chunk.text) + 24  # header line
-        if used + cost > budget_tokens:
+        limit = budget_tokens if kept else max(budget_tokens, best_budget_tokens or 0)
+        if used + cost > limit:
             if kept:
                 continue  # a smaller, lower-ranked chunk may still fit
-            chunk = chunk.model_copy(update={"text": _truncate_to_tokens(chunk.text, max(budget_tokens - 24, 1))})
-            cost = budget_tokens
+            chunk = chunk.model_copy(update={"text": _truncate_to_tokens(chunk.text, max(limit - 24, 1))})
+            cost = limit
         seen_ids.add(r.chunk.chunk_id)
         seen_texts.add(key)
         kept.append((rank, r, chunk))
@@ -140,7 +152,27 @@ def build_sources(ranked: Sequence[RankedChunk], filenames: Mapping[str, str], *
 
 
 def format_sources(sources: Sequence[Source]) -> str:
-    return "\n\n".join(f"{s.header()}\n{s.chunk.text.strip()}" for s in sources)
+    return "\n\n".join(f"{s.header()}\n{compact_tables(s.chunk.text.strip())}" for s in sources)
+
+
+_TABLE_RULE = re.compile(r":?-{3,}:?")
+
+
+def compact_tables(text: str) -> str:
+    """Markdown table rows without their padding ("| Revenue      | 7,365  |" → "| Revenue | 7,365 |", rules →
+    "|---|"): the same table in ~12% fewer prompt tokens (measured on the eval corpus' 25 tables), and every token of
+    evidence costs ~3 ms of the voice answer's first word (§9.5). Other lines are left as they are."""
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|") and len(stripped) > 1:
+            cells = [c.strip() for c in stripped[1:-1].split("|")]
+            if all(_TABLE_RULE.fullmatch(c) for c in cells if c) and any(cells):
+                line = "|" + "|".join("---" for _ in cells) + "|"
+            else:
+                line = "| " + " | ".join(cells) + " |"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 _OPEN_MARKER = re.compile(r"\s*\[[^\]]{0,24}$")

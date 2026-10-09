@@ -122,8 +122,8 @@ def test_answer_streams_in_contract_order_and_cites_only_what_it_uses(app, fakes
 
     (call,) = fakes.llm.calls
     system, prompt = call["messages"][0], call["messages"][-1]
-    assert system.role == "system" and "Answer in English" in system.content and "[S1]" in system.content
-    assert prompt.role == "user" and f"Question: {EN}" in prompt.content
+    assert system.role == "system" and "[S1]" in system.content
+    assert prompt.role == "user" and f"Question: {EN}" in prompt.content and "Answer in English" in prompt.content
     assert "[S1] annual_report.txt · page " in prompt.content and "| EBITDA margin | 16.9% | 18.2% |" in prompt.content
     assert call["max_tokens"] == ANSWER_LENGTHS["short"].max_tokens  # the text endpoint asks for short answers
     assert ANSWER_LENGTHS["short"].instruction in system.content
@@ -210,8 +210,8 @@ def test_hindi_question_gets_a_hindi_answer(app, fakes):
     assert payload(events, "user_message")["language"] == "hi"
     agent = payload(events, "agent_message")
     assert agent["language"] == "hi" and agent["citations"][0]["source_id"] == "S1"
-    system = fakes.llm.calls[0]["messages"][0].content
-    assert "Answer in Hindi, in Devanagari script" in system and "EBITDA or FY24 exactly as written" in system
+    system, question = fakes.llm.calls[0]["messages"][0].content, fakes.llm.calls[0]["messages"][-1].content
+    assert "Answer in Hindi, in Devanagari script" in question and "EBITDA or FY24 exactly as written" in system
     assert fakes.reranker.calls[-1][0] == HI  # phase 1: no router, so no English query yet
 
 
@@ -231,7 +231,7 @@ def test_answer_language(app, fakes, text, language, expected):
     fakes.reranker.scorer = lambda q, passage: 0.9
     payload(ask(app, new_chat(app, p), text, language), "agent_message")
     name = {"en": "English", "hi": "Hindi"}[expected]
-    assert f"Answer in {name}" in fakes.llm.calls[0]["messages"][0].content
+    assert f"Answer in {name}" in fakes.llm.calls[0]["messages"][-1].content
 
 
 def test_text_without_letters_uses_the_chat_language(app, fakes):
@@ -241,7 +241,7 @@ def test_text_without_letters_uses_the_chat_language(app, fakes):
     fakes.llm.reply = "EBITDA मार्जिन 18.2% था [S1]।"
     agent = payload(ask(app, chat, "18.2%?"), "agent_message")
     assert agent["language"] == "hi" and agent["route"]["language"] == "hi"
-    assert "Answer in Hindi" in fakes.llm.calls[-1]["messages"][0].content
+    assert "Answer in Hindi" in fakes.llm.calls[-1]["messages"][-1].content
 
 
 # ------------------------------------------------------------------ scope
