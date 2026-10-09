@@ -85,6 +85,21 @@ def named_documents(queries: Sequence[str | None], labels: Mapping[str, str]) ->
     return None
 
 
+def documents_by_name(named: NamedDocuments, labels: Mapping[str, str]) -> dict[str, frozenset[str]]:
+    """The named documents grouped by the name that matched them ("valmora" → the Valmora documents, "zephyra" → the
+    Zephyra deck): a question naming two companies compares them (the live canvas puts one table of each side by
+    side). File name words first, as in ``named_documents``."""
+    out: dict[str, frozenset[str]] = {}
+    docs = {d: split_document_label(labels[d]) for d in named.document_ids if d in labels}
+    for name in named.names:
+        for part in (0, 1):
+            found = frozenset(d for d, label in docs.items() if name in label_words(label[part]))
+            if found:
+                out[name] = found
+                break
+    return out
+
+
 def mentions(text: str, names: Sequence[str]) -> bool:
     """Does ``text`` contain one of ``names`` as a word (case-insensitive; "Valmora's" contains "valmora")?"""
     if not names:

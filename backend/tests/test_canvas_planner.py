@@ -22,8 +22,9 @@ from app.services.canvas.planner import (
     visual_intent,
 )
 from app.services.canvas.spec import VisualSpec, resolve
+from app.services.subjects import named_documents
 
-from .canvas_helpers import report_datasets
+from .canvas_helpers import TWO_LABELS, V, report_datasets, two_companies
 from .fakes import FakeLLM
 
 DS = report_datasets()
@@ -109,6 +110,44 @@ def test_candidates_ranked_by_the_question():
     assert boosted[0].id == "ds_cash_flow"
     hindi = rank_candidates("segment revenue dikhao", POOL, query_en="show revenue by segment", limit=2)
     assert hindi[0].id == "ds_segments"
+
+
+def test_by_words_alone_the_other_companys_lookalike_table_ranks_first():
+    assert rank_candidates("Show Valmora's segment revenue breakdown", two_companies(), limit=2)[0].id == "ds_z_seg"
+
+
+def test_a_question_naming_valmora_is_offered_only_valmoras_tables():
+    question = "Show Valmora's segment revenue breakdown"
+    named = named_documents((question,), TWO_LABELS)
+    assert named is not None and named.document_ids == {V}
+    ranked = rank_candidates(question, two_companies(), documents=named.document_ids, names=named.names, limit=4)
+    assert [d.id for d in ranked] == ["ds_v_seg", "ds_v_hl"]  # the planner can't pick Zephyra's table
+
+
+def test_the_turns_own_sources_rank_their_document_first():
+    assert rank_candidates("Show segment revenue", two_companies(), limit=1)[0].id == "ds_z_seg"
+    sourced = rank_candidates("Show segment revenue", two_companies(), source_documents={V}, limit=1)
+    assert sourced[0].id == "ds_v_seg"
+
+
+async def test_the_planner_is_offered_the_named_companys_tables_only():
+    llm = FakeLLM()
+    offered: list[str] = []
+
+    def pick(messages):
+        offered.append(messages[-1].content)
+        return {"kind": "donut", "datasets": ["D1"], "series": ["D1 · Revenue FY24"]}
+
+    llm.route = pick
+    planner = VisualPlanner(llm)
+    question = "Show Valmora's segment revenue breakdown"
+    named = named_documents((question,), TWO_LABELS)
+    assert named is not None
+    plan = await planner.plan_detailed(
+        question, "en", two_companies(), documents=named.document_ids, names=named.names, force=True
+    )
+    assert plan.spec is not None and plan.spec.datasets == ["ds_v_seg"]
+    assert "Freight Services" not in offered[0] and "Zephyra" not in offered[0]
 
 
 def test_catalog_and_schema_offer_only_real_references():

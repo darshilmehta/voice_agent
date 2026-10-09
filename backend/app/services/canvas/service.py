@@ -27,7 +27,7 @@ from ...db.types import new_id, utcnow
 from ...domain.canvas import CanvasEvent, CanvasOp, CanvasPanels, ProjectOverview, Visual, VisualEvent
 from ...domain.datasets import DatasetSummary, TableContext, TypedDataset
 from ...domain.projects import Citation, DocumentTable
-from ...providers.ingestion import Chunk, ParsedDocument
+from ...providers.ingestion import Chunk, ParsedDocument, document_label
 from ...providers.llm import LLMClient
 from ...providers.registry import Container
 from ...providers.runtime import LANE_LONG, JobQueue
@@ -35,6 +35,7 @@ from ...providers.storage import MetadataDB
 from ...settings import Settings
 from ..base import InvalidInput, NotFound
 from ..documents import DocumentService
+from ..subjects import named_documents
 from .builder import build_visual
 from .conversation import CanvasEdit, EditOutcome, EditResult, describe, resolve_target
 from .datasets import TYPER_VERSION, table_contexts, type_document
@@ -355,6 +356,9 @@ class CanvasService:
         yield VisualEvent(phase="preparing", visual_id=visual_id)
         try:
             project_id, datasets, filenames, _ = await self._chat_datasets(chat_id)
+            # the company the question names: only its documents' tables are offered (§12.1)
+            labels = {d: document_label(name, None) for d, name in filenames.items()}
+            named = named_documents((question, query_en), labels)
             spec = await self.planner.plan(
                 question,
                 language,
@@ -363,6 +367,9 @@ class CanvasService:
                 filenames=filenames,
                 query_en=query_en,
                 source_chunks=[c.chunk_id for c in sources],
+                documents=named.document_ids if named else None,
+                names=named.names if named else (),
+                source_documents={c.document_id for c in sources if c.document_id},
                 force=force,
             )
             if spec is None:
