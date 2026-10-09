@@ -63,6 +63,24 @@ def smoke_docs() -> Path:
 
 
 @pytest.fixture(scope="session")
+def smoke_audio() -> Path:
+    audio = Path(os.environ.get("SMOKE_AUDIO") or PROJECT_ROOT / "data/smoke/audio")
+    if not (audio / "say_en_0.wav").is_file():
+        pytest.skip(f"speech clips not found in {audio} (run scripts/smoke/09_kokoro.py or set SMOKE_AUDIO)")
+    return audio
+
+
+def require_chat_model(settings: Settings) -> None:
+    """Skip unless Ollama is reachable and has the configured chat model."""
+    try:
+        pulled = {m["name"] for m in httpx.get(f"{settings.llm.base_url}/api/tags", timeout=2).json()["models"]}
+    except httpx.HTTPError as e:
+        pytest.skip(f"Ollama not reachable at {settings.llm.base_url}: {e}")
+    if settings.llm.chat_model not in pulled:
+        pytest.skip(f"{settings.llm.chat_model} not pulled in Ollama")
+
+
+@pytest.fixture(scope="session")
 def loop() -> Iterator[asyncio.AbstractEventLoop]:
     """One event loop for the session: the Qdrant client's connections belong to the loop that opened them."""
     lp = asyncio.new_event_loop()

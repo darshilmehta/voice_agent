@@ -137,22 +137,29 @@ class BgeM3Embedder(Embedder, LazyModelProvider):
         return BGEM3FlagModel(str(snapshot), use_fp16=_use_fp16(cfg.device, cfg.fp16), devices=cfg.device)
 
     def _warm(self, model: Any) -> None:
-        model.encode(["warm up"], batch_size=1, max_length=32, return_dense=True, return_sparse=True)
+        with self._torch_use():
+            model.encode(["warm up"], batch_size=1, max_length=32, return_dense=True, return_sparse=True)
 
     def _embed_sync(self, texts: list[str]) -> list[DenseSparse]:
-        with self._lock:
-            out = self._model_locked().encode(
-                texts,
-                batch_size=self.cfg.batch_size,
-                max_length=EMBED_MAX_TOKENS,
-                return_dense=True,
-                return_sparse=True,
-                return_colbert_vecs=False,
-            )
-        dense = out["dense_vecs"].tolist()
-        return [
-            DenseSparse(dense=dense[i], sparse=_sparse(weights)) for i, weights in enumerate(out["lexical_weights"])
-        ]
+        """One batch at a time, each holding the model and the GPU only for that batch: a question's query embedding
+        waits for at most one batch of a document being ingested, not for the whole document."""
+        size = self.cfg.batch_size
+        vectors: list[DenseSparse] = []
+        for start in range(0, len(texts), size):
+            with self._lock:
+                model = self._model_locked()
+                with self._torch_use():
+                    out = model.encode(
+                        texts[start : start + size],
+                        batch_size=size,
+                        max_length=EMBED_MAX_TOKENS,
+                        return_dense=True,
+                        return_sparse=True,
+                        return_colbert_vecs=False,
+                    )
+            dense = out["dense_vecs"].tolist()
+            vectors += [DenseSparse(dense=dense[i], sparse=_sparse(w)) for i, w in enumerate(out["lexical_weights"])]
+        return vectors
 
 
 def _sparse(weights: dict[Any, Any]) -> SparseVector:
@@ -200,13 +207,16 @@ class BgeReranker(Reranker, LazyModelProvider):
         )
 
     def _warm(self, model: Any) -> None:
-        model.predict([("warm up", "warm up")], show_progress_bar=False)
+        with self._torch_use():
+            model.predict([("warm up", "warm up")], show_progress_bar=False)
 
     def _score_sync(self, query: str, passages: list[str]) -> list[float]:
         with self._lock:
-            scores = self._model_locked().predict(
-                [(query, p) for p in passages], batch_size=RERANK_BATCH_SIZE, show_progress_bar=False
-            )
+            model = self._model_locked()
+            with self._torch_use():
+                scores = model.predict(
+                    [(query, p) for p in passages], batch_size=RERANK_BATCH_SIZE, show_progress_bar=False
+                )
         return [float(s) for s in scores]
 
 

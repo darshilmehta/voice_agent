@@ -4,7 +4,7 @@ faster-whisper) → BGE-M3 + Qdrant + reranker → Ollama → Kokoro.
     RUN_INTEGRATION=1 uv run --group ml pytest tests/integration/test_voice_e2e.py -s
 
 Needs, besides the models, the smoke documents and Qdrant (see conftest): Ollama with qwen3:4b-instruct, and the
-smoke-test speech clips in SMOKE_AUDIO (default <repo>/data/smoke/audio, written by scripts/smoke/09_kokoro.py).
+smoke-test speech clips in SMOKE_AUDIO (see conftest; written by scripts/smoke/09_kokoro.py).
 
 A spoken question about revenue is streamed in real time (then silence) and must come back as a transcript, a cited
 spoken answer and audio frames. Mid-answer the user barges in with a correction: the answer stops, what was heard is
@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 import queue
 import statistics
 import threading
@@ -26,7 +25,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import httpx
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -34,9 +32,8 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.providers.registry import build_container
 from app.services.voice.protocol import parse_frame
-from app.settings import PROJECT_ROOT
 
-from .conftest import METRICS, integration_settings
+from .conftest import METRICS, integration_settings, require_chat_model
 from .test_chat_e2e import upload_ready
 
 pytestmark = pytest.mark.integration
@@ -173,22 +170,9 @@ def latency_row(log: list[Received], speech_end: float, turn_id: int, user: dict
 
 
 @pytest.fixture(scope="module")
-def smoke_audio() -> Path:
-    audio = Path(os.environ.get("SMOKE_AUDIO") or PROJECT_ROOT / "data/smoke/audio")
-    if not (audio / "say_en_0.wav").is_file():
-        pytest.skip(f"speech clips not found in {audio} (run scripts/smoke/09_kokoro.py or set SMOKE_AUDIO)")
-    return audio
-
-
-@pytest.fixture(scope="module")
 def api(models_root: Path, tmp_path_factory: pytest.TempPathFactory) -> Iterator[TestClient]:
     settings = integration_settings(models_root, tmp_path_factory.mktemp("voice"))
-    try:
-        pulled = {m["name"] for m in httpx.get(f"{settings.llm.base_url}/api/tags", timeout=2).json()["models"]}
-    except httpx.HTTPError as e:
-        pytest.skip(f"Ollama not reachable at {settings.llm.base_url}: {e}")
-    if settings.llm.chat_model not in pulled:
-        pytest.skip(f"{settings.llm.chat_model} not pulled in Ollama")
+    require_chat_model(settings)
     container = build_container(settings)
     with TestClient(create_app(settings, container)) as client:  # preloads the models in the background
         t0 = time.perf_counter()

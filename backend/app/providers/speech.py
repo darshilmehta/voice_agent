@@ -186,6 +186,8 @@ def pick_language(probabilities: Mapping[str, float], languages: Sequence[Langua
 
 
 class _Whisper(SpeechRecognizer, LazyModelProvider):
+    uses_torch = False  # MLX / CTranslate2: not under the torch gate (MLX measured safe alongside torch MPS)
+
     @property
     def cfg(self) -> STTSection:
         return self.config  # type: ignore[return-value]
@@ -425,7 +427,7 @@ class KokoroTTS(SpeechSynthesizer, LazyModelProvider):
         import torch
 
         parts = []
-        with torch.inference_mode():
+        with self._torch_use(), torch.inference_mode():
             for result in kokoro.pipelines[language](text, voice=kokoro.voices[language], speed=1.0):
                 audio = result.audio
                 if audio is None:

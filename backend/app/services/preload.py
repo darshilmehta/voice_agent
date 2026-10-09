@@ -64,8 +64,9 @@ class ModelPreloader:
                 await self._task
 
     async def wait(self) -> None:
+        """Until the preload is over (at once if it never started). Never raises, also if it was cancelled."""
         if self._task is not None:
-            await asyncio.shield(self._task)
+            await asyncio.wait([self._task])
 
     def report(self) -> PreloadReport:
         if self._task is None:

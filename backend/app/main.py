@@ -48,12 +48,15 @@ def create_app(
         apply_runtime_env(settings)
         await container.start()
         app.state.container = container
-        app.state.document_pipeline = DocumentPipeline.from_container(container)
-        await app.state.document_pipeline.start()  # re-queues ingestions a restart interrupted
-        app.state.voice_sessions = VoiceSessions(container)
         app.state.preloader = ModelPreloader(container)
         if preload_models:
             app.state.preloader.start()
+        app.state.document_pipeline = DocumentPipeline.from_container(container)
+        # Ingestion starts once the preload is done: a conversion would otherwise hold off its model loads (and the
+        # questions queued behind them, see models.TorchGate). Set before start(), which re-queues interrupted jobs.
+        app.state.document_pipeline.wait_before_ingesting = app.state.preloader.wait
+        await app.state.document_pipeline.start()  # re-queues ingestions a restart interrupted
+        app.state.voice_sessions = VoiceSessions(container)
         log.info(
             "started %s %s profile=%s strict_offline=%s config=%s",
             settings.app.name,

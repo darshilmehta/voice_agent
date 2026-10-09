@@ -14,7 +14,9 @@ Ingestion, retrieval and speech run local models (Docling, BGE-M3, bge-reranker-
 uv sync --group ml
 ```
 
-At startup the conversation models (VAD, STT, TTS, embedder, reranker) load one after another in the background and Ollama is asked to load the chat model, so the first spoken question isn't slowed by loading; `/health` reports it under `preload` (`loading` → `ready`, or `degraded` with the reason per model).
+At startup the conversation models (VAD, STT, TTS, embedder, reranker) load one after another in the background and Ollama is asked to load the chat model, so the first spoken question isn't slowed by loading; `/health` reports it under `preload` (`loading` → `ready`, or `degraded` with the reason per model). Documents uploaded meanwhile stay `PENDING` until the preload is over.
+
+PyTorch work from different threads (ingestion, questions, speech) goes through one process-wide gate (`TorchGate` in `app/providers/models.py`): loading or freeing a model runs alone (a load changes process-wide torch state and copies weights to the GPU), inference on MPS runs one call at a time (a document is embedded one batch at a time, so a question waits for one batch at most), CPU inference runs alongside. Docling runs on the CPU, so a document being parsed doesn't hold up questions. Without the gate, concurrent MPS work aborts the process (Metal assertion, exit 134). mlx-whisper uses MLX's own GPU queue and isn't gated.
 
 ```bash
 uv run python -m app
@@ -147,6 +149,8 @@ RUN_INTEGRATION=1 uv run --group ml pytest tests/integration -s
 They read models from `MODELS_ROOT` (default `../data/models`) and the smoke-test documents from `SMOKE_DOCS` (default `../data/smoke/docs`, written by `scripts/smoke/05_docling.py`); Qdrant from `QDRANT_URL` (default `http://127.0.0.1:6333`). `test_chat_e2e.py` also needs Ollama with `qwen3:4b-instruct` and checks phase 1 end to end over HTTP: upload until `READY`, English and Hindi fact questions cited to page 2, an out-of-document question abstaining, two documents told apart, nothing leaking across projects. Timings, ranks and answers print in the summary.
 
 `test_voice_e2e.py` (also needs Ollama, and the speech clips in `SMOKE_AUDIO`, default `../data/smoke/audio`, written by `scripts/smoke/09_kokoro.py`) runs the voice loop over the WebSocket with every real model preloaded: a spoken revenue question streamed in real time must come back transcribed, answered with citations and spoken; a spoken correction barges in mid-answer and must stop it (with `heard_text`) and be answered (Whisper must understand that spoken answer again); a Hindi question must be detected as Hindi. It prints the latency from the end of the user's speech to each stage.
+
+`test_concurrency_e2e.py` (same needs) uploads the smoke PDF the moment the app starts, while the models preload (it must wait, `PENDING`, and then become `READY`), then times a text and a spoken question while idle and again while a 60-page PDF is being ingested.
 
 ## Layout
 

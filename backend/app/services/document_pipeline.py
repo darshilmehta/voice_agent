@@ -170,6 +170,9 @@ class DocumentPipeline:
         self.ingestion = ingestion
         self.vectors = vectors
         self._upload_lock = asyncio.Lock()  # dedupe check + insert are atomic within this process
+        # Awaited before each ingestion starts (the app passes the startup model preload): a long conversion must not
+        # hold off the preload's model loads, and the questions queued behind them (models.TorchGate).
+        self.wait_before_ingesting: Callable[[], Awaitable[None]] | None = None
 
     @classmethod
     def from_container(cls, container: Container) -> DocumentPipeline:
@@ -254,6 +257,8 @@ class DocumentPipeline:
 
     async def run_job(self, job_id: str) -> None:
         """One ingestion attempt. Never raises for ingestion problems: the outcome is the document's status."""
+        if self.wait_before_ingesting is not None:
+            await self.wait_before_ingesting()  # the document stays PENDING meanwhile
         target = await self.documents.start_job(job_id)
         if target is None:
             return
