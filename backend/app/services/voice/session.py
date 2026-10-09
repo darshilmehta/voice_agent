@@ -85,6 +85,7 @@ from .speech_text import (
     SpeechChunker,
     SpokenChunk,
     heard_text,
+    is_acknowledgement,
     is_backchannel,
     is_filler,
     normalize_utterance,
@@ -111,6 +112,9 @@ PLAYBACK_GRACE_S = 2.0  # a turn whose client never says playback_done ends this
 CLOSE_WAIT_S = 10.0  # how long a replaced session may take to save its state and close
 ERROR_REPEAT_S = 5.0  # the same kind of input error (bad frames, VAD, bad control messages) at most this often
 BARGE_IN_MATCH_S = 0.5  # a barge_in_start belongs to an utterance that started at most this long before it
+# Speech still going on at decision_timeout_ms but only acknowledgements so far ("Yeah…" of "Yeah, right"): the decision
+# waits up to this many times decision_timeout_ms (700 → 1400 ms) for more words; only real words stop the answer.
+ACKNOWLEDGEMENT_GRACE = 2
 
 
 class Transport(Protocol):
@@ -174,6 +178,8 @@ class PendingBargeIn:
     transcript: str | None = None
     backchannel: bool | None = None
     real_words: int = 0
+    deadline_passed: bool = False
+    cap_passed: bool = False
 
 
 @dataclass(eq=False)
@@ -524,7 +530,7 @@ class VoiceSession:
             pending = self._pending
             if pending is not None:  # a fuller transcript than the barge-in snapshot
                 self._note_transcript(pending, transcript.text)
-                await self._evaluate(pending, deadline_passed=False)
+                await self._evaluate(pending)
         return transcript
 
     # -------------------------------------------------------------- utterances → turns
@@ -582,7 +588,8 @@ class VoiceSession:
                 await self._decide(pending, "stop")
             else:  # no barge_in_start (or it was resolved already): use its played_ms only if it was this speech
                 await self._interrupt(agent, "barge_in", self._barge_in_played(agent, ended), decision=True)
-        if not normalize_utterance(text) or is_filler(text):  # noise, or only "hmm"/"M M": nothing to answer
+        # Noise, hums, or only acknowledgements ("Yeah, right."): not a question, nothing to answer.
+        if not normalize_utterance(text) or is_filler(text) or is_acknowledgement(text):
             await self._ignored_utterance(done_processing=True)
             return
         await self._start_turn(transcript, ended, stt_ms, speculative)
@@ -918,8 +925,19 @@ class VoiceSession:
         await self._barge_in_check()
 
     async def _barge_in_deadline(self, pending: PendingBargeIn) -> None:
-        await asyncio.sleep(self.barge_in.decision_timeout_ms / 1000)
-        await self._evaluate(pending, deadline_passed=True)
+        timeout = self.barge_in.decision_timeout_ms / 1000
+        await asyncio.sleep(timeout)
+        pending.deadline_passed = True
+        await self._evaluate(pending)
+        if self._pending is not pending:
+            return
+        # Still talking, but only acknowledgements so far: listen longer, with a transcript of everything said.
+        self._transcribe_for(pending)
+        await asyncio.sleep(timeout * (ACKNOWLEDGEMENT_GRACE - 1))
+        pending.cap_passed = True
+        await self._evaluate(pending)
+        if self._pending is pending:  # always decided by the cap
+            await self._decide(pending, "resume")
 
     async def _barge_in_check(self) -> None:
         """After new audio: transcribe the interrupting speech once it is long enough, and re-evaluate."""
@@ -929,7 +947,13 @@ class VoiceSession:
         ep = self._endpointer
         if pending.stt is None and ep.in_utterance and ep.speech_ms >= self.vad_settings.min_speech_ms:
             pending.stt = self._spawn(self._barge_in_transcript(pending, ep.snapshot()), f"{self.id}-barge-in-stt")
-        await self._evaluate(pending, deadline_passed=False)
+        await self._evaluate(pending)
+
+    def _transcribe_for(self, pending: PendingBargeIn) -> None:
+        """Transcribe the interrupting speech so far again, while it is still going on past the deadline."""
+        if self._endpointer.in_utterance:
+            audio = self._endpointer.snapshot()
+            self._spawn(self._barge_in_transcript(pending, audio), f"{self.id}-barge-in-stt")
 
     async def _barge_in_transcript(self, pending: PendingBargeIn, audio: np.ndarray) -> None:
         transcript = await self._transcribe(audio, report=False)
@@ -938,14 +962,14 @@ class VoiceSession:
         if transcript.text:
             await self._send({"type": "transcript_partial", "text": transcript.text})
         self._note_transcript(pending, transcript.text)
-        await self._evaluate(pending, deadline_passed=False)
+        await self._evaluate(pending)
 
     def _note_transcript(self, pending: PendingBargeIn, text: str) -> None:
         pending.transcript = text
         pending.backchannel = is_backchannel(text, self.barge_in.backchannel_max_words)
         pending.real_words = real_words(text)
 
-    async def _evaluate(self, pending: PendingBargeIn, *, deadline_passed: bool) -> None:
+    async def _evaluate(self, pending: PendingBargeIn) -> None:
         if self._pending is not pending:
             return
         ep = self._endpointer
@@ -954,8 +978,9 @@ class VoiceSession:
             speaking=ep.speaking,
             transcript=pending.transcript,
             ended=False,
-            deadline_passed=deadline_passed,
+            deadline_passed=pending.deadline_passed,
             real_words=pending.real_words,
+            cap_passed=pending.cap_passed,
         )
         verdict = barge_in_verdict(
             evidence, min_speech_ms=self.vad_settings.min_speech_ms, is_backchannel=pending.backchannel

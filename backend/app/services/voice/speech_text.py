@@ -229,8 +229,9 @@ INTERRUPTION_CUES = {
 }  # fmt: skip
 # What Whisper tends to write for noise or breath rather than speech: treated as no words at all.
 NOISE_TRANSCRIPTS = {"you", "thanks for watching", "thank you for watching", "subtitles by the amara.org community"}
-# Non-lexical sounds as Whisper writes them, one token at a time: "M M", "MM", "Mhmm", "hmm", "uh-huh", "um", "ah".
-_HUM = re.compile(r"[mh]*m[mh]*|u+[hm]+|h+u+h+|a+h+|o+h+|e+r+m*")
+# Non-lexical sounds as Whisper writes them, one token at a time: "M M", "MM", "Mhmm", "hmm", "MMHUM" (a voiced
+# "mm-hmm"), "uh-huh", "um", "ah".
+_HUM = re.compile(r"[mh]*m[mh]*|m+h+u+m+|u+[hm]+|h+u+h+|a+h+|o+h+|e+r+m*")
 _HUM_HI = {"हम", "हम्म", "हम्मम", "ह्म", "ह्म्म", "हूँ", "हूं", "हुं", "हुँ", "उम", "उम्म", "उं", "उँ", "अं", "अँ", "ऊं", "ऊँ"}
 _PUNCT = re.compile(r"[^\w\s'\-ऀ-ॿ]|[।॥]")
 _REPEAT = re.compile(r"(.)\1{2,}")
@@ -272,6 +273,16 @@ def _acknowledgement_cover(words: list[str]) -> tuple[int, list[str]]:
             others.append(words[i])
             i += 1
     return found, others
+
+
+def is_acknowledgement(text: str) -> bool:
+    """Only acknowledgements and hums ("Yeah, right.", "okay", "achha theek hai", "mm-hmm"), nothing else: not a
+    question, so never answered as one (the answer would be "I couldn't find that in the documents")."""
+    words = normalize_utterance(text).split()
+    if not words:
+        return False
+    _, others = _acknowledgement_cover(words)
+    return not others
 
 
 def is_backchannel(text: str, max_words: int) -> bool:

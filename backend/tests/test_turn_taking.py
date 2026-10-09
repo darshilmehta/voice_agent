@@ -117,7 +117,20 @@ def evidence(**kw) -> BargeInEvidence:
         ({"speech_ms": 300, "transcript": "Mm-hmm", "ended": True}, True, "resume"),
         ({"speech_ms": 100, "deadline_passed": True}, None, "resume"),  # too short: noise
         ({"speech_ms": 600, "speaking": True, "deadline_passed": True}, None, "stop"),  # still talking
-        ({"speech_ms": 600, "speaking": True, "transcript": "Okay", "deadline_passed": True}, True, "stop"),
+        # still talking but only acknowledgements so far ("Yeah…" of "Yeah, right"): wait, then resume at the cap
+        ({"speech_ms": 600, "speaking": True, "transcript": "Yeah.", "deadline_passed": True}, True, None),
+        (
+            {
+                "speech_ms": 900,
+                "speaking": True,
+                "transcript": "Yeah, right",
+                "deadline_passed": True,
+                "cap_passed": True,
+            },
+            True,
+            "resume",
+        ),
+        ({"speech_ms": 900, "speaking": True, "transcript": "Yeah, but FY23?", "deadline_passed": True}, False, "stop"),
         ({"speech_ms": 350, "speaking": False, "deadline_passed": True}, None, "resume"),  # short burst, over
         ({"speech_ms": 300, "speaking": True}, None, None),
     ],

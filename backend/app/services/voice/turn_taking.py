@@ -183,6 +183,7 @@ class BargeInEvidence:
     ended: bool  # the utterance is over (end of turn, final transcript known)
     deadline_passed: bool  # decision_timeout_ms since barge_in_start
     real_words: int = 0  # words of the transcript that are neither hums ("M M") nor Whisper noise
+    cap_passed: bool = False  # the extended deadline for speech that is still only acknowledgements has passed
 
 
 Verdict = Literal["stop", "resume"]
@@ -198,10 +199,14 @@ def barge_in_verdict(evidence: BargeInEvidence, *, min_speech_ms: float, is_back
     2. the utterance ended as a backchannel, noise or too short        → resume
     3. before the deadline                                             → wait (None)
     4. at the deadline: speech shorter than min_speech_ms              → resume
-                        the user is still talking                      → stop (backchannels are short)
                         a short burst that has stopped                 → resume; if its final transcript turns out not
                                                                          to be a backchannel, the session still stops
                                                                          the answer when the utterance ends
+                        still talking, no transcript yet (or not a    → stop
+                        backchannel)
+                        still talking, but only acknowledgements so    → wait until the extended deadline (the session
+                        far ("Yeah…" of "Yeah, right")                   transcribes again meanwhile), then resume:
+                                                                         only real words stop the answer
     """
     sure = evidence.speaking or evidence.ended or evidence.real_words >= 2
     if evidence.transcript is not None and is_backchannel is False and sure:
@@ -210,6 +215,8 @@ def barge_in_verdict(evidence: BargeInEvidence, *, min_speech_ms: float, is_back
         return "resume"
     if not evidence.deadline_passed:
         return None
-    if evidence.speech_ms < min_speech_ms:
+    if evidence.speech_ms < min_speech_ms or not evidence.speaking:
         return "resume"
-    return "stop" if evidence.speaking else "resume"
+    if evidence.transcript is not None and is_backchannel:
+        return "resume" if evidence.cap_passed else None
+    return "stop"

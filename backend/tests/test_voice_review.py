@@ -424,3 +424,55 @@ def test_B_a_too_short_burst_restores_the_state_and_resolves_a_pending_barge_in(
         items = c.until(is_state("speaking"))
     assert kinds(items) == ["user_speech", "user_speech", "barge_in", "state"]
     assert one(items, "barge_in")["decision"] == "resume"
+
+
+# ------------------------------------------------------------------ second end-to-end run
+
+SAID = 75  # what the user says over the answer, set per test as a function of how much audio was transcribed
+
+
+def paced(c: VoiceClient, pcm: bytes, frame_ms: int = 32) -> None:
+    """Send audio in real time, so the server's deadlines fall while the user is still speaking."""
+    size = 16 * frame_ms * 2
+    start = time.monotonic()
+    for n, i in enumerate(range(0, len(pcm), size)):
+        time.sleep(max(0.0, start + n * frame_ms / 1000 - time.monotonic()))
+        c.ws.send_bytes(pcm[i : i + size])
+
+
+def speaking_over_the_answer(voice, transcript_of) -> list:
+    voice.fakes.stt.scripts[SAID] = transcript_of
+    with voice.connect() as ws:
+        c = VoiceClient(ws)
+        c.start()
+        c.say(QUESTION)
+        c.until("agent_message")
+        c.send("barge_in_start", turn_id=1, played_ms=300)
+        paced(c, speech_audio(1100, SAID) + silence(800))  # still speaking at the 700 ms deadline
+        items = c.until("barge_in", timeout=5)
+        items += c.quiet(0.6)
+    return items
+
+
+def test_C_yeah_right_still_being_said_at_the_deadline_doesnt_cut_the_answer(voice):
+    items = speaking_over_the_answer(voice, lambda ms: "Yeah." if ms < 1000 else "Yeah, right.")
+    assert one(items, "barge_in") == {"type": "barge_in", "turn_id": 1, "decision": "resume"}
+    assert not of(items, "user_message") and not of(items, "agent_message")  # not answered as a question either
+    assert [r[0] for r in roles(voice)] == ["user", "agent"]
+
+
+def test_C_real_words_after_an_acknowledgement_still_cut_the_answer(voice):
+    items = speaking_over_the_answer(voice, lambda ms: "Yeah." if ms < 600 else "Yeah, but what about FY23?")
+    assert one(items, "barge_in") == {"type": "barge_in", "turn_id": 1, "decision": "stop"}
+
+
+def test_C_an_acknowledgement_alone_is_never_answered_as_a_question(voice):
+    voice.fakes.stt.scripts[SAID] = "Yeah, right."
+    with voice.connect() as ws:
+        c = VoiceClient(ws)
+        c.start()
+        c.say(SAID)  # the agent is silent: nothing to acknowledge, nothing to answer
+        items = c.until(is_state("listening"))
+        assert kinds(items) == ["user_speech", "user_speech", "state", "state"]  # thinking, then listening
+        assert not of(c.quiet(0.3), "user_message")
+    assert voice.transcript() == [] and voice.fakes.llm.calls == []

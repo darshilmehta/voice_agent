@@ -8,6 +8,7 @@ from app.services.voice.speech_text import (
     SpeechChunker,
     SpokenChunk,
     heard_text,
+    is_acknowledgement,
     is_backchannel,
     is_filler,
     real_words,
@@ -161,6 +162,7 @@ def test_backchannels(text):
 
 # What Whisper writes for a short "mm-hmm" and other hums (seen in the end-to-end run: "M M", then "MM").
 HUMS = ["M M", "MM", "m-m", "Mm-hmm.", "Mhmm.", "hmm", "Hmmm?", "mhm", "uh huh", "Um.", "उम्म", "हम्म", "हूँ", "हूं"]
+HUMS += ["MMHUM", "mhum", "Mmhum."]  # Whisper's spelling of a voiced "mm-hmm"
 
 
 @pytest.mark.parametrize("text", HUMS)
@@ -199,6 +201,16 @@ def test_acknowledgements_count_once_against_the_word_limit(text):
 )
 def test_not_backchannels(text):
     assert not is_backchannel(text, 2)
+
+
+@pytest.mark.parametrize("text", ["Yeah, right.", "Okay.", "achha theek hai", "Mm-hmm, okay.", "हाँ जी", "MMHUM"])
+def test_acknowledgements_alone_are_not_questions(text):
+    assert is_acknowledgement(text)
+
+
+@pytest.mark.parametrize("text", ["yes please", "Yeah, but what about FY23?", "Stop.", "", "you"])
+def test_anything_more_than_acknowledgements_is_not_one(text):
+    assert not is_acknowledgement(text)
 
 
 def test_fillers_are_only_non_lexical_sounds():
