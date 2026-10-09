@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from ..settings import Language, STTSection, TTSSection, VADSection
 
 SAMPLE_RATE = 16_000  # microphone audio: PCM mono 16 kHz (what Silero and Whisper take)
+MLX_CACHE_LIMIT_BYTES = 256 * 2**20  # MLX's buffer cache (mlx-whisper is the process's only MLX user), §8
 VAD_FRAME_SAMPLES = 512  # 32 ms: the window Silero v5 expects at 16 kHz
 KOKORO_SAMPLE_RATE = 24_000
 
@@ -362,6 +363,9 @@ class MlxWhisper(_Whisper):
         from mlx_whisper.transcribe import ModelHolder
 
         self._path = str(snapshot)
+        # MLX keeps freed Metal buffers for reuse, without limit by default: 751 MiB after the first transcriptions
+        # beside the 462 MiB model (measured). Capped, a transcription re-allocates some of them (+17 ms p50).
+        mx.set_cache_limit(MLX_CACHE_LIMIT_BYTES)
         # transcribe() looks the model up in this holder by path: loading through it keeps a single copy in memory.
         return ModelHolder.get_model(self._path, mx.float16)
 
