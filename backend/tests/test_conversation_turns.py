@@ -277,7 +277,7 @@ async def test_resume_returns_to_the_document_topic_without_the_model(world):
     _, agent = await say(world, "Let's go back to the annual report")
     assert (
         agent.text
-        == "Sure, back to the annual report. We were talking about ebitda margin. What would you like to know?"
+        == "Sure, back to the annual report. We were talking about the EBITDA margin. What would you like to know?"
     )
     assert len(answer_calls(world)) == calls  # a fixed text, never "I can't access documents"
     r = agent.route
@@ -624,7 +624,9 @@ async def test_drift_document_general_hindi_and_back(world):
 
     messages = (await MessageService(world.db).list(world.chat_id)).items
     resume = messages[9]
-    assert resume.text == "Sure, back to the annual report. We were talking about revenue. What would you like to know?"
+    assert resume.text == (
+        "Sure, back to the annual report. We were talking about the revenue. What would you like to know?"
+    )
     hindi = messages[5]
     assert hindi.route["query_en"] == "How much did revenue grow in FY24?" and hindi.text.startswith("दस्तावेज़")
     assert [m.route["is_topic_shift"] for m in messages if m.role == "agent"] == [False, True, True, True, True, True]

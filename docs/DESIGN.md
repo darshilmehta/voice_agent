@@ -117,7 +117,7 @@ query (rewritten if it's a follow-up; + the router's query_en for Hindi/Hinglish
 
 ### 3.3 The conversation loop — what makes it feel like a conversation
 
-**a) Short spoken replies, details on screen.** The voice answer prompt targets 1–3 sentences and offers more ("want the breakdown?"). Citations, tables and longer detail go to the transcript panel, not into speech.
+**a) Short spoken replies, details on screen.** The voice answer prompt targets 1–3 sentences and offers more ("want the breakdown?"). Citations, tables and longer detail go to the transcript panel, not into speech. When an answer's evidence comes from more than one document, or from one that isn't the obvious one (the chat searches several and the conversation wasn't about this one), the prompt asks the answer to say which, in a few words ("the Zephyra investor deck says…"; `route.named_documents`): citations alone are on screen, not heard.
 
 **b) Speak while generating.** LLM tokens stream into a sentence splitter; each sentence is synthesized and queued as soon as it's complete. Audio starts after the first sentence. Target: **~1.5–2.5 s** from end of user speech to first agent audio (to be measured, not promised).
 
@@ -178,7 +178,7 @@ Router input: the new utterance, the last few turns, the session state, and — 
 | general_qa | no | general (says it isn't from the documents, no citations) | false |
 | conversation | no | short LLM reply, or a fixed ack for thanks / greetings / language requests | false |
 | clarification | no | one question back | false |
-| resume_document | no (yes if it also asks something) | fixed text naming the document and topic, or grounded | false unless grounded and not covered |
+| resume_document | no (yes if it also asks something) | fixed text naming the document and topic as said aloud ("the Valmora annual report", "the net profit"; never the raw topic label), or grounded | false unless grounded and not covered |
 | correction | inherits the last answered question's mode | as that mode | as that mode |
 | backchannel | no | "Anything else?" / "और कुछ जानना है?"; nothing if that was just said | false |
 | stop | no | silent: an `event` message "Stopped", nothing spoken | false |

@@ -22,12 +22,14 @@ short continuation sentence at most (or nothing: "-").
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
 from ..providers.llm import LLMMessage
 from ..settings import Language
+from .language import wordset
 from .live_data import LiveNote
 from .sources import Source, format_sources
 from .web_search import WebSource, format_web_sources
@@ -391,14 +393,78 @@ def document_name(filename: str) -> str:
     return " ".join(stem.replace("_", " ").replace("-", " ").split()) or filename
 
 
+# Words of a topic label that only make it sound like a label ("net profit fiscal" → "the net profit").
+_TOPIC_NOISE = wordset(
+    """
+    fiscal financial year years quarter quarters total amount number value values figure figures overall current
+    latest reported annual company company's companies firm group period end
+    """
+)
+_ACRONYMS = wordset(
+    """
+    ebitda pat pbt capex opex esop csr roe roce eps gst ceo cfo agm npa nim fy ipo
+    """
+)
+# The terms a topic label is usually made of, in Hindi (the rest are said as they are: "EBITDA मार्जिन").
+_TOPIC_HI = {
+    "net profit": "शुद्ध लाभ",
+    "net debt": "शुद्ध कर्ज़",
+    "cash flow": "नकदी प्रवाह",
+    "free cash flow": "फ्री कैश फ्लो",
+    "profit": "मुनाफ़ा",
+    "revenue": "राजस्व",
+    "sales": "बिक्री",
+    "margin": "मार्जिन",
+    "dividend": "लाभांश",
+    "debt": "कर्ज़",
+    "employees": "कर्मचारी",
+    "headcount": "कर्मचारी संख्या",
+    "growth": "वृद्धि",
+    "exports": "निर्यात",
+    "tax": "कर",
+    "shareholders": "शेयरधारक",
+    "auditors": "ऑडिटर",
+    "auditor": "ऑडिटर",
+    "board": "बोर्ड",
+    "segment": "सेगमेंट",
+    "customers": "ग्राहक",
+    "capacity": "क्षमता",
+    "expenses": "खर्च",
+    "costs": "लागत",
+    "emissions": "उत्सर्जन",
+}
+
+
+def spoken_topic(topic: str | None, language: Language) -> str | None:
+    """A topic label as it is said aloud (UX1: the resume line said "We were talking about net profit fiscal."):
+    label-only words dropped, acronyms in capitals, "the" in English, the usual terms in Hindi. None if nothing is
+    left."""
+    if not topic or not topic.strip():
+        return None
+    if any("\u0900" <= ch <= "\u097f" for ch in topic):
+        return topic.strip()  # already Hindi
+    words = [w for w in topic.split() if w.casefold() not in _TOPIC_NOISE]
+    if not words:
+        return None
+    words = [w.upper() if w.casefold() in _ACRONYMS else w for w in words]
+    phrase = " ".join(words)
+    if language == "en":
+        return f"the {phrase}"
+    for en, hi in sorted(_TOPIC_HI.items(), key=lambda kv: -len(kv[0])):
+        phrase = re.sub(rf"(?<![\w]){re.escape(en)}(?![\w])", hi, phrase, flags=re.IGNORECASE)
+    return phrase
+
+
 def resume_text(language: Language, topic: str | None, filenames: Sequence[str]) -> str:
     """Back to the documents without a new question: no model, nothing invented."""
     if len(filenames) == 1:
-        documents = f"the {document_name(filenames[0])}" if language == "en" else document_name(filenames[0])
+        documents = short_document_name(filenames[0])
+        documents = documents if language == "en" else documents.removeprefix("the ")
     else:
         documents = YOUR_DOCUMENTS[language]
     with_topic, without = RESUME_TEXTS[language]
-    return with_topic.format(documents=documents, topic=topic) if topic else without.format(documents=documents)
+    said = spoken_topic(topic, language)
+    return with_topic.format(documents=documents, topic=said) if said else without.format(documents=documents)
 
 
 AckKind = Literal["ack", "thanks", "greeting", "language"]
@@ -441,9 +507,47 @@ def memory_user_prompt(previous: str | None, transcript: str) -> str:
     return f"Current memory:\n{(previous or '').strip() or '(empty)'}\n\nNew messages:\n{transcript.strip()}"
 
 
-def answer_user_prompt(question: str, sources: Sequence[Source], language: Language) -> str:
+def answer_user_prompt(
+    question: str, sources: Sequence[Source], language: Language, *, name_documents: bool = False
+) -> str:
+    """``name_documents``: the evidence comes from more than one document, or from one that isn't the obvious one
+    (UX5): the answer says which, in a few words, besides citing it."""
+    note = f"{documents_note(sources)}\n" if name_documents else ""
     return (
         f"Sources:\n\n{format_sources(sources)}\n\n"
         f"Question: {question.strip()}\n\n"
-        f"(Answer in {LANGUAGE_NAMES[language]}, citing the sources like [S1].)"
+        f"{note}(Answer in {LANGUAGE_NAMES[language]}, citing the sources like [S1].)"
+    )
+
+
+# Filename words that don't help a listener tell documents apart ("valmora_annual_report_fy24_final.pdf" → "the
+# Valmora annual report").
+_FILE_NOISE = re.compile(r"^(?:(?:q[1-4])?fy\d{2,4}|q[1-4]|\d{4}|v\d+|final|draft|copy|scan(?:ned)?|new|old)$", re.I)
+_DESCRIPTIVE = wordset(
+    """
+    annual report reports document deck slides presentation investor policy travel expense group health
+    insurance statement statements financial results quarterly summary overview brochure manual handbook
+    contract agreement memo letter board meeting minutes plan budget notes
+    """
+)
+
+
+def short_document_name(filename: str) -> str:
+    """A document's name as it is said: "zephyra_investor_deck_q4fy24.pptx" → "the Zephyra investor deck"."""
+    words = [w for w in document_name(filename).split() if not _FILE_NOISE.match(w)] or document_name(filename).split()
+    named = [w if w.casefold() in _DESCRIPTIVE else w[:1].upper() + w[1:] for w in words]
+    return "the " + " ".join(named)
+
+
+def documents_note(sources: Sequence[Source]) -> str:
+    names = list(dict.fromkeys(short_document_name(s.filename) for s in sources))
+    if len(names) == 1:
+        return (
+            f"(These sources are from {names[0]}: say so in a few words, for example "
+            f'"{names[0][:1].upper() + names[0][1:]} says …".)'
+        )
+    listed = ", ".join(names[:-1]) + f" and {names[-1]}"
+    return (
+        f"(The sources come from {len(names)} documents: {listed}. Say in a few words which document each figure "
+        f'comes from, for example "{names[0][:1].upper() + names[0][1:]} says …".)'
     )

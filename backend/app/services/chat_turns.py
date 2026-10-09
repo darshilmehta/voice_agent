@@ -335,6 +335,7 @@ class _Progress:
     llm_ms: float | None = None  # the answer's generation time, once complete
     notice: LiveNote | None = None  # the live-data notice the answer started with
     language_retry: bool = False  # the answer came out in the wrong script and was asked again (B5)
+    name_documents: bool = False  # the answer says which document its figures come from (UX5)
 
     @property
     def citable(self) -> list[Source | WebSource]:
@@ -676,6 +677,7 @@ class ChatTurnService:
                 p.result.chunks, ready, budget_tokens=self.settings.retrieval.context_token_budget
             )
             p.documents_part = "sources"
+            p.name_documents = self._name_documents(p)
         elif plan.needs_retrieval:
             p.documents_part = "not_covered"
 
@@ -897,6 +899,18 @@ class ChatTurnService:
         )
 
     @staticmethod
+    def _name_documents(p: _Progress) -> bool:
+        """Should the answer say which document its figures come from (UX5)? When its sources come from more than one
+        document, or from one that isn't the obvious one: the chat searches several documents and the conversation
+        wasn't about this one (two reports with the same metrics: "revenue FY24" answered from the other company's
+        report without saying so)."""
+        documents = list(dict.fromkeys(s.chunk.document_id for s in p.sources))
+        if len(documents) > 1:
+            return True
+        active = p.state.active_document_ids if p.state is not None else []
+        return len(p.ready) > 1 and bool(documents) and documents[0] not in active
+
+    @staticmethod
     def _fixed_reply(plan: TurnPlan, p: _Progress) -> str:
         if plan.mode == "ack":
             return ack_text(plan.ack or "ack", plan.language)
@@ -950,7 +964,9 @@ class ChatTurnService:
                 live_note=notice,
                 live_hint=plan.live_hint and notice is None,
             )
-            question = answer_user_prompt(plan.query, sources, language)
+            question = answer_user_prompt(
+                plan.query, sources, language, name_documents=p is not None and p.name_documents
+            )
         elif plan.mode == "general":
             notice = p.notice if p is not None else None
             system = general_system_prompt(language, length, plan.general_note, live_note=notice)
@@ -1037,6 +1053,7 @@ class ChatTurnService:
             "route_confidence": route.confidence if route is not None else None,
             "answer": plan.mode,
             "language_retry": p.language_retry,
+            "named_documents": p.name_documents,
             "general_note": plan.general_note,
             "router": plan.decision.record() if plan.decision is not None else None,
             "speculation": p.speculation,
