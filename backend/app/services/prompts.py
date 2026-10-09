@@ -47,6 +47,7 @@ AnswerMode = Literal[
     "resume",  # fixed text: back to the documents, what we were talking about
     "ack",  # fixed short reply: "Anything else?" after an acknowledgement, "You're welcome." after thanks
     "silent",  # stop (or a second acknowledgement in a row): nothing is said
+    "canvas",  # a canvas edit (§12.1): applied, then a fixed "Done." / "हो गया।" (or why not)
 ]
 # Prompt ids recorded in a message's route (None: fixed text, no model).
 PROMPT_IDS: dict[AnswerMode, str | None] = {
@@ -58,6 +59,7 @@ PROMPT_IDS: dict[AnswerMode, str | None] = {
     "resume": None,
     "ack": None,
     "silent": None,
+    "canvas": None,
 }
 # Why a turn that wanted the documents is answered from general knowledge instead.
 GeneralNote = Literal["not_covered", "no_documents", "retrieval_off"]
@@ -524,12 +526,38 @@ def memory_user_prompt(previous: str | None, transcript: str) -> str:
     return f"Current memory:\n{(previous or '').strip() or '(empty)'}\n\nNew messages:\n{transcript.strip()}"
 
 
+# A visual was asked for (§12.1): the app draws it from the tables after the answer, if one fits. The answer neither
+# promises it (it may not come) nor says charts can't be shown (a 4B model's reflex).
+VISUAL_NOTE = (
+    "(The app draws charts on screen by itself from the documents' tables. Don't promise or describe a chart, and "
+    "never say you can't show one: just answer with the key figures.)"
+)
+
+
+def screen_note(lines: Sequence[str]) -> str:
+    """What the user is looking at, for a question about a chart on screen (§12.1): its line(s) and the point it
+    names; the chart's table is among the sources."""
+    return "The user is asking about a chart on screen, drawn from the sources: " + " ".join(lines)
+
+
 def answer_user_prompt(
-    question: str, sources: Sequence[Source], language: Language, *, name_documents: bool = False
+    question: str,
+    sources: Sequence[Source],
+    language: Language,
+    *,
+    name_documents: bool = False,
+    visual_requested: bool = False,
+    screen: Sequence[str] = (),
 ) -> str:
     """``name_documents``: the evidence comes from more than one document, or from one that isn't the obvious one
-    (UX5): the answer says which, in a few words, besides citing it."""
+    (UX5): the answer says which, in a few words, besides citing it. ``visual_requested``: the user asked to see
+    something (``VISUAL_NOTE``). ``screen``: the question is about a chart on screen (``screen_note``). Both come
+    after the question, so the system prompt, history and sources stay the cached prefix."""
     note = f"{documents_note(sources)}\n" if name_documents else ""
+    if screen:
+        note += f"{screen_note(screen)}\n"
+    if visual_requested:
+        note += f"{VISUAL_NOTE}\n"
     return (
         f"Sources:\n\n{format_sources(sources)}\n\n"
         f"Question: {question.strip()}\n\n"

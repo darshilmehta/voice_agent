@@ -27,6 +27,13 @@ never takes the document fast path: the router model writes its standalone Engli
 searched (it resolves "the stock" from the conversation), and for Hindi and Hinglish turns that English query is
 kept for every answering intent.
 
+**The canvas** (§12.1): with visuals on screen, the router's input gets them as a few lines (kind, title, x and series
+labels, highlight, and what the utterance points at: "the second bar" → Engineered Plastics), and the model may say
+``canvas_edit``; the keyword fast path catches the common edits first ("make that a bar chart", "remove the pie",
+"pin this", "हटा दो", "isko table mein dikhao"). A question about a chart is a document question (validation turns a
+"clarification" about "the second bar" into one); an edit is never a question. Chats without a canvas get exactly the
+prompt they had before.
+
 Routing a turn as a whole (speculative retrieval alongside the router, timeout, fallback, retrieval policy) is
 ``services/planning.py``.
 """
@@ -44,6 +51,8 @@ from ..domain.conversation import SILENT_INTENTS, TOPIC_NEUTRAL_INTENTS, Convers
 from ..domain.projects import Message
 from ..providers.llm import LLMClient, LLMMessage
 from ..settings import Language
+from .canvas.conversation import CanvasEdit, parse_edit, refers_to_screen
+from .canvas.planner import visual_intent
 from .language import asked_language, is_devanagari, message_language, wordset
 from .live_data import live_data_cue
 from .sources import strip_markers
@@ -312,6 +321,15 @@ def about_the_documents(text: str, filenames: Sequence[str] = ()) -> bool:
     return bool(names & {w.removesuffix("'s") for w in words(text)})
 
 
+def asks_to_see_the_documents(text: str, query: str | None, filenames: Sequence[str] = ()) -> bool:
+    """Asks to be shown something ("show me…", "chart", "dikhao", "दिखाओ") about the documents' subject ("FY24",
+    "the company", a name from a filename), in its own words or its English form: a document question, whatever the
+    router model proposed (§12.1: the visual is drawn from the documents' tables)."""
+    asks = visual_intent(text) == "requested" or (query is not None and visual_intent(query) == "requested")
+    about = about_the_documents(text, filenames) or (query is not None and about_the_documents(query, filenames))
+    return asks and about
+
+
 def asks_about_facts(text: str) -> bool:
     """A question about facts (a figure, a name, a date, which one…), not a definition or how-to, and not a question
     to the assistant itself: in a project with documents, such a question may well be about them even when the router
@@ -365,6 +383,9 @@ class RouteRequest:
     interrupted: InterruptedAnswer | None = None
     available_tools: frozenset[str] = frozenset()  # tools that can run now ("web_search", §3.7)
     enabled_tools: frozenset[str] = frozenset()  # tools turned on in the config, whether they can run now or not
+    # The chat's canvas as a few lines (services/canvas/conversation.screen_lines, §12.1): kinds, titles, x and series
+    # labels, what the utterance points at; empty when nothing is on screen.
+    screen: Sequence[str] = ()
 
     def live_cue(self, *texts: str | None) -> str | None:
         """The live-data cue of the utterance, else of the given texts (its standalone question), or None."""
@@ -447,6 +468,11 @@ class TurnRouter(Protocol):
 # ------------------------------------------------------------------ routes without the model
 
 
+def canvas_edit(req: RouteRequest) -> CanvasEdit | None:
+    """The canvas edit the utterance says (keyword grammar, §12.1), when there is a canvas to edit."""
+    return parse_edit(req.utterance) if req.screen else None
+
+
 def needs_retrieval_by_default(intent: Intent, has_query: bool) -> bool:
     return intent in ("document_qa", "mixed", "correction") or (intent == "resume_document" and has_query)
 
@@ -509,6 +535,8 @@ def fast_route(req: RouteRequest) -> RouteDecision | None:
     n = normalize(req.utterance)
     if n in STOP_PHRASES:
         return RouteDecision(_route(req, "stop", confidence=CONFIDENCE["stop"]), "heuristic")
+    if canvas_edit(req) is not None:  # "make that a bar chart", "हटा दो", "pin this" (§12.1)
+        return RouteDecision(_route(req, "canvas_edit", confidence=CONFIDENCE["heuristic"]), "heuristic")
     if only_asks_for_a_language(req.utterance):
         # "हिंदी में बताइए" after an answer: that question again, in the asked language (the turn's language);
         # before any answer: a short acknowledgement. The language itself is decided (and kept) by services/language.
@@ -561,6 +589,7 @@ def standalone_question(req: RouteRequest) -> bool:
         and not is_resume(text)
         and not req.agent_asked
         and req.interrupted is None
+        and not (req.screen and refers_to_screen(text))  # "what's the second bar?": the router reads the screen
     )
 
 
@@ -612,6 +641,19 @@ def validate(proposal: RouterProposal, req: RouteRequest, *, llm_ms: float | Non
     if intent == "correction" and previous is None:
         overrides.append("correction→document_qa: nothing to correct")
         intent = "document_qa"
+    # The canvas (§12.1): a question about a chart on screen is a document question (its tables answer it); an edit
+    # is never a question.
+    if intent == "canvas_edit" and is_question(text):
+        overrides.append("canvas_edit→document_qa: asks a question")
+        intent = "document_qa"
+    elif intent in ("clarification", "conversation", "general_qa") and req.screen and refers_to_screen(text):
+        overrides.append(f"{intent}→document_qa: asks about a chart on screen")
+        intent = "document_qa"
+    elif intent in ("clarification", "conversation", "general_qa") and asks_to_see_the_documents(
+        text, proposal.query, req.documents
+    ):  # "वालमोरा की FY24 की तिमाही आय का चार्ट दिखाओ" taken for small talk: answered "I can't show charts"
+        overrides.append(f"{intent}→document_qa: asks to see the documents' figures")
+        intent = "document_qa"
 
     # The model's query is the standalone question in English. An English turn: it is the rewritten query. A Hindi or
     # Hinglish turn: it is the English search query, and also the rewritten one when the utterance needs the
@@ -623,8 +665,13 @@ def validate(proposal: RouterProposal, req: RouteRequest, *, llm_ms: float | Non
         if message_language(text) == "en" or is_devanagari(proposed):
             query = proposed
         else:
-            # The English query searches the documents, and for a live question the web (§3.7), whatever the intent.
-            if intent in _SEARCHING or (intent in ANSWERING and req.live_cue(proposed) is not None):
+            # The English query searches the documents, and for a live question the web (§3.7), whatever the intent;
+            # for a canvas edit the planner reads it (§12.1).
+            if (
+                intent in _SEARCHING
+                or intent == "canvas_edit"
+                or (intent in ANSWERING and req.live_cue(proposed) is not None)
+            ):
                 query_en = proposed
             if refers_back(text) or is_correction(text) or intent in ("correction", "resume_document"):
                 query = proposed
@@ -699,6 +746,14 @@ Examples: "What was revenue in FY24?" -> {"intent":"document_qa","query":null}; 
 {"intent":"correction","query":"What was profit in FY24?"}"""
 
 
+# Told only when something is on screen (in the user's message, so the cached system prompt stays the same).
+SCREEN_HINT = (
+    '(intent canvas_edit: the utterance changes a chart on screen, e.g. "make it a bar chart", "remove that", '
+    '"add FY23 to it", "isko table mein dikhao"; a question about a chart is document_qa, with the query naming what '
+    "it points at.)"
+)
+
+
 def _history_lines(req: RouteRequest) -> list[str]:
     lines = []
     for m in list(req.history)[-ROUTER_HISTORY_MESSAGES:]:
@@ -728,6 +783,10 @@ def router_messages(req: RouteRequest) -> list[LLMMessage]:
             if played
             else "(The user cut the answer off before hearing any of it)"
         )
+    if req.screen:  # only chats with a canvas: everyone else's prompt is unchanged (router-v1)
+        lines.append("On screen (charts the app drew from the documents' tables):")
+        lines.extend(req.screen)
+        lines.append(SCREEN_HINT)
     lines.append(f"Utterance: {req.utterance}")
     return [LLMMessage("system", ROUTER_SYSTEM_PROMPT), LLMMessage("user", "\n".join(lines))]
 

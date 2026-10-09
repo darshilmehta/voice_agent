@@ -24,11 +24,17 @@ Intent = Literal[
     "stop",  # be quiet
     "backchannel",  # "okay", "mm-hmm", "haan": nothing to answer
     "clarification",  # too ambiguous to answer: ask a short question back
+    "canvas_edit",  # changes a visual on the chat's canvas ("make it a bar chart", "हटा दो"), §12.1
 ]
 INTENTS: tuple[Intent, ...] = get_args(Intent)
 SILENT_INTENTS: frozenset[Intent] = frozenset({"stop", "backchannel"})  # no answer, nothing spoken
 # Turns that keep the conversation where it is: no new topic.
-TOPIC_NEUTRAL_INTENTS: frozenset[Intent] = frozenset({"conversation", "clarification", "stop", "backchannel"})
+TOPIC_NEUTRAL_INTENTS: frozenset[Intent] = frozenset(
+    {"conversation", "clarification", "stop", "backchannel", "canvas_edit"}
+)
+# Does the answer deserve a visual on the canvas (§12.1)? "requested": the user asked to see something; "suggest": a
+# trend, comparison or breakdown that a chart shows better; "none". Set by application code, never by the model.
+VisualWant = Literal["none", "suggest", "requested"]
 
 RouteSource = Literal[
     "heuristic",  # keyword fast path (stop, backchannel, an explicit question about the documents)
@@ -41,10 +47,11 @@ RouteSource = Literal[
 class TurnRoute(BaseModel):
     """§3.4. ``rewritten_query``: the question made standalone (follow-ups, corrections), None when the utterance
     already stands alone; ``query_en``: an English search query for non-English turns (the reranker scores EN-EN
-    best); ``tools`` stays empty until live-data tools exist (§3.7, phase 8). The router model proposes only the
-    intent and the standalone English question; ``needs_retrieval`` (the retrieval policy), ``topic`` (content words
-    of the question), ``is_topic_shift``, ``response_language`` (services/language.py) and ``confidence`` (by how the
-    route was decided) are set by application code."""
+    best); ``tools``: the live-data tools to run (§3.7); ``visual``: whether the answer gets a visual on the canvas
+    (§12.1, ``services/canvas/conversation.visual_want``). The router model proposes only the intent and the
+    standalone English question; ``needs_retrieval`` (the retrieval policy), ``topic`` (content words of the
+    question), ``is_topic_shift``, ``response_language`` (services/language.py) and ``confidence`` (by how the route
+    was decided) are set by application code."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -57,6 +64,7 @@ class TurnRoute(BaseModel):
     is_topic_shift: bool = False
     response_language: Language
     confidence: float = Field(ge=0, le=1)
+    visual: VisualWant = "none"  # additive (§12.1): from the question's words, set by application code
 
 
 class ConversationState(BaseModel):
