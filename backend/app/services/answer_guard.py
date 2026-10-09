@@ -22,19 +22,23 @@ text through once it has been checked:
   ``max_sentences``, never inside a sentence.
 
 What is held, and for how long: with a coverage check, the first sentence goes out ``LAG_WORDS`` (3) words behind the
-model until it holds a negation ("not", "only", "no", "नहीं"…, which every denial needs) or while its subject is a
-document whose verb hasn't come yet ("The Valmora annual report …" may go on "does not mention"; "… says" releases
-it); from a negation on, it is held to its end and checked. A Hindi first sentence is held whole (its "नहीं" comes
-last). Later sentences are held whole: the voice session synthesises whole sentences after its first chunk anyway,
-so speech pays only the first chunk's wait (~3 words, or a document subject's verb). A live-figure check holds whole
-sentences (such answers are rare). Without either, only a word that may still be an identifier or a misheard name is
-held.
+model until it holds a negation ("not", "only", "no", "नहीं", "nahi"…, which every denial needs) or while its subject
+is a document whose verb hasn't come yet ("The Valmora annual report …" may go on "does not mention"; "… says"
+releases it); from a negation on, it is held to its end and checked. Hindi, whose negation comes last, is released the
+same way (3 words behind, whole from its first negation, apology or "केवल"), except that a sentence *about what the
+documents contain* ("रिपोर्ट में …", "… की जानकारी …", "इस बारे में …", a contrast "…, लेकिन …") is held to its
+clause's final auxiliary (है, हैं, था, थे, होगा…; ``hindi_hold``): a negation always precedes it, so a denial is
+seen before any of its clause is out, and a clause with its auxiliary and no negation goes out at once. Later
+sentences are held whole: the voice session synthesises whole sentences after its first chunk anyway, so speech pays
+only the first chunk's wait (~3 words, or a document subject's verb). A live-figure check holds whole sentences (such
+answers are rare). Without either, only a word that may still be an identifier or a misheard name is held.
 Every change is recorded (``checks``: ``route.checks`` on the saved message).
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -157,7 +161,7 @@ def _word_matches(word: str, words: frozenset[str]) -> bool:
 
 _DENIAL_CUE = re.compile(
     r"\b(?:not|no|none|nothing|neither|nor|cannot|unable|unfortunately|sorry|only|without|lacks?|missing|unavailable|"
-    r"absent|unclear)\b|n['\u2019]t\b|नहीं|अनुपलब्ध|केवल|सिर्फ़|सिर्फ|खेद",
+    r"absent|unclear|nah(?:i|in|ee)|nhi|uplabdh|ullekh)\b|n['\u2019]t\b",  # (the last four: romanized Hindi)
     re.IGNORECASE,
 )
 
@@ -188,9 +192,79 @@ def awaits_its_verb(text: str) -> bool:
     return not any(w in _REPORTING_VERBS for w in words[at + 1 :])
 
 
+# Hindi puts its verb last: "रिपोर्ट में FY25 की जानकारी उपलब्ध नहीं है।" says what it is about first, and only its last
+# words say whether it denies it. English is released a few words behind the model because its negation comes early; a
+# Hindi sentence is checked by its structure instead (``hindi_hold``): one about what the documents contain (it names a
+# document, or availability: "रिपोर्ट", "जानकारी", "उल्लेख", "उपलब्ध"…) goes out clause by clause, each when its final
+# auxiliary (है, हैं, था, थे, होगा…, which a negation always precedes) has come without one; any other sentence goes
+# out LAG_WORDS behind the model, as English does, and is held whole from the moment a negation or apology shows up.
+_HI_PUNCT = ",.;:!?\u0964\u0965\"'\u201c\u201d\u2018\u2019()[]{}\u2014\u2013-\u2026"
+
+
+def hindi(text: str) -> str:
+    """Devanagari as compared: without nuktas ("दस्तावेज़" = "दस्तावेज") and with the chandrabindu as an anusvara
+    ("हूँ" = "हूं")."""
+    return unicodedata.normalize("NFD", text).replace("\u093c", "").replace("\u0901", "\u0902")
+
+
+def _hindi_words(text: str) -> frozenset[str]:
+    return frozenset(hindi(w) for w in text.split())
+
+
+_HI_CUE = re.compile(  # on hindi(text): a negation, an apology or a restriction
+    "नही|नहि|अनुपलब्ध|अनुल्लेख|केवल|सिर्फ|खेद|माफ|क्षमा|दुर्भाग्य|अफसोस|अभाव|गायब",
+)
+_HI_AUXILIARIES = _hindi_words("है हैं हूं था थी थे थीं होगा होगी होंगे होंगी")  # the verb group's last word
+_HI_ABOUT_STEMS = (  # starts a word: what a "not covered" sentence names ("रिपोर्ट में", "दस्तावेज़ों", "उपलब्ध नहीं")
+    *_hindi_words(
+        "रिपोर्ट दस्तावेज डॉक्यूमेंट स्रोत प्रस्तुति प्रेजेंटेशन पॉलिसी नीति फाइल तालिका टेबल अनुच्छेद स्लाइड मैनुअल "
+        "हैंडबुक अनुबंध समझौत डेक जानकारी उल्लेख उपलब्ध मौजूद दर्ज जिक्र विवरण ब्योरा ब्यौरा शामिल आंकड डेटा"
+    ),
+)
+# whole words: "इस बारे में", "मुझे पता नहीं", and a contrast, which so often introduces what the documents lack ("Q4 का
+# राजस्व ₹1,711 करोड़ था, लेकिन FY23 की जानकारी उपलब्ध नहीं है")
+_HI_ABOUT_WORDS = _hindi_words("पता बारे संबंध सम्बन्ध विषय मुझे लेकिन परंतु परन्तु किंतु किन्तु मगर जबकि हालांकि हालाकि")
+_HI_ATTRIBUTION = _hindi_words("अनुसार मुताबिक हिसाब आधार")  # "रिपोर्ट के अनुसार …": the report is named, not described
+
+
+def _hindi_tokens(text: str) -> list[tuple[str, int, bool]]:
+    """The words of ``text`` as ``(word as compared, end offset, complete)``: a word is complete once whitespace or
+    punctuation follows it (the last one may still be growing: "है" → "हैं")."""
+    out = []
+    for m in _WORD.finditer(_mask(text)):
+        raw = m.group(0)
+        out.append((hindi(raw.strip(_HI_PUNCT)), m.end(), m.end() < len(text) or raw[-1] in _HI_PUNCT))
+    return out
+
+
+def hindi_hold(text: str) -> tuple[bool, int]:
+    """For a Hindi sentence so far with no denial cue in it: ``(about, safe)``. ``about``: it is about what the
+    documents contain, so it may still end "… उपलब्ध नहीं है" (held until a clause's verb has come). ``safe``: how far
+    the text can be released then: the end of its last complete final auxiliary (0: none yet)."""
+    tokens = _hindi_tokens(text)
+    about = False
+    safe = 0
+    for i, (word, end, complete) in enumerate(tokens):
+        if word in _HI_AUXILIARIES and complete:
+            safe = end
+        elif word in _HI_ABOUT_WORDS or word.startswith(_HI_ABOUT_STEMS) or word.casefold() in _DOCUMENT_NOUNS:
+            ahead = tokens[i + 1 : i + 3]
+            if not (
+                len(ahead) == 2 and ahead[0][0] == "के" and ahead[1][0] in _HI_ATTRIBUTION and ahead[1][2]
+            ):  # "रिपोर्ट के अनुसार": an attribution, not the subject
+                about = True
+    return about, safe
+
+
 def has_denial_cue(text: str) -> bool:
-    """A negation or restriction that a "the documents don't cover it" sentence needs."""
-    return bool(_DENIAL_CUE.search(_MARKERS.sub(" ", text)))
+    """A negation or restriction that a "the documents don't cover it" sentence needs (English, Hindi, romanized
+    Hindi)."""
+    plain = _MARKERS.sub(" ", text)
+    return bool(
+        _DENIAL_CUE.search(plain)
+        or _HI_CUE.search(hindi(plain))
+        or any(word == "न" for word, _, _ in _hindi_tokens(text))
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -585,18 +659,28 @@ class AnswerGuard:
             # the model while it holds no negation (the voice answer's first chunk waits for it); from its first "not"
             # / "only" / "नहीं" on, the rest of it waits for its end (a denial's own clause is then still unsaid, and
             # can be dropped or the model asked again). Later sentences are held whole: speech waits for whole
-            # sentences after the first chunk anyway, and a denial is then dropped without a trace.
+            # sentences after the first chunk anyway, and a denial is then dropped without a trace. English holds
+            # a sentence whose subject is a document until its verb; Hindi, whose negation comes last, a sentence
+            # about what the documents contain until a clause's final auxiliary (``hindi_hold``).
             first = self.sentences == 0 and self.attempt <= 2
             sofar = self.current + self.buffer
-            if not (self.lag_release and first) or has_denial_cue(sofar) or awaits_its_verb(sofar):
+            if not (self.lag_release and first) or has_denial_cue(sofar):
                 return ""
+            cut = None
             if _DEVANAGARI.search(sofar):
-                return ""  # Hindi says "नहीं" last: a Hindi sentence is checked whole
-            words = list(_WORD.finditer(_mask(self.buffer)))
-            ready = len(words) - LAG_WORDS - (0 if self.buffer[-1].isspace() else 1)
-            if ready <= 0:
+                about, safe = hindi_hold(sofar)
+                if about:  # its clauses go out as their verbs come; the one being written waits
+                    cut = safe - len(self.current)
+                    if cut <= 0:
+                        return ""
+            elif awaits_its_verb(sofar):
                 return ""
-            cut = words[ready - 1].end()
+            if cut is None:
+                words = list(_WORD.finditer(_mask(self.buffer)))
+                ready = len(words) - LAG_WORDS - (0 if self.buffer[-1].isspace() else 1)
+                if ready <= 0:
+                    return ""
+                cut = words[ready - 1].end()
         elif self.token_hold:
             # the word being written (it may be a code or a name), and for a misheard phrase ("Wall Mora") the words
             # before it that may start one; whole phrases are respelled first
