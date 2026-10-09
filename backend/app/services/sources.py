@@ -194,6 +194,7 @@ _DOCUMENT_WORDS = (
 # Between the document and its "does not …": nothing that makes it report a fact ("the report shows revenue does not
 # include other income" says what the report says).
 _REPORTING = r"(?!\b(?:shows?|says?|states?|notes?|reports?|explains?|confirms?|clarifies|that)\b)"
+_HI_NO = "नही[\u0901\u0902]?"  # "नहीं", "नही" (written without the dot) and "नहीँ"
 _NOT_COVERED = re.compile(
     rf"(?:\b(?:{_DOCUMENT_WORDS})\b|\[\s*[SW]\d+\s*\])"
     rf"(?:{_REPORTING}[^.!?।]){{0,80}}?\b(?:do(?:es)?\s*n[o'\u2019]?t|did\s*n[o'\u2019]?t|cannot|can't)\s+(?:\w+\s+)?(?:cover|mention|"
@@ -204,7 +205,9 @@ _NOT_COVERED = re.compile(
     r"|\bno\s+(?:specific\s+|such\s+|further\s+)?(?:information|mention|data|details|figures?|provisions?|breakdown)"
     r"\s+(?:about|on|of|regarding|for|in\s+the\s+(?:documents?|sources?|report|policy))\b"
     r"|\b(?:i\s+)?(?:couldn['\u2019]t|could\s+not|can['\u2019]t|cannot)\s+find\b"
-    r"|जानकारी\s+नहीं|उल्लेख\s+नहीं|नहीं\s+दी\s+गई|नहीं\s+दिया\s+गया|नहीं\s+दिए\s+गए|उपलब्ध\s+नहीं|नहीं\s+बताया|नहीं\s+मिल",
+    rf"|(?:जानकारी|उल्लेख|उपलब्ध|मौजूद|दर्ज|पता|विवरण|ब्योरा|ब्यौरा|ज\u093c?िक्र)\s+{_HI_NO}"
+    rf"|{_HI_NO}\s+(?:दी|दिया|दिए|दिये)\s+(?:गई|गयी|गया|गए|गये)|{_HI_NO}\s+(?:बताया|मिल)"
+    r"|\b(?:jaa?nkari|ullekh|uplabdh|maujood|pata)\s+nah(?:i|in|ee)\b",  # romanized Hindi ("uplabdh nahi hai")
     re.IGNORECASE,
 )
 
@@ -229,7 +232,11 @@ _ABBREVIATED = re.compile(
     re.IGNORECASE,
 )
 # Where a clause starts inside a sentence ("…, but the report doesn't give FY23").
-_CLAUSE = re.compile(r",\s+|;\s+|\s+[\u2014\u2013-]\s+|\s+(?=(?:but|however|although|though|while|whereas)\b)", re.I)
+_CLAUSE = re.compile(
+    r",\s+|;\s+|\s+[\u2014\u2013-]\s+|\s+(?=(?:but|however|although|though|while|whereas)\b)"
+    r"|\s+(?=(?:लेकिन|परंतु|परन्तु|किंतु|किन्तु|मगर|जबकि|हालांकि|हालाँकि)\s)",  # Hindi (no \b: matras aren't \w)
+    re.I,
+)
 
 
 def split_sentences(text: str) -> list[str]:

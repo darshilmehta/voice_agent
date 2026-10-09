@@ -101,6 +101,26 @@ def documents_by_name(named: NamedDocuments, labels: Mapping[str, str]) -> dict[
     return out
 
 
+# "both companies", "the two reports", "each company", "compare the documents", Hindi "दोनों कंपनियों", Hinglish "dono
+# companies": a question about the documents side by side, whether or not it names them. "Compare FY23 and FY24" and
+# "the company's revenue" are not (periods, one company).
+_ENTITY = r"compan(?:y|ies)|firms?|businesses|organi[sz]ations?|documents?|reports?|decks?|presentations?|files?"
+_COMPARES = re.compile(
+    rf"(?<![a-z])(?:(?:both|two|each|every|all)\s+(?:of\s+)?(?:the\s+)?(?:{_ENTITY})"
+    r"|(?:compar\w*|versus|vs\.?|between|across)\s+(?:the\s+)?(?:two\s+|both\s+)?(?:companies|documents|reports|decks|files)"
+    rf"|dono\s+(?:companies|company|companiyon|documents|reports))(?![a-z])"
+    r"|(?<![ऀ-ॿ])(?:दोनों|सभी|हर)\s+(?:कं?पनि|कम्पनि|दस्तावे|रिपोर्ट)[ऀ-ॿ]*",
+    re.IGNORECASE,
+)
+
+
+def compares_documents(texts: Sequence[str | None]) -> bool:
+    """The question (or its English query) explicitly puts the documents or companies side by side without naming them
+    ("show both companies' revenue", "दोनों कंपनियों का राजस्व"). A question that names two companies compares them too
+    (``documents_by_name`` finds two), which is for the caller to see."""
+    return any(_COMPARES.search(t) for t in texts if t)
+
+
 def mentions(text: str, names: Sequence[str]) -> bool:
     """Does ``text`` contain one of ``names`` as a word (case-insensitive; "Valmora's" contains "valmora")?"""
     if not names:

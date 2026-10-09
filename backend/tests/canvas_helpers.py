@@ -231,3 +231,45 @@ def two_companies() -> list[TypedDataset]:
         typed(ZEPHYRA_GLANCE, heading=("Zephyra at a glance",), page=3, document_id=Z, dataset_id="ds_z_glance"),
         report_datasets(V)["highlights"].model_copy(update={"id": "ds_v_hl"}),
     ]
+
+
+ZEPHYRA_Q4 = [
+    ["Quarter", "Revenue", "EBITDA", "EBITDA margin"],
+    ["Q1 FY24", "880", "128", "14.5%"],
+    ["Q2 FY24", "930", "140", "15.1%"],
+    ["Q3 FY24", "990", "156", "15.8%"],
+    ["Q4 FY24", "1,070", "172", "16.1%"],
+]
+ZEPHYRA_Q23 = [
+    ["Quarter", "Revenue", "EBITDA", "EBITDA margin"],
+    ["Q1 FY23", "800", "110", "13.7%"],
+    ["Q2 FY23", "850", "120", "14.1%"],
+]
+
+
+def two_companies_quarterly() -> list[TypedDataset]:
+    """Both companies print quarterly tables: Valmora's report has FY23's and FY24's (``ds_q_fy23``, ``ds_q_fy24``),
+    Zephyra's deck its "Q4 FY24 results" (``ds_z_q24``) and an earlier quarterly trend (``ds_z_q23``). A question that
+    says only "the company's quarterly revenue" fits every one of them."""
+    valmora = report_datasets(V)
+    return [
+        valmora["q_fy23"],
+        valmora["q_fy24"],
+        valmora["highlights"].model_copy(update={"id": "ds_v_hl"}),
+        typed(
+            ZEPHYRA_Q4,
+            heading=("Q4 FY24 results",),
+            page=6,
+            document_id=Z,
+            dataset_id="ds_z_q24",
+            chunk_id=f"{Z}:v1:0001",
+        ),
+        typed(
+            ZEPHYRA_Q23,
+            heading=("Quarterly trend",),
+            page=7,
+            document_id=Z,
+            dataset_id="ds_z_q23",
+            chunk_id=f"{Z}:v1:0002",
+        ),
+    ]

@@ -125,6 +125,64 @@ async def test_a_second_denial_is_replaced_by_a_pointer_to_the_passage(world, fa
     assert [c["action"] for c in agent.route["checks"]] == ["retry", "corrected"]
 
 
+HOTELS_HI = "टियर-2 शहरों में L3 कर्मचारियों के लिए होटल की सीमा क्या है?"
+HOTELS_EN = "What are the hotel limits per night for L3 employees in tier 2 cities?"
+
+
+async def test_a_hindi_denial_of_a_strong_passage_is_asked_again(world, fakes):
+    """Hindi puts its negation last: the denial is held, checked, never heard, and the model asked once more."""
+    service, chat_id = world
+    replies = iter(
+        [
+            "दस्तावेज़ों में टियर-2 शहरों में L3 कर्मचारियों के लिए होटल की सीमा की जानकारी उपलब्ध नहीं है [{sid}]।",
+            "टियर-2 शहरों में L3 कर्मचारियों के लिए होटल की सीमा ₹5,200 प्रति रात है [{sid}]।",
+        ]
+    )
+    fakes.llm.reply = lambda m: next(replies).format(sid=source_of(m[-1].content, "Hotel limits"))
+    fakes.llm.route = {"intent": "document_qa", "query": HOTELS_EN}
+    fakes.llm.piece_chars = 3
+    fakes.reranker.scorer = prefer("Hotel limits")
+    events = await turn(service, chat_id, HOTELS_HI, language="hi")
+    agent = saved(events)
+    sid = source_of(answer_prompts(fakes.llm)[0], "Hotel limits")
+    assert spoken(events) == f"टियर-2 शहरों में L3 कर्मचारियों के लिए होटल की सीमा ₹5,200 प्रति रात है [{sid}]।"
+    assert agent.route["abstained"] is False and [c.source_id for c in agent.citations] == [sid]
+    assert [(c["check"], c["action"]) for c in agent.route["checks"]] == [("coverage", "retry")]
+    assert f"IMPORTANT: the sources do contain this: [{sid}]" in fakes.llm.calls[-1]["messages"][-1].content
+
+
+async def test_a_hindi_denial_said_twice_is_replaced_by_a_hindi_pointer_to_the_passage(world, fakes):
+    service, chat_id = world
+    fakes.llm.reply = "इस बारे में होटल की सीमा की जानकारी उपलब्ध नहीं है।"
+    fakes.llm.route = {"intent": "document_qa", "query": HOTELS_EN}
+    fakes.llm.piece_chars = 2
+    fakes.reranker.scorer = prefer("Hotel limits")
+    events = await turn(service, chat_id, HOTELS_HI, language="hi")
+    sid = source_of(answer_prompts(fakes.llm)[0], "Hotel limits")
+    assert len(answer_prompts(fakes.llm)) == 2
+    assert "उपलब्ध नहीं" not in spoken(events) and spoken(events).endswith(f"में इसकी जानकारी है [{sid}]।")
+    assert [c["action"] for c in saved(events).route["checks"]] == ["retry", "corrected"]
+
+
+async def test_a_hindi_answer_is_spoken_three_words_behind_the_model_not_a_sentence_behind(world, fakes):
+    """The guard held every Hindi sentence whole (first audio 2.6 s later than English's, §9.5)."""
+    service, chat_id = world
+    reply = "FY24 में वालमोरा का कुल राजस्व ₹7,365 करोड़ रहा, जो पिछले साल के ₹6,482 करोड़ से ज़्यादा है [S1]। यह 13.6% की बढ़त है।"
+    fakes.llm.reply = reply
+    fakes.llm.piece_chars = 2
+    fakes.reranker.scorer = prefer("Revenue from operations")
+    events = await turn(service, chat_id, "FY24 में राजस्व कितना था?", language="hi", length="short")
+    deltas = [e.text for e in events if isinstance(e, DeltaEvent)]
+    assert "".join(deltas) == reply and not saved(events).route.get("checks")
+    first_sentence = reply.split("। ")[0] + "। "
+    out, early = "", []
+    for d in deltas:
+        out += d
+        if len(out) < len(first_sentence) - 10:  # said before the first sentence was over
+            early.append(d)
+    assert len(early) >= 5 and reply.startswith("".join(early))  # word by word, not the sentence at its end
+
+
 # ------------------------------------------------------------------ item 1: the chart on screen and the answer
 
 

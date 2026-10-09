@@ -3,6 +3,8 @@ are offered, the per-request schema, mapping the model's choice back to a spec, 
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from pydantic import ValidationError
 
@@ -13,6 +15,7 @@ from app.services.canvas.planner import (
     build_catalog,
     builds,
     first_valid,
+    one_document,
     planner_messages,
     planner_schema,
     rank_candidates,
@@ -21,10 +24,10 @@ from app.services.canvas.planner import (
     variants,
     visual_intent,
 )
-from app.services.canvas.spec import VisualSpec, resolve
+from app.services.canvas.spec import CalcRequest, VisualSpec, resolve
 from app.services.subjects import named_documents
 
-from .canvas_helpers import TWO_LABELS, V, report_datasets, two_companies
+from .canvas_helpers import TWO_FILES, TWO_LABELS, V, Z, report_datasets, two_companies, two_companies_quarterly
 from .fakes import FakeLLM
 
 DS = report_datasets()
@@ -373,6 +376,66 @@ async def test_no_candidates():
     assert (
         await planner(llm).plan_detailed("show the glossary", "en", [DS["glossary"]])
     ).reason == "no chartable table"
+
+
+# ------------------------------------------------------------------ one document's tables, unless the question compares
+
+QUARTERLY = two_companies_quarterly()
+QUARTERLY_BY_ID = {d.id: d for d in QUARTERLY}
+
+
+def both_documents(messages) -> dict:
+    """A planner that takes the first table offered of each document and plots its revenue."""
+    first: dict[str, str] = {}
+    for line in messages[-1].content.splitlines():
+        if m := re.match(r'(D\d+) ".*" \((\S+)', line):
+            first.setdefault(m.group(2), m.group(1))
+    aliases = list(first.values())
+    return {"kind": "line", "datasets": aliases, "series": [f"{a} · Revenue" for a in aliases]}
+
+
+def documents_of(spec: VisualSpec) -> set[str]:
+    return {QUARTERLY_BY_ID[i].document_id for i in spec.datasets}
+
+
+async def test_a_choice_of_two_documents_tables_is_cut_down_to_one_unless_the_question_compares():
+    """ "The company's quarterly revenue" in a chat of two companies: the model, offered both, took the deck's Q4 table
+    and the other company's FY23 table for one chart."""
+    llm = FakeLLM()
+    llm.route = both_documents
+    question = "Show the company's quarterly revenue"
+    as_chosen = await planner(llm).plan_detailed(question, "en", QUARTERLY, filenames=TWO_FILES)
+    assert as_chosen.spec is not None and documents_of(as_chosen.spec) == {V, Z}  # (compare=None: left as chosen)
+    one = await planner(llm).plan_detailed(question, "en", QUARTERLY, filenames=TWO_FILES, compare=False)
+    assert one.spec is not None and len(documents_of(one.spec)) == 1 and one.source == "model"
+    assert {s.split(":")[0] for s in one.spec.series} == set(one.spec.datasets)
+    both = await planner(llm).plan_detailed(
+        "Show both companies' quarterly revenue", "en", QUARTERLY, filenames=TWO_FILES, compare=True
+    )
+    assert both.spec is not None and documents_of(both.spec) == {V, Z}
+
+
+def test_one_document_keeps_the_first_series_document_and_what_belongs_to_it():
+    mixed = VisualSpec(
+        kind="line",
+        datasets=["ds_z_q24", "ds_q_fy23", "ds_q_fy24"],
+        series=["ds_q_fy23:revenue", "ds_z_q24:revenue", "ds_q_fy24:revenue"],
+        periods=["Q4 FY23"],
+        highlight=["ds_z_q24:q4_fy24", "ds_q_fy23:q4_fy23", "Q4 FY24"],
+        calculations=[
+            CalcRequest(op="growth", series="ds_z_q24:revenue"),
+            CalcRequest(op="growth", series="ds_q_fy23:revenue"),
+        ],
+    )
+    cut = one_document(mixed, QUARTERLY_BY_ID)
+    assert cut is not None and cut.datasets == ["ds_q_fy23", "ds_q_fy24"]  # Valmora's: its first series is
+    assert cut.series == ["ds_q_fy23:revenue", "ds_q_fy24:revenue"] and cut.periods == ["Q4 FY23"]
+    assert cut.highlight == ["ds_q_fy23:q4_fy23", "Q4 FY24"]  # a period label stays
+    assert [c.series for c in cut.calculations] == ["ds_q_fy23:revenue"]
+    one = VisualSpec(kind="line", datasets=["ds_z_q24"], series=["ds_z_q24:revenue"])
+    assert one_document(one, QUARTERLY_BY_ID) is one  # nothing mixed: untouched
+    only_tables = VisualSpec(kind="bar", datasets=["ds_z_q24", "ds_q_fy23"], series=["ds_unknown:revenue"])
+    assert one_document(only_tables, QUARTERLY_BY_ID) is None  # nothing of the chart is left to draw
 
 
 def test_prompt_in_hindi_keeps_the_catalog():

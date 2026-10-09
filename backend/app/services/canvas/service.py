@@ -419,7 +419,7 @@ class CanvasService:
                     pool,
                     query_en=query_en,
                     source_chunks=ctx.source_chunks,
-                    documents=ctx.documents,
+                    documents=ctx.scope,
                     source_documents=ctx.source_documents,
                     names=ctx.names,
                     companies=ctx.companies,
@@ -494,12 +494,13 @@ class CanvasService:
                 filenames=filenames,
                 query_en=query_en,
                 source_chunks=ctx.source_chunks,
-                documents=ctx.documents,
+                documents=ctx.scope,
                 source_documents=ctx.source_documents,
                 names=ctx.names,
                 ranked=draft.candidates if draft is not None and draft.candidates else None,
                 force=force or shown is not None,
                 fallback=shown is None,
+                compare=ctx.compare,
             )
         except asyncio.CancelledError:
             raise

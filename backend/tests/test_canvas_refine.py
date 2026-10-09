@@ -4,14 +4,17 @@ planner's refinement replaced a correct 8-quarter draft with a 2-point bar chart
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from app.domain.projects import Citation
 from app.services.canvas.draft import cues, draft_visual, refinement_loses, turn_context
 from app.services.canvas.spec import VisualSpec
 
-from .canvas_helpers import TWO_FILES, TWO_LABELS, V, report_datasets, two_companies
+from .canvas_helpers import TWO_FILES, TWO_LABELS, V, Z, report_datasets, two_companies, two_companies_quarterly
 from .canvas_turn_helpers import Script, choose, choose_table, planner_calls, report_chat
+from .test_canvas_api import chat, drain, project, upload
 from .test_canvas_turns import ask, canvas, messages, visuals
 
 DS = report_datasets()
@@ -198,4 +201,101 @@ def test_a_planner_chart_that_covers_the_question_as_well_still_replaces_it_in_p
     assert visuals(events) == [("preparing", None), ("ready", None), ("ready", None)]
     (panel,) = canvas(api, chat_id)
     assert panel["kind"] == "bar" and [s["label"] for s in panel["series"]] == ["Revenue", "EBITDA"]
+    assert messages(api, chat_id)[-1]["route"]["visual_plan"]["planner"] == "changed"
+
+
+# ------------------------------------------------------------------ one document's tables, unless the question compares
+#
+# Found in the final real run: "the company's quarterly revenue" in a chat of both companies' documents drew the deck's
+# Q4 table next to Valmora's FY23 table in one chart. The draft and the planner's refinement draw from one document.
+
+QUARTERLY = two_companies_quarterly()
+COMPANY = "Show the company's quarterly revenue"
+MIXED = VisualSpec(
+    kind="line", datasets=["ds_z_q24", "ds_q_fy23"], series=["ds_z_q24:revenue", "ds_q_fy23:revenue"], periods=[]
+)
+
+
+def test_a_planner_chart_that_mixes_two_documents_never_replaces_the_draft():
+    ctx = turn_context(COMPANY, None, sources(Z, V), TWO_LABELS)
+    drafted = draft_visual(
+        COMPANY, "en", QUARTERLY, documents=ctx.scope, source_documents=ctx.source_documents, filenames=TWO_FILES
+    )
+    assert drafted.spec is not None and drafted.spec.datasets == ["ds_z_q23", "ds_z_q24"]
+    by_id = {d.id: d for d in QUARTERLY}
+    why = refinement_loses(MIXED, drafted, by_id, cues(COMPANY, None, names=ctx.names), ctx, TWO_FILES)
+    assert why == "the planner's chart mixes tables of different documents"
+
+
+def test_a_question_that_compares_the_companies_lets_the_planner_draw_from_both():
+    question = "Show both companies' quarterly revenue"
+    ctx = turn_context(question, None, sources(Z, V), TWO_LABELS)
+    assert ctx.compare
+    drafted = draft_visual(
+        question, "en", QUARTERLY, documents=ctx.scope, source_documents=ctx.source_documents, filenames=TWO_FILES
+    )
+    assert drafted.spec is not None
+    by_id = {d.id: d for d in QUARTERLY}
+    assert refinement_loses(MIXED, drafted, by_id, cues(question, None, names=ctx.names), ctx, TWO_FILES) is None
+
+
+TWO_COMPANY_TEXTS = {
+    "valmora_annual_report_fy24.txt": (
+        "Valmora annual report FY24\n\nQuarterly results.\f"
+        "| Quarter | Revenue (₹ crore) | EBITDA (₹ crore) |\n"
+        "| Q1 FY24 | 1,742 | 352 |\n| Q2 FY24 | 1,801 | 372 |\n| Q3 FY24 | 1,889 | 399 |\n| Q4 FY24 | 1,933 | 422 |"
+    ),
+    "zephyra_investor_deck_q4fy24.txt": (
+        "Zephyra investor deck Q4FY24\n\nQuarterly results.\f"
+        "| Quarter | Revenue (₹ crore) | EBITDA (₹ crore) |\n"
+        "| Q1 FY24 | 880 | 128 |\n| Q2 FY24 | 930 | 140 |\n| Q3 FY24 | 990 | 156 |\n| Q4 FY24 | 1,070 | 172 |"
+    ),
+}
+
+
+@pytest.fixture
+def two_company_chat(make_app, fakes):
+    """A project with both companies' documents, each with a quarterly table; the reranker finds Zephyra's table the
+    best match, Valmora's the next, so Zephyra's deck is the top source."""
+    with make_app() as api:
+        p = project(api, "Two companies")
+        for name, text in TWO_COMPANY_TEXTS.items():
+            upload(api, p, name, text.encode())
+        drain(api)
+        fakes.reranker.scorer = lambda q, passage: 0.9 if "880" in passage else 0.6 if "1,742" in passage else 0.1
+        yield api, chat(api, p), fakes
+
+
+def both_documents(messages) -> dict:
+    """A planner that takes the first table offered of each document (the 4B model did: "the company's quarterly
+    revenue" got the deck's Q4 table and the other company's FY23 table)."""
+    first: dict[str, str] = {}
+    for line in messages[-1].content.splitlines():
+        if m := re.match(r'(D\d+) ".*" \((\S+)', line):
+            first.setdefault(m.group(2), m.group(1))
+    aliases = list(first.values())
+    return {"kind": "line", "datasets": aliases, "series": [f"{a} · Revenue" for a in aliases]}
+
+
+def files_of(panel: dict) -> set[str]:
+    return {s["filename"] for s in panel["sources"]}
+
+
+def test_a_turn_naming_no_company_draws_one_chart_from_the_top_sources_document(two_company_chat, unsure):
+    api, chat_id, fakes = two_company_chat
+    Script(planner=both_documents).install(fakes.llm)
+    ask(api, chat_id, COMPANY)
+    (panel,) = canvas(api, chat_id)
+    assert files_of(panel) == {"zephyra_investor_deck_q4fy24.txt"}
+    assert [r["x"] for r in panel["rows"]] == ["Q1 FY24", "Q2 FY24", "Q3 FY24", "Q4 FY24"]
+    offered = planner_calls(fakes.llm)[0]["messages"][-1].content  # the planner saw nothing of Valmora's
+    assert "zephyra_investor_deck_q4fy24.txt" in offered and "valmora" not in offered.lower()
+
+
+def test_a_turn_comparing_the_companies_still_gets_both(two_company_chat, unsure):
+    api, chat_id, fakes = two_company_chat
+    Script(planner=both_documents).install(fakes.llm)
+    ask(api, chat_id, "Show both companies' quarterly revenue")
+    (panel,) = canvas(api, chat_id)
+    assert files_of(panel) == set(TWO_COMPANY_TEXTS)
     assert messages(api, chat_id)[-1]["route"]["visual_plan"]["planner"] == "changed"
