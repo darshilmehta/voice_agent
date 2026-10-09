@@ -16,7 +16,7 @@ import pytest
 from app.api.chats import sse
 from app.providers.retrieval import IndexedChunk
 from app.services.base import InvalidInput
-from app.services.chat_turns import AnswerStop, ChatTurnService, DeltaEvent, wait_for_background
+from app.services.chat_turns import STRONG_PASSAGE, AnswerStop, ChatTurnService, DeltaEvent, wait_for_background
 from app.services.chats import ChatService
 from app.services.messages import MessageService
 from app.services.projects import ProjectService
@@ -24,7 +24,7 @@ from app.services.prompts import ANSWER_LENGTHS
 from app.services.retrieval import RetrievalService
 
 from .conftest import add_document
-from .fakes import make_chunk, vector_for
+from .fakes import keyword_scorer, make_chunk, vector_for
 
 REPLY = "Margin 18.2% [S1] while revenue grew 34% [S2] on a strong enterprise segment."  # 6-char pieces
 
@@ -39,6 +39,10 @@ async def setup(db, load_local, fakes):
         chunk = make_chunk(i, project_id=project.id, document_id=doc_id, text=text, page_start=2, page_end=2)
         await fakes.store.upsert([IndexedChunk(chunk, vector_for(text))])
     chat = await ChatService(db).create(project.id)
+    # Passages that answer, but not "strong" ones (reranker < STRONG_PASSAGE): the answer streams as the model writes
+    # it, which is what these tests stop. (Over strong passages the answer's checks hold its sentences until each is
+    # checked: tests/test_answer_checks.py.)
+    fakes.reranker.scorer = lambda q, p: min(keyword_scorer(q, p), STRONG_PASSAGE - 0.05)
     retrieval = RetrievalService(fakes.embedder, fakes.reranker, fakes.store, settings.retrieval)
     pipeline = ChatTurnService(db, retrieval=retrieval, llm=fakes.llm, settings=settings)
     fakes.llm.reply = REPLY

@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
@@ -114,6 +115,7 @@ from .speech_text import (
     is_filler,
     normalize_utterance,
     real_words,
+    transcript_garbled,
 )
 from .turn_taking import (
     FRAME_SAMPLES,
@@ -149,6 +151,8 @@ WATCH_STEP_MS = 400
 # The visual's spoken tail (§12.1) is sent after agent_message only while the answer still has this much left to play:
 # the client plays it as part of the turn, before it reports playback_done.
 TAIL_MARGIN_S = 0.3
+# An answer that already said the chart is there ("The chart shows …", quality round item 1) gets no spoken tail.
+_NAMES_THE_CHART = re.compile(r"\b(?:chart|graph)s?\b|चार्ट|ग्राफ़|ग्राफ", re.IGNORECASE)
 
 
 class Transport(Protocol):
@@ -694,6 +698,7 @@ class VoiceSession:
                 length="short",
                 input_language=transcript.language,
                 input_latency=latency,
+                garbled=transcript_garbled(transcript),  # asked to say it again, not answered (quality round)
             )
         except NotFound:
             await self._error("storage", "this chat no longer exists")
@@ -794,7 +799,13 @@ class VoiceSession:
                 self._withdraw_visual(agent)
             else:
                 await self._release_visual(agent)
-        if agent.tail_wanted and not agent.cut and agent.first_audio_at is not None and not agent.errored:
+        if (
+            agent.tail_wanted
+            and not agent.cut
+            and agent.first_audio_at is not None
+            and not agent.errored
+            and not _said_the_chart(agent)
+        ):
             await self._send_tail(agent)  # the visual became ready while the answer was spoken (§12.1)
         if agent.message is not None:
             agent.message_sent = True
@@ -892,9 +903,11 @@ class VoiceSession:
             visual = agent.stop.visual
             if visual is not None and visual.status != "ready":
                 return  # withdrawn meanwhile: nothing to announce
-            if visual is not None and visual.trace.draft == "refine" and visual.trace.planner is None:
+            if visual is not None and visual.trace.draft == "refine" and not visual.done:
                 # A draft the planner is still to check (it may withdraw it): the tail waits for its verdict, so it
-                # never announces a visual that goes.
+                # never announces a visual that goes. (Until the visual is done, not only until the planner has
+                # answered: its "none" is recorded just before the withdrawal reaches the visual's status, and an
+                # answer held while it is checked (services/answer_guard.py) can make its first audio land between.)
                 visual.when_settled(lambda v: self._tail_once_settled(agent, v))
             else:
                 await self._visual_tail(agent)
@@ -920,7 +933,11 @@ class VoiceSession:
         if not agent.audio_done:
             agent.tail_wanted = True  # after the answer's last chunk, before agent_message
             return
-        if agent.first_audio_at is None or time.perf_counter() >= agent.play_end - TAIL_MARGIN_S:
+        if (
+            agent.first_audio_at is None
+            or time.perf_counter() >= agent.play_end - TAIL_MARGIN_S
+            or _said_the_chart(agent)
+        ):
             return
         await self._send_tail(agent)
         if agent.playback_timer is not None:
@@ -1380,6 +1397,11 @@ class VoiceSession:
                 at("first_audio"),
                 gap,
             )
+
+
+def _said_the_chart(agent: AgentTurn) -> bool:
+    """The answer's speech already points at the chart ("The chart shows …"): "It's on screen now." would repeat it."""
+    return any(_NAMES_THE_CHART.search(c.text) for c in agent.chunks if not c.filler)
 
 
 def _answer_end_ms(agent: AgentTurn) -> float:

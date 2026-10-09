@@ -23,7 +23,7 @@ short continuation sentence at most (or nothing: "-").
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -34,8 +34,8 @@ from .live_data import LiveNote
 from .sources import Source, format_sources
 from .web_search import WebSource, format_web_sources
 
-PROMPT_VERSION = "answer-v1"
-LIVE_PROMPT_VERSION = "live-v1"
+PROMPT_VERSION = "answer-v2"  # v2: shorter spoken answers (quality round)
+LIVE_PROMPT_VERSION = "live-v2"
 CONTINUATION_PROMPT_VERSION = "live-continue-v1"
 
 AnswerMode = Literal[
@@ -52,8 +52,8 @@ AnswerMode = Literal[
 # Prompt ids recorded in a message's route (None: fixed text, no model).
 PROMPT_IDS: dict[AnswerMode, str | None] = {
     "grounded": PROMPT_VERSION,
-    "mixed": "mixed-v1",
-    "general": "general-v1",
+    "mixed": "mixed-v2",
+    "general": "general-v2",
     "conversation": "conversation-v1",
     "clarification": "clarification-v1",
     "resume": None,
@@ -88,9 +88,13 @@ class LengthStyle:
 
 ANSWER_LENGTHS: dict[AnswerLength, LengthStyle] = {
     # Voice (§3.3 a): a short spoken reply; tables and detail stay on screen as citations.
+    # Quality round (item 7): "one to three sentences" gave three long ones, 36-45 s of speech; two short sentences
+    # of about 45 words in all are ~15-20 s. ChatTurnService also stops a short answer at the end of the sentence
+    # that reaches SHORT_ANSWER_WORDS (or the third sentence), never inside one.
     "short": LengthStyle(
-        "Be brief: one to three sentences that read well aloud. Leave further detail to the cited sources unless "
-        "the user asks for it. No preamble.",
+        "Be brief: at most two short sentences, about 45 words in all, that read well aloud and end at a natural "
+        "point. Lead with the answer itself. Leave further detail to the cited sources unless the user asks for it. "
+        "No preamble.",
         384,
         max_sources=3,
         context_tokens=600,
@@ -133,6 +137,27 @@ LIVE_NOTICES: dict[LiveNote, dict[Language, str]] = {
 def live_notice(note: LiveNote, language: Language) -> str:
     """The fixed first sentence of an answer to a live question that has no live data."""
     return LIVE_NOTICES[note][language]
+
+
+# A question for a live figure (a rate, a price, the news) that gets no live data and that no source answers: this
+# fixed text, never the model (quality round, item 2: the 4B model said "approximately 83.50" for "USD to INR today"
+# whatever the prompt said). After a notice (tool unavailable, search failed) only its second half.
+LIVE_FIGURE_TEXTS: dict[Language, tuple[str, str]] = {
+    "en": (
+        "I can't look up live data such as today's rates, prices or news, so I won't guess a figure.",
+        "So I won't guess today's figure.",
+    ),
+    "hi": (
+        "मैं आज के रेट, भाव या ख़बरें जैसी लाइव जानकारी नहीं देख सकता, इसलिए कोई आँकड़ा अंदाज़े से नहीं बताऊँगा।",
+        "इसलिए आज का आँकड़ा अंदाज़े से नहीं बताऊँगा।",
+    ),
+}
+
+
+def live_figure_text(language: Language, note: LiveNote | None = None) -> str:
+    """The honest line for a live figure there is no data for (with the notice first when web search is on)."""
+    alone, after = LIVE_FIGURE_TEXTS[language]
+    return f"{live_notice(note, language)} {after}" if note else alone
 
 
 def _without_live_data(source: str) -> str:
@@ -215,12 +240,19 @@ def general_system_prompt(
     note: GeneralNote | None = None,
     *,
     live_note: LiveNote | None = None,
+    prefixed: bool = False,
 ) -> str:
     """A question that isn't about the user's documents (or that they don't cover): general knowledge, said
-    honestly, no citations. ``live_note``: live data was asked for and isn't there. Like the grounded prompt, the
-    same in every answer language (``general_user_prompt`` asks for it)."""
+    honestly, no citations. ``live_note``: live data was asked for and isn't there. ``prefixed``: the answer already
+    begins with ``NOT_FROM_DOCUMENTS`` (a spoken answer in a chat with documents): it goes on from there. Like the
+    grounded prompt, the same in every answer language (``general_user_prompt`` asks for it)."""
     del language
     situation = _GENERAL_NOTES[note] if note else "This question is not about the user's documents."
+    if prefixed:
+        situation = (
+            "The user's documents don't answer this. Your answer is spoken right after the words \"Not from your "
+            "documents, but\": go straight on with the answer and don't say again that it isn't from the documents."
+        )
     live = _without_live_data("from general knowledge, or say briefly that you don't know") if live_note else ""
     return (
         "You are a voice and text assistant that talks with the user about their uploaded documents and also answers "
@@ -486,8 +518,13 @@ def resume_text(language: Language, topic: str | None, filenames: Sequence[str])
     return with_topic.format(documents=documents, topic=said) if said else without.format(documents=documents)
 
 
-AckKind = Literal["ack", "thanks", "greeting", "language"]
+AckKind = Literal["ack", "thanks", "greeting", "language", "repeat"]
 ACK_TEXTS: dict[AckKind, dict[Language, str]] = {
+    # A transcript that looks garbled (quality round, item 8): asked again, never answered or "clarified".
+    "repeat": {
+        "en": "Sorry, I didn't catch that. Could you say it again?",
+        "hi": "माफ़ कीजिए, मैं ठीक से सुन नहीं पाया। क्या आप फिर से कह सकते हैं?",
+    },
     # After "okay" / "got it" / "theek hai" while the agent is idle: what ChatGPT's voice mode does, keep the floor
     # open in two words. (A backchannel *during* an answer never gets here: the voice session resumes playback.)
     "ack": {"en": "Anything else?", "hi": "और कुछ जानना है?"},
@@ -502,7 +539,7 @@ def ack_text(kind: AckKind, language: Language) -> str:
 
 
 # Saved (as an ``event`` message, nothing spoken) for turns that get no answer.
-SILENT_NOTICES = {"stop": "Stopped", "backchannel": "Acknowledged"}
+SILENT_NOTICES = {"stop": "Stopped", "backchannel": "Acknowledged", "clarification": "Not understood"}
 
 
 # ------------------------------------------------------------------ memory summary
@@ -534,6 +571,75 @@ VISUAL_NOTE = (
 )
 
 
+def on_screen_note(line: str, source_ids: Sequence[str], *, confident: bool) -> str:
+    """The answer's own chart is on screen from its first words (§12.1, quality round item 1), drawn from the tables
+    ``source_ids``: the answer must agree with it. ``confident``: the chart stays as it is (no planner), so the answer
+    may refer to it ("The chart shows …"); otherwise the planner may still redraw it, so the answer doesn't."""
+    ids = "".join(f"[{s}]" for s in source_ids)
+    refer = 'You may begin with "The chart shows …". ' if confident else ""
+    return (
+        f"(A chart of this is on screen now, drawn by the app from {ids}: {line}. Your answer is spoken beside it and "
+        f"must agree with it. {refer}The chart shows every figure: say what it shows (the trend, the highest or "
+        f"latest figure) with one or two key figures from {ids}, citing them, rather than reading out every number. "
+        f"Never say the documents don't have figures that {ids} gives, and don't describe how the chart looks.)"
+    )
+
+
+def latest_period_note(period: str) -> str:
+    """The question names no period and the sources give figures for several (quality round, item 4: "What is the
+    dividend per share?" was once answered with FY23's)."""
+    return (
+        f"(The question names no period. If the sources give it for more than one period, answer for the latest, "
+        f"{period}, and say that it is for {period}.)"
+    )
+
+
+def names_note(renames: Mapping[str, str]) -> str:
+    """The user's words for a name, as speech recognition heard them, and the documents' spelling (item 10)."""
+    pairs = "; ".join(f'"{said}" is {name}' for said, name in renames.items())
+    return f"(Speech recognition misheard a name: {pairs}. Always write the name as the documents spell it.)"
+
+
+def coverage_note(evidence: str) -> str:
+    """Told when the model's answer said the documents don't cover what its sources (or the chart on screen) give
+    (quality round, item 1)."""
+    return (
+        f"IMPORTANT: the sources do contain this: {evidence}. Answer from them with their figures, citing them. Don't "
+        "say that the documents don't cover it."
+    )
+
+
+def with_note(messages: Sequence[LLMMessage], note: str) -> list[LLMMessage]:
+    """The same prompt, its last user message ending with ``note`` (the prefix stays cached)."""
+    *head, last = messages
+    return [*head, LLMMessage(last.role, f"{last.content}\n\n{note}")]
+
+
+def chart_correction(title: str, document: str, source_ids: Sequence[str], language: Language) -> str:
+    """Replaces an answer that kept saying the documents don't have what the chart on screen shows."""
+    ids = "".join(f"[{s}]" for s in source_ids)
+    if language == "hi":
+        return f"स्क्रीन पर चार्ट {document.removeprefix('the ')} से {title} दिखाता है {ids}।"
+    return f"The chart on screen shows {title}, from {document} {ids}."
+
+
+def passage_correction(document: str, where: str | None, source_id: str, language: Language) -> str:
+    """Replaces an answer that kept saying the documents don't have what a strong passage gives."""
+    if language == "hi":
+        place = f" {where} में" if where else ""
+        return f"{document.removeprefix('the ')}{place} इसकी जानकारी है [{source_id}]।"
+    place = f" in {where}" if where else ""
+    return f"{document[:1].upper() + document[1:]} covers this{place} [{source_id}]."
+
+
+# A general answer spoken in a chat with documents (quality round, item 9): its first words say it isn't from them
+# (the "general knowledge" label is on screen only). For questions about facts only, not definitions or small talk.
+NOT_FROM_DOCUMENTS: dict[Language, str] = {
+    "en": "Not from your documents, but ",
+    "hi": "यह आपके दस्तावेज़ों से नहीं है, लेकिन ",
+}
+
+
 def screen_note(lines: Sequence[str]) -> str:
     """What the user is looking at, for a question about a chart on screen (§12.1): its line(s) and the point it
     names; the chart's table is among the sources."""
@@ -548,16 +654,23 @@ def answer_user_prompt(
     name_documents: bool = False,
     visual_requested: bool = False,
     screen: Sequence[str] = (),
+    on_screen: str | None = None,
+    notes: Sequence[str] = (),
 ) -> str:
     """``name_documents``: the evidence comes from more than one document, or from one that isn't the obvious one
     (UX5): the answer says which, in a few words, besides citing it. ``visual_requested``: the user asked to see
-    something (``VISUAL_NOTE``). ``screen``: the question is about a chart on screen (``screen_note``). Both come
-    after the question, so the system prompt, history and sources stay the cached prefix."""
+    something (``VISUAL_NOTE``). ``screen``: the question is about a chart on screen (``screen_note``). ``on_screen``:
+    the answer's own chart is on screen (``on_screen_note``, instead of ``VISUAL_NOTE``). ``notes``: more lines
+    (``latest_period_note``, ``names_note``). All come after the question, so the system prompt, history and sources
+    stay the cached prefix."""
     note = f"{documents_note(sources)}\n" if name_documents else ""
     if screen:
         note += f"{screen_note(screen)}\n"
-    if visual_requested:
+    if on_screen:
+        note += f"{on_screen}\n"
+    elif visual_requested:
         note += f"{VISUAL_NOTE}\n"
+    note += "".join(f"{n}\n" for n in notes)
     return (
         f"Sources:\n\n{format_sources(sources)}\n\n"
         f"Question: {question.strip()}\n\n"

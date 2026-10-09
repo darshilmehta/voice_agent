@@ -184,16 +184,27 @@ def compact_tables(text: str) -> str:
 
 
 # An answer that says the documents don't have it: "The documents do not specify Valmora's EBITDA margin for FY25.",
-# "The report doesn't provide…", "not mentioned in the sources", "इस बारे में जानकारी नहीं दी गई है".
+# "The report doesn't provide…", "The policy does not cover hotel provisions", "[S2] … but does not give the FY23
+# breakdown", "not mentioned in the sources", "are not available in the provided sources", "is not covered by the
+# policy", "इस बारे में जानकारी नहीं दी गई है".
+_DOCUMENT_WORDS = (
+    r"documents?|sources?|report|deck|minutes|filing|file|policy|policies|manual|handbook|contract|agreement|"
+    r"presentation|slides?|statements?|text|passages?|tables?|provided\s+(?:sources|information|text|documents)"
+)
+# Between the document and its "does not …": nothing that makes it report a fact ("the report shows revenue does not
+# include other income" says what the report says).
+_REPORTING = r"(?!\b(?:shows?|says?|states?|notes?|reports?|explains?|confirms?|clarifies|that)\b)"
 _NOT_COVERED = re.compile(
-    r"\b(?:documents?|sources?|report|deck|minutes|filing|file|provided\s+(?:sources|information|text|documents))\b"
-    r"[^.!?।]{0,60}?\b(?:do(?:es)?\s*n[o'\u2019]?t|did\s*n[o'\u2019]?t|cannot|can't)\s+(?:cover|mention|provide|specify|include|"
-    r"contain|state|say|give|list|disclose|show|have)\b"
-    r"|\bnot\s+(?:mentioned|specified|provided|available|covered|stated|given|disclosed|found|listed)\s+in\s+the\s+"
-    r"(?:documents?|sources?|report|provided|deck|minutes)"
-    r"|\bno\s+(?:information|mention|data|details)\s+(?:about|on|of|regarding|in\s+the\s+(?:documents?|sources?|report))\b"
+    rf"(?:\b(?:{_DOCUMENT_WORDS})\b|\[\s*[SW]\d+\s*\])"
+    rf"(?:{_REPORTING}[^.!?।]){{0,80}}?\b(?:do(?:es)?\s*n[o'\u2019]?t|did\s*n[o'\u2019]?t|cannot|can't)\s+(?:\w+\s+)?(?:cover|mention|"
+    r"provide|specify|include|contain|state|say|give|list|disclose|show|have|offer|address|detail|break)\w*\b"
+    r"|\bnot\s+(?:explicitly\s+|specifically\s+|directly\s+)?(?:mentioned|specified|provided|available|covered|"
+    r"stated|given|disclosed|found|listed|included|addressed|reported|shown|detailed)\s+(?:anywhere\s+)?"
+    r"(?:in|by)\s+(?:the|these|this|any|those)\b"
+    r"|\bno\s+(?:specific\s+|such\s+|further\s+)?(?:information|mention|data|details|figures?|provisions?|breakdown)"
+    r"\s+(?:about|on|of|regarding|for|in\s+the\s+(?:documents?|sources?|report|policy))\b"
     r"|\b(?:i\s+)?(?:couldn['\u2019]t|could\s+not|can['\u2019]t|cannot)\s+find\b"
-    r"|जानकारी\s+नहीं|उल्लेख\s+नहीं|नहीं\s+दी\s+गई|नहीं\s+दिया\s+गया|उपलब्ध\s+नहीं|नहीं\s+बताया|नहीं\s+मिल",
+    r"|जानकारी\s+नहीं|उल्लेख\s+नहीं|नहीं\s+दी\s+गई|नहीं\s+दिया\s+गया|नहीं\s+दिए\s+गए|उपलब्ध\s+नहीं|नहीं\s+बताया|नहीं\s+मिल",
     re.IGNORECASE,
 )
 
@@ -201,6 +212,87 @@ _NOT_COVERED = re.compile(
 def says_not_covered(text: str) -> bool:
     """The text says the documents don't have the answer (a model's own non-answer, or a summary point about one)."""
     return bool(_NOT_COVERED.search(text))
+
+
+def not_covered_at(text: str) -> int | None:
+    """Where the text says the documents don't have something: the last character of the claim (its verb, "…doesn't
+    give"), so the clause it is in is the denying one even when the claim begins in an earlier clause ("[S2], but
+    the deck doesn't give FY23"), or None."""
+    m = _NOT_COVERED.search(text)
+    return m.end() - 1 if m else None
+
+
+# Sentence ends: punctuation followed by whitespace, or a line break. "Rs. 5,000", "U.S." and "18.2%" end none.
+_SENTENCE_CUT = re.compile("(?<=[.!?।॥])[\"'\u201d\u2019)\\]]*\\s+|\\n+")
+_ABBREVIATED = re.compile(
+    r"(?:^|\b)(?:rs|mr|mrs|ms|dr|vs|e\.g|i\.e|etc|approx|inc|ltd|co|st|fig|no)\.$|(?:[a-z]\.){2,}$|^\(?\d{1,2}\.$",
+    re.IGNORECASE,
+)
+# Where a clause starts inside a sentence ("…, but the report doesn't give FY23").
+_CLAUSE = re.compile(r",\s+|;\s+|\s+[\u2014\u2013-]\s+|\s+(?=(?:but|however|although|though|while|whereas)\b)", re.I)
+
+
+def split_sentences(text: str) -> list[str]:
+    """The text's sentences (and lines), in order, without the whitespace between them."""
+    out: list[str] = []
+    start = 0
+    for m in _SENTENCE_CUT.finditer(text):
+        head = text[start : m.start()]
+        words = head.split()
+        if "\n" not in m.group(0) and words and _ABBREVIATED.search(words[-1]):
+            continue  # "Rs. 4,210", "U.S. sales", a list item's "1."
+        if head.strip():
+            out.append(head.strip())
+        start = m.end()
+    if text[start:].strip():
+        out.append(text[start:].strip())
+    return out
+
+
+def clauses(sentence: str) -> list[str]:
+    """A sentence cut at its clause boundaries (commas, semicolons, dashes, "but", "however"…)."""
+    return [c.strip() for c in _CLAUSE.split(sentence) if c.strip()]
+
+
+def answer_declines(answer: str, questions: Sequence[str | None]) -> bool:
+    """The answer says the documents don't cover what was asked (B9, quality round): an abstention, recorded as such,
+    however many sources it cites for what it says around it.
+
+    - A question that names fiscal periods ("revenue in FY25"): every period it names is only in clauses that say the
+      documents don't have it ("FY24 revenue was ₹7,365 crore [S1], but the documents don't give FY25" declines a
+      question about FY25; for a question about FY24 and FY25 it is a partial answer, no abstention).
+    - Otherwise: the answer leads with it (its first clause says the documents don't cover it)."""
+    from .retrieval import asked_periods  # (retrieval imports this module)
+
+    sentences = [s for s in split_sentences(strip_markers(answer)) if len(s.split()) >= 2]
+    if not any(says_not_covered(s) for s in sentences):
+        return False
+    asked: set[int] = set()
+    for q in questions:
+        if q:
+            asked |= asked_periods(q)
+    parts = [c for s in sentences for c in denial_clauses(s)]
+    if asked:
+        denied: set[int] = set().union(*(asked_periods(c) for c, no in parts if no))
+        answered: set[int] = set().union(*(asked_periods(c) for c, no in parts if not no))
+        return asked <= denied and not (asked & answered)
+    return parts[0][1]
+
+
+def denial_clauses(sentence: str) -> list[tuple[str, bool]]:
+    """The sentence's clauses, each with whether it says the documents don't have something. A claim that spans
+    clauses ("the report, as filed, does not…") marks the clause it starts in."""
+    out = [(c, says_not_covered(c)) for c in clauses(sentence)]
+    at = not_covered_at(sentence)
+    if at is not None and not any(no for _, no in out):
+        pos = 0
+        for i, (c, _) in enumerate(out):
+            pos = sentence.find(c, pos)
+            if pos <= at < pos + len(c) or i == len(out) - 1:
+                out[i] = (c, True)
+                break
+            pos += len(c)
+    return out
 
 
 _OPEN_MARKER = re.compile(r"\s*\[[^\]]{0,24}$")

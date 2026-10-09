@@ -169,7 +169,7 @@ async def test_a_mixed_question_is_answered_with_separate_document_and_web_citat
     assert agent.text == ANSWER
     assert [(c.source_id, c.kind) for c in agent.citations] == [("W1", "web"), ("S1", "document")]
     r = agent.route
-    assert r["tools"] == ["web_search"] and r["prompt"] == "live-v1" and r["live_note"] is None
+    assert r["tools"] == ["web_search"] and r["prompt"] == "live-v2" and r["live_note"] is None
     assert r["web_search"] == {
         "query": "how is the stock doing today?",
         "provider": "fake",
@@ -232,7 +232,7 @@ async def test_the_answer_starts_on_the_first_results_and_continues_with_later_o
     assert [s.source_id for s in sources.sources] == ["S1", "S2", "W1", "W2"]  # what the answer started with
     assert agent.text.endswith(" " + CONTINUED)
     assert [c.source_id for c in agent.citations][-1] == "W3"
-    assert agent.route["continuations"] == 1 and agent.route["prompt"] == "live-v1+live-continue-v1"
+    assert agent.route["continuations"] == 1 and agent.route["prompt"] == "live-v2+live-continue-v1"
     main, continuation = answer_prompts(world)
     assert continuation[:-2] == main  # the same prompt, then the answer so far and the new results
     assert continuation[-2] == LLMMessage("assistant", agent.text.removesuffix(" " + CONTINUED))

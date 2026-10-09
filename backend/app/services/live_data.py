@@ -207,6 +207,20 @@ def live_data_cue(text: str | None, *, documents: Sequence[str] = ()) -> str | N
     return None
 
 
+def asks_live_figure(text: str | None, *, documents: Sequence[str] = ()) -> bool:
+    """A live-data question that asks for a figure or news only the web has right now (a strong cue, or a topic cue:
+    "USD to INR today", "the share price right now", "latest news", "आज सोने का भाव"), not merely "today" ("what
+    should I cook today?"). Without live data, such a question gets a fixed honest line, never a model's guess
+    (quality round, item 2)."""
+    if text is None or live_data_cue(text, documents=documents) is None:
+        return False
+    for strong in (_STRONG_EN, _STRONG_HI):
+        if any(not _names_a_document_after(text, m.end(), documents) for m in strong.finditer(text)):
+            return True
+    patterns = [_TOPIC_EN, _TOPIC_HI, *([_TOPIC_HINGLISH] if message_language(text) == "hi" else [])]
+    return any(p.search(text) for p in patterns)
+
+
 def _cue(m: re.Match[str]) -> str:
     return " ".join(m.group(0).split()).casefold()
 

@@ -36,11 +36,81 @@ _WORD = re.compile(r"\S+")
 _BRACKETED = re.compile(r"\[[^\]]*\]")
 
 
-def spoken_text(raw: str) -> str:
-    """What TTS should say for a piece of answer text: no [S#] markers, no markdown, single spaces. Empty if nothing
-    speakable (only punctuation or markers) remains."""
-    text = _SPACE.sub(" ", _MARKDOWN.sub("", strip_markers(raw))).strip()
+def spoken_text(raw: str, *, sentence_start: bool = True) -> str:
+    """What TTS should say for a piece of answer text: [S#] / [W#] markers dropped, or said as "a web source" / "one
+    source" where the sentence uses them as a word (``speakable_markers``), no markdown, single spaces. Empty if
+    nothing speakable (only punctuation or markers) remains. ``sentence_start``: the piece starts a sentence (a marker
+    that opens it is said with a capital letter)."""
+    text = speakable_markers(raw, sentence_start=sentence_start)
+    text = _SPACE.sub(" ", _MARKDOWN.sub("", strip_markers(text))).strip()
     return text if any(ch.isalnum() for ch in text) else ""
+
+
+# Citation markers as words (quality round, item 6): "[W1] mentions that the rupee rose" was spoken "However,
+# mentions that…". A marker group ("[W1]", "[S1][S2]", "[W1] and [W2]") that is the subject of its clause (it opens
+# the clause and a word follows) or the object of a preposition ("according to [W1]", "as reported by [S2]", Hindi
+# "[W1] के अनुसार") is said as what it is; anywhere else it is dropped, with the space before it.
+_MARKER_GROUP = re.compile(
+    r"(\s*)\[\s*[SW]\d+(?:\s*[,;]\s*[SW]\d+)*\s*\](?:(?:\s*(?:,|and|और)?\s*)\[\s*[SW]\d+(?:\s*[,;]\s*[SW]\d+)*\s*\])*",
+    re.IGNORECASE,
+)
+_MARKER_ID = re.compile(r"([SW])\d+", re.IGNORECASE)
+_CLAUSE_OPENERS = {"and", "but", "however", "while", "whereas", "also", "though", "although", "so", "then", "yet"}
+_PREPOSITIONS = {
+    "to",
+    "per",
+    "by",
+    "from",
+    "in",
+    "on",
+    "see",
+    "cites",
+    "cite",
+    "citing",
+    "as",
+    "than",
+    "at",
+    "under",
+    "with",
+}
+_POSTPOSITIONS = {"के", "की", "का", "में", "ने", "से", "पर", "द्वारा", "अनुसार", "को"}
+_SPOKEN_SOURCE = {
+    # (language, web, several) → words
+    ("en", True, False): "a web source",
+    ("en", True, True): "web sources",
+    ("en", False, False): "one source",
+    ("en", False, True): "the sources",
+    ("hi", True, False): "एक स्रोत",
+    ("hi", True, True): "कुछ स्रोत",
+    ("hi", False, False): "एक स्रोत",
+    ("hi", False, True): "कुछ स्रोत",
+}
+
+
+def speakable_markers(text: str, *, sentence_start: bool = True) -> str:
+    """``text`` with each citation marker group that is used as a word replaced by words ("a web source", "one source",
+    "एक स्रोत"), the others left for ``strip_markers``."""
+    hindi = any("ऀ" <= ch <= "ॿ" for ch in text)
+
+    def replace(m: re.Match[str]) -> str:
+        before = text[: m.start()].rstrip()
+        after = text[m.end() :].lstrip()
+        prev = re.sub(r"[^\wऀ-ॿ]", "", before.split()[-1]).casefold() if before.split() else ""
+        nxt = re.sub(r"[^\wऀ-ॿ]", "", after.split()[0]) if after.split() else ""
+        opens = (not before and (sentence_start or after)) or before[-1:] in ".!?।,;:—" or prev in _CLAUSE_OPENERS
+        subject = opens and bool(nxt) and nxt[:1].isalpha() and nxt.casefold() not in {"and", "or"}
+        objected = (prev in _PREPOSITIONS and before[-1:].isalnum()) or nxt in _POSTPOSITIONS
+        if not (subject or objected):
+            return m.group(0)  # a citation after a fact: dropped by strip_markers
+        kinds = {k.upper() for k in _MARKER_ID.findall(m.group(0))}
+        several = len(_MARKER_ID.findall(m.group(0))) > 1
+        words = _SPOKEN_SOURCE[("hi" if hindi else "en", kinds == {"W"}, several)]
+        at_start = (not before and sentence_start) or before[-1:] in ".!?।"
+        if at_start and not hindi:
+            words = words[:1].upper() + words[1:]
+        return m.group(1) + words
+
+    return _MARKER_GROUP.sub(replace, text)
 
 
 def _mask_brackets(text: str) -> str:
@@ -76,6 +146,7 @@ class SpeechChunker:
     def __init__(self, *, max_sentences: int | None = None) -> None:
         self._buffer = ""
         self._first = True
+        self._sentence_start = True  # the next chunk starts a sentence
         self._sentences = 0
         self.max_sentences = max_sentences
         self.spoken: list[str] = []  # every chunk returned, in order
@@ -105,7 +176,8 @@ class SpeechChunker:
     def _emit(self, raw: str, sentence: bool, out: list[str]) -> None:
         if self.exhausted:
             return
-        text = spoken_text(raw)
+        text = spoken_text(raw, sentence_start=self._sentence_start)
+        self._sentence_start = sentence
         if not text:
             return
         self._first = False
@@ -305,3 +377,87 @@ def is_backchannel(text: str, max_words: int) -> bool:
     if not found or any(w in INTERRUPTION_CUES for w in others):
         return False
     return len(others) <= max_words
+
+
+# ------------------------------------------------------------------ garbled transcripts (quality round, item 8)
+#
+# What Whisper writes for noise, a TV, or speech it couldn't make out (the final real run, with a film playing):
+# "आब आब आब आब …" (60 times), "Just 1 employee sign here... Just 1 employee sign here...", "अप बवबवववववव…",
+# "आश़््गें।", "understandgradeelle걱", "…for its меня dollars series…", "Is used by runsTAIC traffic". Answering them
+# gave "I couldn't find that in this chat's documents" or "Could you please clarify your question?"; the user should
+# be asked to say it again instead.
+
+# Letters of neither script the app speaks (Latin with accents, Devanagari): Cyrillic, Hangul, CJK, …; and U+FFFD.
+_FOREIGN = re.compile("[^\\W\\d_A-Za-zÀ-ɏऀ-ॿ]|�")
+_NUKTA_BASES = "कखगजडढफयनरळ"
+_BAD_DEVANAGARI = re.compile(
+    "\u094d\u094d"  # two viramas
+    "|\u093c\u093c"  # two nuktas
+    f"|[^{_NUKTA_BASES}\u093c]\u093c"  # a nukta on a letter that takes none ("श़")
+    "|[\u093e-\u094c\u0962\u0963][\u093e-\u094c\u0962\u0963]"  # two vowel signs in a row
+    "|[\u0904-\u0914][\u093e-\u094d]"  # a vowel sign or virama on a vowel letter
+    "|(?:^|\\s)[\u093e-\u094d\u0901-\u0903]"  # a word that starts with a sign
+)
+_RUN = re.compile(r"(\w)\1{4,}")  # the same letter five times ("ववववव")
+_CAMEL = re.compile(r"[a-z]{2,}[A-Z]{2,}")  # "runsTAIC"
+_LONG_WORD = re.compile(r"[^\W\d_]{25,}")
+
+
+def _repeats(words: list[str]) -> bool:
+    """A loop: one word four times in a row, a phrase of two to five words three times in a row, or one word making up
+    two fifths of eight or more."""
+    n = len(words)
+    for size in range(1, 6):
+        need = 4 if size == 1 else 3
+        for i in range(0, n - size * need + 1):
+            chunk = words[i : i + size]
+            if all(words[i + k * size : i + (k + 1) * size] == chunk for k in range(need)):
+                return True
+    if n >= 8:
+        top = max(words.count(w) for w in set(words))
+        return top * 5 >= n * 2
+    return False
+
+
+def looks_garbled(text: str) -> bool:
+    """The transcript reads like noise rather than speech (above). Acknowledgements repeated ("okay okay okay") and
+    hums are not garbled: they have their own handling."""
+    if not text.strip() or is_acknowledgement(text) or is_filler(text):
+        return False
+    if _FOREIGN.search(text) or _BAD_DEVANAGARI.search(text) or _CAMEL.search(text) or _LONG_WORD.search(text):
+        return True
+    if _RUN.search(text.casefold()):
+        return True
+    return _repeats(normalize_utterance(text).split())
+
+
+# Speech recognition's own confidence, when the recognizer reports it (Whisper's thresholds: a decode whose average
+# log probability is below -1 failed, one that compresses better than 2.4 is repetitive, and one whose no-speech
+# probability is above 0.6 with a log probability below -1 is silence). Read only if present: ``Transcript`` may not
+# carry them.
+AVG_LOGPROB_MIN = -1.2
+COMPRESSION_MAX = 2.4
+NO_SPEECH_MAX = 0.6
+CONFIDENCE_MIN = 0.35  # a 0-1 confidence, if that is what the recognizer gives instead
+
+
+def transcript_garbled(transcript: object) -> bool:
+    """Should this transcript be asked again ("Sorry, I didn't catch that")? Its text looks garbled, or the
+    recognizer's confidence (``avg_logprob``, ``no_speech_prob``, ``compression_ratio`` or ``confidence``, whichever
+    it has) says so."""
+
+    def number(name: str) -> float | None:
+        value = getattr(transcript, name, None)
+        return float(value) if isinstance(value, int | float) else None
+
+    logprob, no_speech = number("avg_logprob"), number("no_speech_prob")
+    compression, confidence = number("compression_ratio"), number("confidence")
+    if logprob is not None and (
+        logprob < AVG_LOGPROB_MIN or (no_speech is not None and no_speech > NO_SPEECH_MAX and logprob < -1.0)
+    ):
+        return True
+    if compression is not None and compression > COMPRESSION_MAX:
+        return True
+    if confidence is not None and 0.0 <= confidence <= 1.0 and confidence < CONFIDENCE_MIN:
+        return True
+    return looks_garbled(str(getattr(transcript, "text", "") or ""))

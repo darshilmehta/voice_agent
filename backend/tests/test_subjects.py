@@ -15,7 +15,16 @@ from app.services.retrieval import (
     confidence_of,
     prefer_named_documents,
 )
-from app.services.subjects import asked_names, documents_by_name, label_words, mentions, named_documents
+from app.services.subjects import (
+    asked_names,
+    documents_by_name,
+    label_words,
+    mentions,
+    misheard_names,
+    named_documents,
+    respell,
+    sound_key,
+)
 from app.settings import RetrievalSection
 
 from .fakes import FakeEmbedder, FakeReranker, FakeStore, hit, make_chunk
@@ -301,3 +310,38 @@ def test_the_named_documents_by_company():
     assert documents_by_name(n, LABELS) == {"valmora": frozenset(VALMORA), "zephyra": frozenset({"deck"})}
     one = named_documents(("Show Zephyra's segments",), LABELS)
     assert one is not None and documents_by_name(one, LABELS) == {"zephyra": frozenset({"deck"})}
+
+
+# ------------------------------------------------------------------ misheard names (quality round, item 10)
+
+HEARD_LABELS = {
+    "report": "valmora annual report fy24: Valmora Industries Limited Annual Report 2023-24",
+    "deck": "zephyra investor deck q4fy24: Zephyra Logistics Limited",
+    "policy": "valmora travel expense policy",
+}
+
+
+@pytest.mark.parametrize(
+    ("question", "renames"),
+    [
+        ("What was Wall Mora's revenue in FY24?", {"Wall Mora": "Valmora"}),  # the real run
+        ("Hi, what is the profit that well Mora made in F524?", {"well Mora": "Valmora"}),
+        ("What is the profit that Wilmura made in FY24?", {"Wilmura": "Valmora"}),
+        ("What was Mora's net debt?", {"Mora": "Valmora"}),
+        ("What is Zefira's EBITDA?", {"Zefira": "Zephyra"}),
+        ("What is Valmora's revenue?", {}),  # spelled right
+        ("What does the Policy say?", {}),
+        ("What was Industrial output in FY24?", {}),  # sounds like no name
+        ("Tell me about Moral hazards in Delhi.", {}),
+        ("what is wall mora's revenue?", {}),  # no capital: not taken for a name
+    ],
+)
+def test_misheard_names_map_to_the_documents_spelling(question, renames):
+    assert misheard_names([question], HEARD_LABELS) == renames
+
+
+def test_respelling_keeps_the_rest_of_the_question():
+    assert respell("What was Wall Mora's revenue? Mora grew.", {"Wall Mora": "Valmora", "Mora": "Valmora"}) == (
+        "What was Valmora's revenue? Valmora grew."
+    )
+    assert sound_key("Valmora") == sound_key("Wall Mora") == sound_key("Wilmura") == "vlmr"
