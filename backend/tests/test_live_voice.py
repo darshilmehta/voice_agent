@@ -16,6 +16,7 @@ from app.providers.llm import LLMMessage
 from app.providers.registry import build_container
 from app.services.preload import ModelPreloader
 from app.services.voice.fillers import FILLERS, filler_audio
+from app.services.voice.protocol import parse_frame
 from app.services.voice.speech_text import SpokenChunk, heard_text
 from app.settings import load_settings
 
@@ -109,7 +110,12 @@ def test_the_filler_is_spoken_at_once_then_the_answer(live):
     assert kinds(main)[:8] == [
         "user_speech", "user_speech", "state", "user_message", "turn", "tool", "audio_chunk", "frame",
     ]  # fmt: skip
-    assert main.index({"type": "state", "state": "speaking"}) > main.index(of(items, "audio_chunk")[0])
+    # F12: the filler (announce and all its frames) is sent before the turn's next message, always
+    filler_at = main.index(of(items, "audio_chunk")[0])
+    assert all(isinstance(m, bytes) for m in main[filler_at + 1 : filler_at + 4])
+    assert main.index(one(items, "sources")) > filler_at + 3
+    # F13: "speaking" comes with the answer's first audio, not with the filler
+    assert main.index({"type": "state", "state": "speaking"}) > main.index(of(items, "audio_chunk")[1])
     tool_events = of(items, "tool")
     assert [t["phase"] for t in tool_events] == ["start", "results", "done"]
     assert all(t["turn_id"] == 1 for t in tool_events)
@@ -149,7 +155,8 @@ def test_barge_in_during_the_search_cancels_it(live):
         c.start()
         c.say(LIVE)
         c.until(lambda m: isinstance(m, dict) and m.get("filler") is True)
-        c.until(lambda m: isinstance(m, dict) and m == {"type": "state", "state": "speaking"})
+        # the filler alone doesn't make the agent "speaking" (F13): the answer hasn't started
+        assert not [m for m in c.quiet(0.2) if isinstance(m, dict) and m.get("state") == "speaking"]
         assert live.fakes.web.open == 1  # searching
         live.fakes.web.hang = False
         c.send("barge_in_start", turn_id=1, played_ms=600)  # the filler has played
@@ -167,6 +174,34 @@ def test_barge_in_during_the_search_cancels_it(live):
         nxt = c.until("agent_message")  # the correction is answered (no live cue: no search, no filler)
         assert one(nxt, "turn")["turn_id"] == 2 and not of(nxt, "tool")
         assert not [ch for ch in of(nxt, "audio_chunk") if ch.get("filler")]
+
+
+LAST_SENTENCE = "The report says revenue grew 34%."
+
+
+def test_speech_after_a_heard_answer_while_the_web_still_runs_is_not_a_barge_in(live):
+    """F10: the answer is complete and was played; the turn only waits for slower engines (a continuation may
+    come). The user speaking now ends the turn: the answer is saved complete (not stopped, no heard_text), no
+    barge_in decision, no "interrupted" state, and the speech is the next turn. The answer's last sentence was spoken
+    without waiting for the search to end."""
+    live.fakes.web.script, live.fakes.web.hang = [(0.0, web_result(1))], True  # one engine never answers
+    with live.connect() as ws:
+        c = VoiceClient(ws)
+        c.start()
+        c.say(LIVE)
+        items = c.until(lambda m: isinstance(m, dict) and m.get("text") == LAST_SENTENCE)
+        assert not [t for t in of(items, "tool") if t["phase"] in ("done", "timeout")]  # the search still runs
+        items += c.until(lambda m: isinstance(m, bytes) and parse_frame(m)[1:3] == (2, 2))  # its last frame (600 ms)
+        c.send("playback", turn_id=1, played_ms=60_000)  # the client played all of it
+        c.say(CORRECTION, ms=400)
+        after = c.until("turn")
+    assert not of(after, "barge_in") and {"type": "state", "state": "interrupted"} not in after
+    agent = one(after, "agent_message")["message"]
+    assert agent["text"] == "Up 2% today [W1]. The report says revenue grew 34% [S1]."
+    assert agent["heard_text"] is None and agent["route"]["stopped"] is False and "interrupted" not in agent["route"]
+    assert after.index(one(after, "agent_message")) < after.index(one(after, "user_message"))
+    assert one(after, "turn")["turn_id"] == 2
+    assert live.fakes.web.cancelled == 1
 
 
 def test_a_tts_failure_on_the_filler_doesnt_silence_the_answer(live, monkeypatch):
