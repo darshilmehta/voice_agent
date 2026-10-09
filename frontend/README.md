@@ -76,6 +76,18 @@ The audio engine is `lib/voice/` (protocol in docs/DESIGN.md §3.10, `WS /ws/cha
 
 In development `window.__voice` is the live session (`getSnapshot()`, `stats`, `player`) and `window.__presence` the presence meters, for debugging and browser tests.
 
+### Revisiting a chat: titles, summary, export
+
+The transcript panel has two tabs, **Transcript | Summary** (`components/Summary.tsx`; the plain transcript layout, with voice off, has the same tabs above the transcript). The chat's **⋯** menu (header, sidebar, project page) has **Summarise**, **Regenerate title** and **Export transcript → Markdown / JSON**; the last three are greyed out for a chat with no messages.
+
+- **Automatic titles.** A new chat is called "New chat" until the backend writes a title about a second after the first answer is saved. While the chat still has that placeholder (and `title_is_auto`), the page re-reads it 0.8, 1.8, 3.2 and 5 s after each saved answer (a voice `agent_message` or a finished typed turn; `lib/auto-title.ts`) and stops when it changes. The chat is refetched into the shared store without a loading state, and the header and sidebar fade the new text in (`components/TitleText.tsx`). **Regenerate title** calls `POST /api/chats/{id}/title:regenerate`; a `409` (the user chose the title) asks "Replace your title?" and retries with `?force=true`; `422` and `503` say what happened in a toast.
+- **Summary.** `GET /api/chats/{id}/summary` when the Summary tab is first shown (a `404` "summary of chat … not found" is the normal "no summary yet", not an error), `POST …/summary[?language=en|hi]` to write or refresh one. It is slow on the local model, so the view says so, keeps working while you look at the transcript (the state lives in `lib/use-chat-summary.ts`, in the chat page), and a failed write leaves the summary that was there. It is rendered from the structured fields (overview, key points with source chips in the citation popover style, unanswered questions, follow-ups), never from the markdown `content`, and is never spoken. **Out of date: covers N of M messages** with a Refresh button shows when the backend says `stale` or the chat got more messages since the page fetched the summary; the **EN | हिंदी** switch writes the other language. A question the documents couldn't answer scrolls the transcript to the message that asked it (`message_seq`), loading earlier pages if needed, and highlights it.
+- **Export.** `GET /api/chats/{id}/export?format=md|json` is fetched, turned into a blob and saved under the file name the server sends (`filename*=UTF-8''…` for Hindi titles; `lib/download.ts`). A browser can only read that header across origins if the backend lists `Content-Disposition` in `Access-Control-Expose-Headers`; without it the file is named after the chat's title. Errors show in a toast.
+
+### Routed answers
+
+Each agent message's `route` (docs/DESIGN.md §3.4; read by `lib/route.ts`, which tolerates older messages with none of it) shapes how the transcript shows the answer: a general-knowledge answer (`answer: "general"`, or `mixed` with a `general_note`) says "General knowledge, not from your documents"; a `mixed` answer that cites sources says "From your documents + general knowledge" (both in the same quiet style as "Not in your documents", which an answer given from general knowledge on purpose doesn't get); `ack` and `conversation` are light bubbles without a source list; a `clarification` says "Asked to clarify". When `rewritten_query` differs from what the user said (a correction, a follow-up, a word Whisper mis-heard), their message gets a tiny toggle beside its time and an "Understood as: …" line that shows on hover or focus. Topic shifts show nothing. On the voice stage, source chips (and the "Not in your documents" pill) belong only to answers that draw on the documents: once the saved answer is general, an acknowledgement or a clarification there are none, whatever retrieval found.
+
 ## Checks
 
 ```bash
@@ -88,16 +100,18 @@ npm run build && npm run typecheck
 
 ```text
 app/          root layout (reads BACKEND_URL per request), routes, global styles (globals.css: tokens + primitives;
-              styles/: shell, overlays, pages, chat, voice)
+              styles/: shell, overlays, pages, chat, voice, summary)
 components/   AppProviders, AppFrame (sidebar + drawer), Sidebar, views (Home, Project, Chat, Status), Transcript,
-              Citations (chips, source list, popover), Documents (documents card), Uploads (upload queue),
-              Actions (dialogs and entity actions), Dialog, Menu, Toast, StatusPanel, Icon,
-              voice/ (VoiceChat: the voice view, PresenceField, Captions)
+              Summary (panel tabs, the summary view), TitleText, Citations (chips, source list, popover),
+              Documents (documents card), Uploads (upload queue), Actions (dialogs and entity actions), Dialog, Menu,
+              Toast, StatusPanel, Icon, voice/ (VoiceChat: the voice view, PresenceField, Captions)
 scripts/      copy-vad-assets.mjs (VAD + ONNX runtime from node_modules into public/vad/)
 lib/          api.ts (typed backend calls, upload, streamed chat), sse.ts (Server-Sent Events reader), chat-turns.ts
               (questions and streaming answers), citations.ts ([S#] markers and citation shapes), backend-url.ts
               (runtime URL validation), backend-context.tsx (URL + public config), workspace.tsx (projects/chats/pins/
-              documents store, ingestion polling), health.tsx (GET /health polling), format.ts
+              documents store, ingestion polling), health.tsx (GET /health polling), format.ts, route.ts (what the
+              router decided, "Understood as"), use-chat-summary.ts + summary-model.ts + summary-request.ts (summaries),
+              auto-title.ts (the automatic title), download.ts (export file names and saving)
 lib/voice/    protocol.ts (messages, frame header, socket URL), session.ts (the live session), capture.ts (mic +
               AudioWorklet), playback.ts (gapless 24 kHz playback, duck, progress), vad.ts (Silero barge-in), captions.ts
               (word timing), analysis.ts + presence-renderer.ts (voice levels, the WebGL2 field), autostart.ts,

@@ -69,6 +69,8 @@ const PATHS = {
   refresh: <path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v4h-4" />,
   arrowUp: <path d="M12 19V5M6 11l6-6 6 6" />,
   arrowDown: <path d="M12 5v14M6 13l6 6 6-6" />,
+  download: <path d="M12 4.5v11M7.5 11.5 12 16l4.5-4.5M5 19.5h14" />,
+  list: <path d="M9 6.5h11M9 12h11M9 17.5h11M4.5 6.5h.01M4.5 12h.01M4.5 17.5h.01" />,
   stop: <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" stroke="none" />,
   check: <path d="m5 12.5 4.5 4.5L19 7.5" />,
   info: (

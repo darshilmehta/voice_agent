@@ -302,6 +302,8 @@ export interface WorkspaceActions {
   deleteProject: (projectId: string) => Promise<void>;
   createChat: (projectId: string) => Promise<Chat>;
   updateChat: (chatId: string, patch: ChatPatch) => Promise<Chat>;
+  /** Write a new automatic title. A BackendError 409 means the user chose the current one: retry with `force`. */
+  regenerateTitle: (chatId: string, force?: boolean) => Promise<Chat>;
   deleteChat: (chatId: string) => Promise<void>;
   /** A document the backend just returned (an upload): show it at once, then fetch the list again. */
   documentAdded: (document: ProjectDocument) => void;
@@ -411,6 +413,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         dispatch({ type: "chat", chat });
         void loadChats(chat.project_id, true);
         if ("pinned" in patch || "archived" in patch) void loadPins(true);
+        return chat;
+      },
+      async regenerateTitle(chatId, force = false) {
+        const chat = await api.regenerateTitle(chatId, { force });
+        dispatch({ type: "chat", chat });
+        void loadChats(chat.project_id, true); // the new title also moves the chat in the sidebar's order
         return chat;
       },
       async deleteChat(chatId) {

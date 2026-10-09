@@ -1,6 +1,8 @@
 /** Typed access to the backend. Shapes mirror backend/app/api/*.py and backend/app/domain/projects.py. */
 
+import { filenameFromDisposition } from "./download";
 import { readSse } from "./sse";
+import { normalizeSummary } from "./summary-model";
 
 export type Language = "en" | "hi";
 
@@ -159,6 +161,58 @@ export interface ChatPatch {
   language?: Language | null;
 }
 
+// ------------------------------------------------------------------ summaries, export, titles (docs/DESIGN.md §3.9)
+
+/** A document page range a summary key point rests on. */
+export interface SummarySource {
+  document_id: string | null;
+  filename: string;
+  page_start: number | null;
+  page_end: number | null;
+}
+
+export interface SummaryKeyPoint {
+  text: string;
+  sources: SummarySource[];
+}
+
+export interface UnansweredQuestion {
+  question: string;
+  /** `seq` of the user message that asked it; null when the summary can't say. */
+  message_seq: number | null;
+}
+
+/** GET/POST /api/chats/{id}/summary. The UI renders these fields; `content` is the same summary as markdown. */
+export interface ChatSummary {
+  id: string;
+  chat_id: string;
+  language: Language | (string & {});
+  overview: string;
+  key_points: SummaryKeyPoint[];
+  unanswered_questions: UnansweredQuestion[];
+  follow_ups: string[];
+  content: string;
+  /** The last message (`seq`) the summary covers. */
+  covers_seq: number;
+  /** How many messages the summary was written from. */
+  message_count: number;
+  /** The chat has newer messages than the summary covers. */
+  stale: boolean;
+  model: string;
+  created_at: Timestamp;
+}
+
+export type ExportFormat = "md" | "json";
+
+export interface ExportedTranscript {
+  blob: Blob;
+  /** From the response's Content-Disposition; null when the browser can't read that header (CORS) or it has none. */
+  filename: string | null;
+}
+
+/** The placeholder title a new chat has until the backend writes one from the first answer. */
+export const PLACEHOLDER_TITLE = "New chat";
+
 /** What retrieval found for a question: `sources` are numbered S1…, `abstained` means the evidence is too weak. */
 export interface Confidence {
   top_score: number;
@@ -227,6 +281,11 @@ export class BackendError extends Error {
 
   get notFound(): boolean {
     return this.status === 404;
+  }
+
+  /** 409: the request conflicts with the chat's state (a title the user set). */
+  get conflict(): boolean {
+    return this.status === 409;
   }
 }
 
@@ -299,6 +358,33 @@ async function request<T>(base: string, path: string, { method = "GET", body, si
 const getJson = <T>(base: string, path: string, signal?: AbortSignal) => request<T>(base, path, { signal });
 
 const id = encodeURIComponent;
+
+/** GET /api/chats/{id}/export: the transcript as a file. The body is read whole (it is a few hundred KB at most). */
+async function exportChat(base: string, chatId: string, format: ExportFormat, signal?: AbortSignal): Promise<ExportedTranscript> {
+  const path = `/api/chats/${id(chatId)}/export?format=${format}`;
+  let res: Response;
+  try {
+    res = await fetch(`${base}${path}`, { signal, cache: "no-store" });
+  } catch (err) {
+    if (isAbort(err)) throw err;
+    throw new BackendError(`Can't reach the backend at ${base}`);
+  }
+  if (!res.ok) {
+    const detail = await readDetail(res);
+    throw new BackendError(detail ?? `GET ${path} returned HTTP ${res.status}`, res.status);
+  }
+  let blob: Blob;
+  try {
+    blob = await res.blob();
+  } catch (err) {
+    if (isAbort(err)) throw err;
+    throw new BackendError("The connection to the backend was lost while the file was downloading.");
+  }
+  return { blob, filename: filenameFromDisposition(res.headers.get("content-disposition")) };
+}
+
+/** The 404 that means "no summary yet" (the chat exists), as opposed to an unknown chat. */
+const NO_SUMMARY_YET = /^summary\b/i;
 
 /**
  * POST one file as multipart/form-data (field `file`). XMLHttpRequest rather than fetch because only XHR reports
@@ -488,6 +574,36 @@ export function createApi(base: string) {
     updateChat: (chatId: string, patch: ChatPatch) =>
       request<Chat>(base, `/api/chats/${id(chatId)}`, { method: "PATCH", body: patch }),
     deleteChat: (chatId: string) => request<void>(base, `/api/chats/${id(chatId)}`, { method: "DELETE" }),
+
+    /**
+     * Write a new automatic title from the chat's messages. Throws BackendError: 409 when the user chose the current
+     * title (pass `force` to replace it anyway), 422 when there is no message yet, 503 when the model couldn't
+     * produce one.
+     */
+    regenerateTitle: (chatId: string, opts: { force?: boolean } = {}) =>
+      request<Chat>(base, `/api/chats/${id(chatId)}/title:regenerate${opts.force ? "?force=true" : ""}`, { method: "POST" }),
+
+    /** The stored summary, or null when none was written yet. */
+    getSummary: async (chatId: string, signal?: AbortSignal): Promise<ChatSummary | null> => {
+      try {
+        return normalizeSummary(await getJson<unknown>(base, `/api/chats/${id(chatId)}/summary`, signal));
+      } catch (err) {
+        if (err instanceof BackendError && err.notFound && NO_SUMMARY_YET.test(err.message)) return null;
+        throw err;
+      }
+    },
+    /**
+     * Write (or refresh) the summary; slow, because the local model reads the whole chat. An unchanged chat in the
+     * same language returns the stored one at once. 422: nothing to summarise, or a bad language; 503: no model.
+     */
+    createSummary: async (chatId: string, language?: Language, signal?: AbortSignal): Promise<ChatSummary> =>
+      normalizeSummary(
+        await request<unknown>(base, `/api/chats/${id(chatId)}/summary${language ? `?language=${language}` : ""}`, {
+          method: "POST",
+          signal,
+        }),
+      ),
+    exportChat: (chatId: string, format: ExportFormat, signal?: AbortSignal) => exportChat(base, chatId, format, signal),
 
     /** One page of a transcript, chronological. `before` reads backward (open at the latest), `after` forward. */
     listMessages: (

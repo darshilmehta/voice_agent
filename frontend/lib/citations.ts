@@ -20,6 +20,8 @@ export interface SourceRef {
   pageEnd: number | null;
   snippet: string | null;
   chunkId: string | null;
+  /** What the popover says when there is no passage to show (default: none was saved). */
+  note?: string;
 }
 
 const str = (v: unknown) => (typeof v === "string" && v.trim() ? v : null);

@@ -403,15 +403,8 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 8px 10px 8px 16px;
+  padding: 6px 10px 6px 10px;
   border-bottom: 1px solid var(--border);
-}
-
-.vc-panel-head h2 {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 650;
-  outline: none;
 }
 
 .vc-panel-body {

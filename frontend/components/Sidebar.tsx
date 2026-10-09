@@ -31,6 +31,7 @@ import { Highlight } from "./Highlight";
 import { Icon } from "./Icon";
 import { Menu, type MenuItem } from "./Menu";
 import { useReconnect } from "./States";
+import { TitleText } from "./TitleText";
 
 const EXPANDED_KEY = "sidebar.expanded";
 const ARCHIVED_KEY = "sidebar.showArchived";
@@ -234,7 +235,7 @@ export function Sidebar({ onClose, onRequestOpen, searchRef }: SidebarProps) {
                   href={`/chats/${c.id}`}
                   current={c.id === activeChatId}
                   icon="chat"
-                  label={<Highlight text={c.title} query={q} />}
+                  label={<TitleText title={c.title}><Highlight text={c.title} query={q} /></TitleText>}
                   sub={projectName(state, c.project_id) ?? undefined}
                   menuLabel={`Actions for chat ${c.title}`}
                   menu={actions.chatMenu(c)}
@@ -430,7 +431,7 @@ function ProjectNode({
             key={c.id}
             href={`/chats/${c.id}`}
             current={c.id === activeChatId}
-            label={<Highlight text={c.title} query={query} />}
+            label={<TitleText title={c.title}><Highlight text={c.title} query={query} /></TitleText>}
             meta={shortAge(chatActivity(c), now)}
             archived={c.archived}
             menuLabel={`Actions for chat ${c.title}`}

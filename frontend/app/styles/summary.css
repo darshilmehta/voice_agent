@@ -1,0 +1,398 @@
+/* The panel's two views (transcript, summary) and the summary itself (docs/DESIGN.md §3.9). */
+
+/* ------------------------------------------------------------------ tabs */
+
+.ptabs {
+  display: flex;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ptab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+
+.ptab:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.ptab[aria-selected="true"] {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+/* The summary is being written, or is out of date. */
+.ptab-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+}
+
+.ptab-dot[data-kind="writing"] {
+  background: var(--accent);
+  animation: pulse 1s ease-in-out infinite;
+}
+
+/* The tabs' own bar when the page has no voice stage (the plain transcript + composer layout). */
+.panel-bar {
+  flex: none;
+  padding: 6px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+/* ------------------------------------------------------------------ the two views, stacked */
+
+.pv {
+  position: relative;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.pv-pane[hidden] {
+  display: none;
+}
+
+.pv-transcript {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* The summary covers the transcript, which stays where it was underneath. */
+.pv-summary {
+  position: absolute;
+  z-index: 3;
+  inset: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: var(--bg);
+}
+
+/* ------------------------------------------------------------------ language switch */
+
+.sm {
+  padding: 14px 16px 28px;
+}
+
+.sm-inner {
+  max-width: 640px;
+  margin: 0 auto;
+}
+
+.sm-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.sm-bar-label {
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.seg {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-muted);
+}
+
+.seg-btn {
+  min-width: 46px;
+  height: 26px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-weight: 650;
+  transition:
+    background 0.12s,
+    color 0.12s;
+}
+
+.seg-btn:hover {
+  color: var(--text);
+}
+
+.seg-btn[aria-pressed="true"] {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 0 0 1px var(--border-strong);
+}
+
+.seg-btn[aria-disabled="true"] {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+/* ------------------------------------------------------------------ banners and states */
+
+.sm-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  margin-bottom: 14px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  font-size: 13.5px;
+}
+
+.sm-banner > span:not(.sm-spinner) {
+  flex: 1 1 180px;
+  min-width: 0;
+}
+
+.sm-banner-stale {
+  border-color: transparent;
+  background: var(--warn-soft);
+}
+
+.sm-banner-stale .icon {
+  color: var(--warn);
+}
+
+.sm-spinner {
+  display: inline-block;
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-right: 8px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  vertical-align: -2px;
+  animation: spin 0.8s linear infinite;
+}
+
+.sm-banner .sm-spinner {
+  margin-right: 0;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.sm-writing {
+  margin-bottom: 18px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.sm-writing strong {
+  display: flex;
+  align-items: center;
+  font-size: 14.5px;
+}
+
+.sm-writing p {
+  margin: 6px 0 0;
+  color: var(--text-muted);
+  font-size: 13.5px;
+}
+
+.sm-skeleton {
+  display: grid;
+  gap: 10px;
+}
+
+.sm-skel-h {
+  width: 90px;
+  height: 11px;
+  margin: 4px 0 12px;
+}
+
+.sm-skel-line {
+  height: 13px;
+  margin-bottom: 8px;
+}
+
+.sm-skel-line.short {
+  width: 62%;
+}
+
+.sm-skel-point {
+  margin-bottom: 14px;
+  padding-left: 14px;
+  border-left: 2px solid var(--border);
+}
+
+.sm-skel-chip {
+  width: 150px;
+  height: 20px;
+  border-radius: 999px;
+}
+
+/* ------------------------------------------------------------------ the summary's content */
+
+.sm-body {
+  transition: opacity 0.15s;
+}
+
+.sm-body[data-refreshing] {
+  opacity: 0.55;
+}
+
+.sm-section {
+  margin-bottom: 22px;
+}
+
+.sm-section h3 {
+  margin: 0 0 8px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.sm-overview {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.sm-points,
+.sm-questions {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sm-points {
+  gap: 14px;
+}
+
+.sm-point {
+  padding-left: 14px;
+  border-left: 2px solid var(--border-strong);
+}
+
+.sm-point p {
+  margin: 0 0 6px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.sm-point .cites {
+  margin-top: 0;
+}
+
+.sm-questions {
+  gap: 6px;
+}
+
+.sm-q {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  width: 100%;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.45;
+  text-align: left;
+}
+
+.sm-q > .icon:first-child {
+  margin-top: 2px;
+  color: var(--text-muted);
+}
+
+.sm-q-text,
+.sm-q-plain > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sm-q-text {
+  flex: 1;
+}
+
+.sm-q-go {
+  margin-top: 2px;
+  color: var(--text-muted);
+  transition: transform 0.12s;
+}
+
+button.sm-q {
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    border-color 0.12s;
+}
+
+button.sm-q:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+button.sm-q:hover .sm-q-go {
+  color: var(--accent-text);
+  transform: translateX(2px);
+}
+
+.sm-follow {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.sm-follow li {
+  margin-bottom: 5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.sm-foot {
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+@media (max-width: 819.98px) {
+  .panel-bar {
+    padding: 6px 12px;
+  }
+
+  .sm {
+    padding: 12px 14px 24px;
+  }
+}

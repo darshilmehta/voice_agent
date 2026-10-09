@@ -853,3 +853,134 @@
     margin: 10px 12px 0;
   }
 }
+
+/* ------------------------------------------------------------------ chat titles */
+
+/* A title that changed (written after the first answer, regenerated, renamed) fades in instead of jumping. */
+.title-swap {
+  animation: fade-in 0.5s ease-out;
+}
+
+/* A new title is being written. */
+.title-busy {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+/* ------------------------------------------------------------------ routed answers (docs/DESIGN.md §3.4) */
+
+/* Where an answer comes from when it isn't (only) the documents: the same quiet label as "Not in your documents". */
+.basis-label {
+  font-weight: 600;
+}
+
+/* A short acknowledgement or chit-chat: a plain, light bubble. */
+.msg-agent .bubble-light {
+  padding: 7px 13px;
+  box-shadow: none;
+}
+
+/* "Understood as: …" under a message the router read differently. Hidden until the message is hovered or focused. */
+.understood-toggle {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  opacity: 0;
+  transition:
+    opacity 0.12s,
+    background 0.12s;
+}
+
+.msg:hover .understood-toggle,
+.msg:focus-within .understood-toggle,
+.understood-toggle[aria-expanded="true"],
+.understood-toggle:focus-visible {
+  opacity: 0.85;
+}
+
+.understood-toggle:hover {
+  background: var(--hover);
+  opacity: 1;
+}
+
+.understood-toggle[aria-expanded="true"] {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.understood-line {
+  max-width: 100%;
+  max-height: 0;
+  margin: 0;
+  padding: 0 4px;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.45;
+  text-align: right;
+  overflow-wrap: anywhere;
+  opacity: 0;
+  visibility: hidden; /* out of the accessibility tree too, until revealed */
+  transition:
+    max-height 0.18s ease-out,
+    opacity 0.18s ease-out,
+    visibility 0s 0.18s;
+}
+
+.msg:hover .understood-line,
+.msg:focus-within .understood-line,
+.understood-line[data-open] {
+  max-height: 12em;
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 0s;
+}
+
+/* No hover on touch screens: the toggle stays, tiny and quiet. */
+@media (hover: none) {
+  .understood-toggle {
+    opacity: 0.55;
+  }
+}
+
+/* ------------------------------------------------------------------ a message jumped to (from the summary) */
+
+.msg:focus {
+  outline: none;
+}
+
+.msg:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+  border-radius: 10px;
+}
+
+.msg[data-flash] .bubble {
+  animation: msg-flash 2.2s ease-out;
+}
+
+.msg-event[data-flash] {
+  animation: msg-flash-event 2.2s ease-out;
+}
+
+@keyframes msg-flash {
+  0%,
+  55% {
+    box-shadow: 0 0 0 3px var(--accent);
+  }
+  100% {
+    box-shadow: 0 0 0 3px transparent;
+  }
+}
+
+@keyframes msg-flash-event {
+  0%,
+  55% {
+    background: var(--accent-soft);
+  }
+}

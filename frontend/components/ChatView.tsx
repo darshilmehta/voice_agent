@@ -15,9 +15,12 @@ import Link from "next/link";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 
 import { MESSAGE_MAX_CHARS, errorMessage, type Chat, type Language, type ProjectDocument } from "@/lib/api";
+import { useAutoTitleRefresh } from "@/lib/auto-title";
 import { useBackend, useDocumentTitle } from "@/lib/backend-context";
 import { useChatTurns } from "@/lib/chat-turns";
 import { LANGUAGE_NAMES } from "@/lib/format";
+import { useSummaryRequests } from "@/lib/summary-request";
+import { useChatSummary } from "@/lib/use-chat-summary";
 import { wantsAutoStart } from "@/lib/voice/autostart";
 import { useVoiceSession } from "@/lib/voice/use-voice-session";
 import { isIngesting, keys, projectName, slotOf, useWorkspace, useWorkspaceActions } from "@/lib/workspace";
@@ -27,6 +30,8 @@ import { DOCUMENT_STATUS } from "./Documents";
 import { Icon } from "./Icon";
 import { Menu } from "./Menu";
 import { LoadFailed } from "./States";
+import { PanelTabs, PanelViews, SummaryView, usePanelIds, type PanelView } from "./Summary";
+import { TitleText } from "./TitleText";
 import { useToast } from "./Toast";
 import { Transcript } from "./Transcript";
 import { VoiceChat } from "./voice/VoiceChat";
@@ -107,8 +112,10 @@ function ChatPage({ chat }: { chat: Chat }) {
   const actions = useEntityActions();
   const docs = state.documents[chat.project_id] ?? null;
   const docsById = useMemo(() => Object.fromEntries((docs ?? []).map((d) => [d.id, d])), [docs]);
-  const menu = actions.chatMenu(chat).filter((i) => i.id === "archive" || i.id === "delete");
+  // Rename and pin have buttons of their own beside the menu; the rest (summarise, title, export, archive, delete) live in it.
+  const menu = actions.chatMenu(chat).filter((i) => i.id !== "rename" && i.id !== "pin");
   const project = projectName(state, chat.project_id);
+  const toast = useToast();
 
   // After each answer: message count, activity time and (later) the automatic title change.
   const chatId = chat.id;
@@ -131,11 +138,44 @@ function ChatPage({ chat }: { chat: Chat }) {
   const [panelOpen, setPanelOpen] = useState(() => chat.message_count > 0);
   const [typeOpen, setTypeOpen] = useState(false);
 
+  // The panel shows the transcript or the summary (components/Summary.tsx). The summary lives here, so one that is
+  // being written keeps going while the reader looks at the transcript.
+  const panelIds = usePanelIds();
+  const [view, setView] = useState<PanelView>("transcript");
+  const summary = useChatSummary(chat, view === "summary");
+  const summarise = summary.summarise;
+  const openSummary = useCallback(() => {
+    setView("summary");
+    setPanelOpen(true);
+    summarise();
+  }, [summarise]);
+  useSummaryRequests(chat.id, openSummary); // the "Summarise" menu item, from here or from another page
+  // A question the summary says the documents couldn't answer: show the message that asked it.
+  const [focus, setFocus] = useState<{ seq: number; n: number } | null>(null);
+  const focusCount = useRef(0);
+  const showMessage = useCallback((seq: number) => {
+    setView("transcript");
+    setPanelOpen(true);
+    setFocus({ seq, n: ++focusCount.current });
+  }, []);
+  const onFocusDone = useCallback(
+    (_n: number, found: boolean) => {
+      if (!found) toast({ message: "That message isn't in the transcript any more." });
+    },
+    [toast],
+  );
+
   // Messages the voice session saves change the chat's count, activity and (later) title.
   const savedByVoice = snapshot.messages.length;
   useEffect(() => {
     if (savedByVoice > 0) onSettled();
   }, [savedByVoice, onSettled]);
+
+  // The automatic title arrives a second or two after the first answer is saved: ask again after each saved answer
+  // (voice `agent_message`, or a typed turn that finished) while the chat still has the placeholder title.
+  const answersSaved =
+    snapshot.messages.reduce((n, m) => n + (m.role === "agent" ? 1 : 0), 0) + conversation.turns.filter((t) => t.agent).length;
+  useAutoTitleRefresh(chat, answersSaved);
 
   // The backend turned voice off while the page was open (the public config was reloaded): let go of the microphone
   // and the socket.
@@ -188,6 +228,24 @@ function ChatPage({ chat }: { chat: Chat }) {
       onRetry={canAsk ? conversation.retry : undefined}
       voiceMessages={snapshot.messages}
       voice={voiceLive}
+      focus={focus}
+      onFocusDone={onFocusDone}
+    />
+  );
+  const panel = (
+    <PanelViews
+      view={view}
+      ids={panelIds}
+      transcript={transcript}
+      summary={<SummaryView chat={chat} s={summary} docsById={docsById} onShowMessage={showMessage} />}
+    />
+  );
+  const tabs = (
+    <PanelTabs
+      view={view}
+      onChange={setView}
+      ids={panelIds}
+      summaryBadge={summary.writing !== null ? "writing" : summary.stale ? "stale" : null}
     />
   );
   const composer = (
@@ -216,8 +274,12 @@ function ChatPage({ chat }: { chat: Chat }) {
             </Link>
             <Icon name="chevron" size={14} className="crumb-sep" />
           </nav>
-          <h1 className="chat-title" title={chat.title}>
-            {chat.title}
+          <h1
+            className={actions.regeneratingTitleId === chat.id ? "chat-title title-busy" : "chat-title"}
+            title={chat.title}
+            aria-busy={actions.regeneratingTitleId === chat.id || undefined}
+          >
+            <TitleText title={chat.title} />
           </h1>
           {chat.archived && <span className="tag">Archived</span>}
           <div className="head-actions">
@@ -268,13 +330,15 @@ function ChatPage({ chat }: { chat: Chat }) {
           typeOpen={typeOpen}
           onTypeOpenChange={setTypeOpen}
           messageCount={chat.message_count + snapshot.messages.filter((m) => m.seq > chat.message_count).length}
-          transcript={transcript}
+          panel={panel}
+          panelTabs={tabs}
           composer={composer}
           language={language}
         />
       ) : (
         <>
-          {transcript}
+          <div className="panel-bar">{tabs}</div>
+          {panel}
           {composer}
         </>
       )}
