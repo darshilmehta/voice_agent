@@ -602,3 +602,49 @@ def test_markdown_rendering_of_a_summary_without_sections():
     )
     assert render_summary_markdown(data) == "## Overview\n\nShort."
     assert render_summary_markdown(data, level=3) == "### Overview\n\nShort."
+
+
+def test_prepare_lists_questions_the_documents_did_not_cover():
+    """A mixed question the documents didn't cover is answered from general knowledge (``general_note``): the
+    answer stays in the transcript, marked as not from the documents, and its question is listed as unanswered."""
+
+    def m(seq: int, role: str, text: str, **kw: Any) -> Message:
+        base: dict[str, Any] = {
+            "id": f"m{seq}",
+            "chat_id": "c",
+            "seq": seq,
+            "role": role,
+            "modality": "text",
+            "text": text,
+            "heard_text": None,
+            "language": "en",
+            "citations": [],
+            "route": None,
+            "latency": None,
+            "created_at": "2026-10-08T09:00:00Z",
+        }
+        return Message.model_validate({**base, **kw})
+
+    prepared = prepare(
+        [
+            m(1, "user", "How does our margin compare with the industry?"),
+            m(
+                2,
+                "agent",
+                "Industry margins are usually 12-15%.",
+                route={"answer": "general", "general_note": "not_covered", "abstained": False},
+            ),
+            m(3, "user", "What is the capital of France?"),
+            m(4, "agent", "Paris.", route={"answer": "general", "abstained": False}),
+        ]
+    )
+    assert [ln.text for ln in prepared.lines] == [
+        "#1 User: How does our margin compare with the industry?",
+        "#2 Assistant (general knowledge, not from the documents): Industry margins are usually 12-15%.",
+        "#3 User: What is the capital of France?",
+        "#4 Assistant (general knowledge, not from the documents): Paris.",
+    ]
+    # Only the document question that went uncovered is "unanswered"; a general question answered as such isn't.
+    assert [(q.question, q.message_seq) for q in prepared.unanswered] == [
+        ("How does our margin compare with the industry?", 1)
+    ]

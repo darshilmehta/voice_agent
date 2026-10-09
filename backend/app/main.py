@@ -96,6 +96,7 @@ def create_app(
         allow_origins=settings.server.cors_allowed_origins,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["Content-Type", "Authorization"],
+        expose_headers=["Content-Disposition"],  # the export's file name, read by the frontend on another origin
     )
     install_error_handlers(app)
     for module in (health, public_config, projects, documents, chats, pins, voice, revisit):

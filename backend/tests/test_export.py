@@ -474,3 +474,11 @@ def test_nothing_audio_is_in_the_export(api_chat):
     api, _, _, chat = api_chat
     body = api.get(f"/api/chats/{chat.id}/export", params={"format": "json"}).text.lower()
     assert "audio" not in body
+
+
+def test_export_file_name_is_readable_from_the_frontend_origin(api_chat):
+    """The frontend runs on another origin, so CORS must expose Content-Disposition or the browser hides the name."""
+    api, _, _, chat = api_chat
+    r = api.get(f"/api/chats/{chat.id}/export", headers={"Origin": "http://localhost:3000"})
+    assert r.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert "content-disposition" in r.headers["access-control-expose-headers"].lower()

@@ -7,7 +7,8 @@
           ──► numbers → document and page references (SourceRef) ──► SummaryData + Markdown ──► ``chat_summaries``
 
 The unanswered questions are not asked of the model: they are the user's questions of the turns where the agent
-abstained (``route.abstained``), copied as said. This is a different artifact from the internal memory summary
+abstained (``route.abstained``) or answered from general knowledge because the documents didn't cover the question
+(``route.general_note == "not_covered"``), copied as said. This is a different artifact from the internal memory summary
 (§3.5), which keeps prompts short; this one is for the user to read.
 
 A summary is kept with the last message it covers. Asking again for an unchanged chat (and the same language) returns
@@ -126,17 +127,21 @@ def prepare(messages: Sequence[Message]) -> Prepared:
             lines.append(_line(m.seq, f"#{m.seq} User: {_flat(m.text, MESSAGE_CHARS)}"))
         elif m.role == "agent":
             mapping = sources.register(m.seq, m.citations)
-            if (m.route or {}).get("abstained") is True:
+            route = m.route or {}
+            uncovered = route.get("abstained") is True or route.get("general_note") == "not_covered"
+            if uncovered and last_user is not None:
+                question = _flat(last_user.text, QUESTION_CHARS)
+                if question.casefold() not in asked:
+                    asked.add(question.casefold())
+                    unanswered.append(UnansweredQuestion(question=question, message_seq=last_user.seq))
+            if route.get("abstained") is True:
                 lines.append(_line(m.seq, f"#{m.seq} Assistant: {NO_ANSWER_LINE}"))
-                if last_user is not None:
-                    question = _flat(last_user.text, QUESTION_CHARS)
-                    if question.casefold() not in asked:
-                        asked.add(question.casefold())
-                        unanswered.append(UnansweredQuestion(question=question, message_seq=last_user.seq))
                 continue
             heard = m.heard_text is not None
             body = _flat(number_markers(m.heard_text if heard else m.text, mapping), MESSAGE_CHARS)
             label = "Assistant (interrupted: the user heard only this)" if heard else "Assistant"
+            if route.get("answer") == "general" or route.get("general_note") == "not_covered":
+                label += " (general knowledge, not from the documents)"
             lines.append(_line(m.seq, f"#{m.seq} {label}: {body}"))
     return Prepared(lines, sources, unanswered)
 
