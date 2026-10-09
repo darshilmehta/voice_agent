@@ -322,6 +322,29 @@ async def test_b1_a_hindi_profit_question_routed_general_searches_in_english(b1)
     assert result.chunks[0].chunk.text == text
 
 
+async def test_b1_the_fiscal_year_veto_counts_as_not_covered(world):
+    """#35's gate: a strong match that doesn't state the fiscal year asked about is not relevant (above_threshold
+    False): "FY25" names the documents' subject, so the turn is a document question that abstains, never grounded on
+    the FY24 passage, nor a general answer."""
+    from app.services.retrieval import Confidence, RetrievalResult
+
+    vetoed = Confidence(0.92, 0.4, 0.8, False, missing_periods=(25,))
+
+    class Vetoed:
+        async def result_for(self, query, query_en):
+            return RetrievalResult(query, query_en or query, [], 8, vetoed), "used"
+
+        def discard(self):
+            pass
+
+    world.llm.route = {"intent": "general_qa", "query": None}
+    r = req("What will the EBITDA margin be in FY25?")
+    decision = validate(proposal("general_qa"), r)
+    decision, prefetched = await world.planner._check_facts(decision, r, Vetoed())
+    assert decision.route.intent == "document_qa" and prefetched is not None
+    assert decision.overrides[-1] == "general_qa→document_qa: asks about the documents' subject (best match 0.92)"
+
+
 async def test_b1_a_question_about_the_company_the_documents_dont_answer_abstains(b1):
     b1.reranker.scorer = lambda q, passage: 0.0
     b1.llm.route = {"intent": "general_qa", "query": None}

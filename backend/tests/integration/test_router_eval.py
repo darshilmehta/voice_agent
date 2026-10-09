@@ -103,7 +103,7 @@ class CachedRetrieval:
         self.score = score
 
     async def result_for(self, query: str, query_en: str | None):
-        confidence = Confidence(self.score, self.score, 0.5, self.score >= 0.05)
+        confidence = Confidence(self.score, self.score, 0.5, self.score >= 0.02)  # retrieval.min_rerank_score
         return RetrievalResult(query, query_en or query, [], 8, confidence), "used"
 
     def discard(self) -> None:
