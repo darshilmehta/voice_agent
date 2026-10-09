@@ -1,8 +1,14 @@
 """LLM providers (interface ``LLMClient``, docs/DESIGN.md §6): streamed chat and JSON-schema output.
 
 ``OllamaLLM`` talks to Ollama's ``/api/chat`` on the shared HTTP client with ``think`` from the config (off: the
-voice loop can't wait for hidden reasoning, §9.1), ``num_ctx``, ``keep_alive`` and per-purpose temperatures
-(``temperature.answer`` for answers, ``temperature.router`` for JSON decisions).
+voice loop can't wait for hidden reasoning, §9.1) and per-purpose temperatures (``temperature.answer`` for answers,
+``temperature.router`` for JSON decisions).
+
+**One model load for every call (§9.5).** Ollama reloads a model whenever a request asks for another context size,
+which costs seconds on this machine. Every request this provider makes (router, answers, titles, summaries, memory,
+warm-ups, and any later caller such as the canvas planner) takes ``num_ctx`` and ``keep_alive`` from one place,
+``OllamaLLM.runtime_options``; callers can't pass their own. ``warm_up`` reads prompts once (one token each), so the
+prompt prefixes the first turns share are already in Ollama's cache.
 """
 
 from __future__ import annotations
@@ -75,6 +81,11 @@ class LLMClient(Provider):
         the cap cut it short)."""
         raise NotImplementedError(f"{type(self).__name__}.generate_json")
 
+    async def warm_up(self, prompts: Sequence[Sequence[LLMMessage]], *, model: str | None = None) -> None:
+        """Have the model (chat model unless given) read these prompts now, one token each and nothing kept, so a
+        model server with a prompt cache has their prefixes ready (the router's and the answers' system prompts, at
+        startup). Default: nothing to warm."""
+
 
 class _ThinkFilter:
     """Drops a leading ``<think>…</think>`` block from streamed text. With ``think: false`` instruct models emit none,
@@ -137,6 +148,16 @@ class OllamaLLM(LLMClient):
             return self._health(HealthStatus.DEGRADED, f"not pulled: {', '.join(missing)} (ollama pull <model>)", ms)
         return self._health(HealthStatus.OK, f"models ready: {', '.join(wanted)}", ms)
 
+    def runtime_options(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """(options, top-level fields) every request carries: the context size and how long the model stays loaded.
+        The only place they are set (module docstring): a request with another ``num_ctx`` would reload the model."""
+        cfg = self.config
+        options: dict[str, Any] = {"num_ctx": cfg.num_ctx}  # type: ignore[attr-defined]
+        fields: dict[str, Any] = {}
+        if cfg.keep_alive is not None:  # type: ignore[attr-defined]
+            fields["keep_alive"] = cfg.keep_alive  # type: ignore[attr-defined]
+        return options, fields
+
     def request_body(
         self,
         messages: Sequence[LLMMessage],
@@ -148,7 +169,8 @@ class OllamaLLM(LLMClient):
         format: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         cfg = self.config
-        options: dict[str, Any] = {"num_ctx": cfg.num_ctx, "temperature": temperature}  # type: ignore[attr-defined]
+        runtime, fields = self.runtime_options()
+        options: dict[str, Any] = {**runtime, "temperature": temperature}
         if max_tokens is not None:
             options["num_predict"] = max_tokens
         body: dict[str, Any] = {
@@ -157,9 +179,8 @@ class OllamaLLM(LLMClient):
             "stream": stream,
             "think": cfg.think,  # type: ignore[attr-defined]
             "options": options,
+            **fields,
         }
-        if cfg.keep_alive is not None:  # type: ignore[attr-defined]
-            body["keep_alive"] = cfg.keep_alive  # type: ignore[attr-defined]
         if format is not None:
             body["format"] = format
         return body
@@ -169,15 +190,25 @@ class OllamaLLM(LLMClient):
         It is loaded with the answers' ``num_ctx``: loaded with Ollama's default context instead, the first answer
         would reload it (measured: first token after 952 ms instead of 136 ms)."""
         cfg = self.config
-        body: dict[str, Any] = {"model": cfg.chat_model, "options": {"num_ctx": cfg.num_ctx}}  # type: ignore[attr-defined]
-        if cfg.keep_alive is not None:  # type: ignore[attr-defined]
-            body["keep_alive"] = cfg.keep_alive  # type: ignore[attr-defined]
+        runtime, fields = self.runtime_options()
+        body: dict[str, Any] = {"model": cfg.chat_model, "options": runtime, **fields}  # type: ignore[attr-defined]
         try:
             response = await self.ctx.http.post(f"{self.base_url}/api/generate", json=body, timeout=self.timeout)
         except httpx.HTTPError as e:
             raise LLMUnavailableError(f"Ollama unreachable at {self.base_url} ({type(e).__name__}: {e})") from e
         if response.status_code != 200:
             raise LLMError(_error_text(response))
+
+    async def warm_up(self, prompts: Sequence[Sequence[LLMMessage]], *, model: str | None = None) -> None:
+        """Each prompt read once (one token, the router's temperature), one after another."""
+        cfg = self.config
+        for messages in prompts:
+            await self.generate(
+                messages,
+                model=model or cfg.chat_model,  # type: ignore[attr-defined]
+                temperature=cfg.temperature.router,  # type: ignore[attr-defined]
+                max_tokens=1,
+            )
 
     @property
     def timeout(self) -> httpx.Timeout:

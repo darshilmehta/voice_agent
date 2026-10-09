@@ -7,6 +7,10 @@ missing) is reported and still loads on first use if that becomes possible; noth
 
 With web search enabled, the voice filler ("Let me look that up.", §3.7) is synthesized right after TTS loads, in
 every configured language, so speaking it costs no TTS time.
+
+Once the LLM is loaded, its first prompts are warmed (``warm_prompts``): the router's prompt and the voice answer's
+system prompt in every configured language are read once, so Ollama's prompt cache holds them before the first turn.
+Without it the first routed turns after startup read the router prompt cold and hit the router timeout (§3.4, §9.5).
 """
 
 from __future__ import annotations
@@ -20,9 +24,13 @@ from typing import Literal
 from pydantic import BaseModel
 
 from ..providers.base import PlaceholderProvider
+from ..providers.llm import LLMClient, LLMError, LLMMessage
 from ..providers.models import ModelUnavailableError
 from ..providers.registry import Container
 from ..providers.speech import SpeechSynthesizer
+from ..settings import Settings
+from .prompts import answer_system_prompt
+from .router import LLMTurnRouter, RouteRequest
 from .voice.fillers import filler_audio
 
 log = logging.getLogger(__name__)
@@ -98,6 +106,17 @@ class ModelPreloader:
         except Exception as e:
             log.warning("preload: the web search filler couldn't be synthesized: %s: %s", type(e).__name__, e)
 
+    async def _warm(self, llm: object) -> None:
+        """The LLM's first prompts, read now (module docstring); a failure only means the first turns read them."""
+        if not isinstance(llm, LLMClient):
+            return
+        try:
+            await warm_prompts(llm, self.container.settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("preload: warming the LLM's prompts failed: %s: %s", type(e).__name__, e)
+
     async def _run(self) -> None:
         started = time.perf_counter()
         for load in self._loads:
@@ -119,9 +138,26 @@ class ModelPreloader:
                 load.state = "ready"
                 if load.capability == "tts":
                     await self._fillers(provider)
+                elif load.capability == "llm":
+                    await self._warm(provider)
             load.seconds = round(time.perf_counter() - t0, 2)
         log.info(
             "model preload finished in %.1fs: %s",
             time.perf_counter() - started,
             ", ".join(f"{m.capability} {m.state} {m.seconds}s" for m in self._loads),
         )
+
+
+async def warm_prompts(llm: LLMClient, settings: Settings) -> None:
+    """The router's prompt (a real router call, JSON schema and all) and the voice answer's system prompt in each
+    configured language, read once by the model."""
+    request = RouteRequest("Hello, can you hear me?", settings.client.default_language)
+    try:
+        await LLMTurnRouter(llm, settings.llm.router_model).propose(request)
+    except LLMError as e:  # the model's reply doesn't matter, only that it read the prompt
+        log.info("preload: the router warm-up call returned no valid route (%s)", e)
+    answers = [
+        [LLMMessage("system", answer_system_prompt(language, "short")), LLMMessage("user", "Hello")]
+        for language in settings.client.languages
+    ]
+    await llm.warm_up(answers, model=settings.llm.chat_model)
