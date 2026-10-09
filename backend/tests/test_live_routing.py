@@ -4,6 +4,7 @@ query that may leave the machine, and how the validated route gets ``tools=["web
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -99,10 +100,87 @@ def test_questions_that_need_live_data(text, cue):
         "रिपोर्ट के अनुसार अभी CEO कौन है?",
         "aaj ki meeting mein kya decide hua?",
         "report mein aaj ki meeting ka agenda kya hai?",
+        # F2, round two: today's town hall / webinar / mail / invoice / presentation / date, "the agenda for today"
+        "What's today's date on the invoice?",
+        "What's the date today on the form?",
+        "What's on the agenda for today?",
+        "What are the minutes from today?",
+        "What did the CEO say in today's town hall?",
+        "Key points from today's webinar?",
+        "Summarize today's email from finance",
+        "Anything in today's mail?",
+        "What are today's action items?",
+        "आज की तारीख़ क्या लिखी है?",
+        "आज की प्रेजेंटेशन में क्या था?",
+        "आज के वेबिनार में क्या बताया गया?",
+        "aaj ki presentation mein kya tha?",
+        "aaj ki email mein kya hai?",
+        "aaj ka agenda kya hai?",
+        # F2, round two: a strong cue in a technical or price-list context, or with the document named after it
+        "What is the latest price in the price list?",
+        "What is the price today according to the price list?",
+        "As of today, how many employees does the company have per the report?",
+        "What are the real-time monitoring requirements in the SOP?",
+        "Does the system support live data feeds?",
+        "Explain the live updates section",
+        "Explain the live updates section of the report",
+        "What is the current market price per unit in the quotation?",
+        "What's the current share price in the valuation section?",
+        "What's the latest rate in the manual?",
+        "What is the live price in the datasheet?",
+        "Latest price per the invoice?",
+        "What does the spec say about real-time sync?",
+        "What did they say about the weather in the travel itinerary?",
+        "What news did the newsletter cover?",
+        "What is the current exchange rate assumption?",
+        "What is the latest status of the project?",
     ],
 )
 def test_questions_that_dont(text):
     assert live_data_cue(text) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "cue"),
+    [
+        # the deliberately ambiguous ones stay live: nothing says they are about a document
+        ("Any news on the dividend?", "news"),
+        ("What's the news about the merger?", "news"),
+        ("What's the latest update on the litigation?", "latest update"),
+        ("अभी कंपनी का कर्ज़ कितना है?", "अभी"),
+        # strong cues outside technical or document contexts
+        ("What is the real-time price of Bitcoin?", "real-time"),
+        ("Show me live data for Infosys", "live data"),
+        ("What's the latest news about the merger per the Reuters story?", "latest news"),
+        ("What did the market do today?", "today"),
+        # "today's" and friends where nothing says meeting, mail, invoice or date
+        ("What is the stock doing today in Mumbai?", "stock doing today"),
+        ("Is the stock above 1,250 today?", "today"),
+    ],
+)
+def test_the_ambiguous_questions_are_still_live(text, cue):
+    assert live_data_cue(text) == cue
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The report says revenue grew 34%; how is the stock doing today?",
+        "According to the report, revenue grew 34%. How is the stock doing today?",
+        "Given revenue grew 34% per the report, how is Infosys stock doing today?",
+        "The price list says 40 a unit. What is the latest news about the supplier?",
+    ],
+)
+def test_a_document_named_before_a_strong_cue_is_only_a_premise(text):
+    """Only a document the cue's own clause names *after* it ("… in the price list") makes it a document question."""
+    assert live_data_cue(text, documents=["price_list_2026.xlsx"]) is not None
+
+
+def test_a_document_file_named_after_a_strong_cue_makes_it_a_document_question():
+    docs = ["price_list_2026.xlsx"]
+    assert live_data_cue("What is the latest price in price_list_2026.xlsx?", documents=docs) is None
+    assert live_data_cue("What is the latest price in price list 2026?", documents=docs) is None
+    assert live_data_cue("What is the latest price of copper?", documents=docs) == "latest price"
 
 
 def test_naming_a_document_points_at_the_documents():
@@ -196,6 +274,234 @@ def test_figures_the_user_said_stay():
     assert web_query("What is the Nifty 50 doing today?", utterance="aaj Nifty 50 kaisa hai?") == (
         "What is the Nifty 50 doing today?"
     )
+
+
+UTTERANCE = "how's the stock doing today?"
+
+
+@pytest.mark.parametrize(
+    ("question", "query"),
+    [
+        # F3: compact and spelled-out figures the user never said (the reviewer's probes): the whole token goes, with
+        # the word that led into it and its unit, and nothing is left behind
+        (
+            "How is Acme's stock doing today after posting ₹4512cr revenue?",
+            "How is Acme's stock doing today after posting revenue?",
+        ),
+        (
+            "How is Acme's stock doing today after Rs.4,512 crore revenue?",
+            "How is Acme's stock doing today after revenue?",
+        ),
+        (
+            "How is Acme's stock doing today after revenue of INR4512 crore?",
+            "How is Acme's stock doing today after revenue?",
+        ),
+        (
+            "How is Acme stock doing today after net profit of $1.2bn and EBITDA of 18.2x?",
+            "How is Acme stock doing today after net profit and EBITDA?",
+        ),
+        (
+            "How is Acme stock doing today after 34pc growth and a 1:2 bonus?",
+            "How is Acme stock doing today after growth and a bonus?",
+        ),
+        (
+            "How is Acme stock doing today after Q3 revenue of 1,234.5 million?",
+            "How is Acme stock doing today after Q3 revenue?",
+        ),
+        (
+            "How is Acme stock doing today after revenue rose from 3,367 to 4,512?",
+            "How is Acme stock doing today after revenue rose?",
+        ),
+        (
+            "How is Acme stock doing today after revenue of 4.5 lakh crore and margin of 18 per cent?",
+            "How is Acme stock doing today after revenue and margin?",
+        ),
+        (
+            "How is Acme's stock doing today after revenue of Rs. 4,512 crore?",  # "Rs." ends no clause
+            "How is Acme's stock doing today after revenue?",
+        ),
+        (
+            "How is Acme's stock doing today after revenue of ₹4,512 crore (up 34%)?",
+            "How is Acme's stock doing today after revenue up?",
+        ),
+        (
+            "How is Acme's stock doing today after the auditors flagged ₹ 230 crore?",
+            "How is Acme's stock doing today after the auditors flagged?",
+        ),
+        (
+            "How is the stock of Acme (see annual report FY24, page 12) doing today?",
+            "How is the stock of Acme see annual report FY24 doing today?",
+        ),
+        # spelled out, with a scale word, in English and romanized Hindi
+        (
+            "How is Acme stock doing today after revenue of four thousand five hundred crore rupees?",
+            "How is Acme stock doing today after revenue?",
+        ),
+        (
+            "How is Acme stock doing today after revenue of four point five lakh crore?",
+            "How is Acme stock doing today after revenue?",
+        ),
+        ("How is Acme's stock doing today after a hundred crore deal?", "How is Acme's stock doing today after deal?"),
+        (
+            "How is Acme's stock doing today after thirty-four percent growth?",
+            "How is Acme's stock doing today after growth?",
+        ),
+        (
+            "How is Acme's stock doing today after revenue of paanch hazaar crore?",
+            "How is Acme's stock doing today after revenue?",
+        ),
+        # what stays: words, years, FY tags, quarters, halves; numbers without a scale word spelled out are words
+        (
+            "How is Acme stock doing today after the going-concern warning and the CEO's resignation?",
+            "How is Acme stock doing today after the going-concern warning and the CEO's resignation?",
+        ),
+        (
+            "How is Acme's stock doing today after the 2024 results, the FY24 and FY 24 and FY2024-25 numbers and "
+            "Q3FY24, Q3'24, 3Q24, H1 and 1H25?",
+            "How is Acme's stock doing today after the 2024 results the FY24 and FY 24 and FY2024-25 numbers and "
+            "Q3FY24 Q3'24 3Q24 H1 and 1H25?",
+        ),
+        (
+            "How is Acme's stock doing today after revenue of 2024 crore?",
+            "How is Acme's stock doing today after revenue?",
+        ),
+        (
+            "How is Acme's stock doing today after the one-off charge?",
+            "How is Acme's stock doing today after the one-off charge?",
+        ),
+    ],
+)
+def test_compact_and_spelled_out_figures_never_leave(question, query):
+    assert web_query(question, documents=DOCS, utterance=UTTERANCE) == query
+
+
+@pytest.mark.parametrize(
+    "figure",
+    [
+        *("₹4512cr", "INR4512", "$1.2bn", "18.2x", "Rs.4,512", "Rs4512", "34pc", "34pct", "1:2", "4.5L", "₹4,512.50"),
+        *("US$3m", "€3.4bn", "12,34,567", "(4,512)", "-12%", "+3.4pp", "1.2e6", "4512/-", "Rs.4512/-", "3.5K"),
+        *("20-30%", "$5-7m"),
+    ],
+)
+def test_no_digit_of_an_unsaid_figure_survives_whatever_its_format(figure):
+    question = f"How is Acme's stock doing today after revenue of {figure} last week?"
+    query = web_query(question, documents=DOCS, utterance=UTTERANCE)
+    assert query is not None and not re.search(r"\d", query), query
+    assert query.startswith("How is Acme's stock doing today after revenue") and query.endswith("last week?")
+
+
+@pytest.mark.parametrize(
+    "amount",
+    [
+        "four thousand five hundred crore",
+        "one hundred and twenty crore",
+        "two and a half crore",
+        "four point five lakh crore",
+        "forty-five thousand",
+        "a million",
+        "half a million",
+        "one billion dollars",
+        "thirty four per cent",
+        "twenty-five percent",
+        "teen sau crore",  # romanized Hindi
+        "paanch hazaar rupees",
+    ],
+)
+def test_spelled_out_amounts_with_a_scale_word_never_leave(amount):
+    question = f"How is Acme's stock doing today after revenue of {amount} last week?"
+    assert web_query(question, utterance=UTTERANCE) == "How is Acme's stock doing today after revenue last week?"
+
+
+@pytest.mark.parametrize(
+    ("utterance", "question", "query"),
+    [
+        (
+            "is the stock above 1250 today?",
+            "Is the stock above Rs.1,250 today?",
+            "Is the stock above Rs.1,250 today?",
+        ),
+        (
+            "is the stock above 1,250 today?",
+            "Is Acme stock above ₹1250 today?",
+            "Is Acme stock above ₹1250 today?",
+        ),
+        (
+            "revenue was four thousand crore, how's the stock today?",
+            "How is Acme's stock doing today after revenue of four thousand crore?",
+            "How is Acme's stock doing today after revenue of four thousand crore?",
+        ),
+        (  # a different amount than the user said is not theirs
+            "is the stock above 1,250 today?",
+            "Is the stock above 1,250 today after revenue of 4,512 crore?",
+            "Is the stock above 1,250 today after revenue?",
+        ),
+    ],
+)
+def test_figures_in_the_users_own_words_stay_in_any_format(utterance, question, query):
+    assert web_query(question, documents=DOCS, utterance=utterance) == query
+
+
+@pytest.mark.parametrize(
+    ("question", "query"),
+    [
+        (
+            "How is Acme stock doing today after ~₹4,512cr / +34% YoY (up 1.2x) - [Rs 230 crore] growth?",
+            "How is Acme stock doing today after YoY up",
+        ),
+        ("How is Acme stock doing today (Rs 5, 6) & [x]: , ; growth", "How is Acme stock doing today"),
+        ("How is Acme stock doing today after revenue of (4,512) crore", "How is Acme stock doing today after revenue"),
+        ("How is Acme stock doing today - 34% growth - ?", "How is Acme stock doing today"),
+    ],
+)
+def test_no_punctuation_fragments_are_left_behind(question, query):
+    result = web_query(question, documents=DOCS, utterance=UTTERANCE)
+    assert result == query
+    assert not re.search(r"\d|[()\[\]~/+&]| - |\s[.,;:]|[.,;:]{2}", result or "")
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Explain the live updates section of the report",  # F2 aside, the query would be just "Explain"
+        "As of today, how many employees does the company have per the report?",  # … "As of today"
+        "As of today",
+        "Explain",
+        "How is it doing today?",  # nothing resolved "it"
+        "Tell me today",
+        "What's new now?",
+    ],
+)
+def test_a_query_with_nothing_to_look_up_is_not_sent(question):
+    """N1: fewer than two content words (not counting question, request and time words) and no live topic."""
+    assert web_query(question, documents=DOCS, utterance=question) is None
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is the latest news?",  # a live topic is enough by itself
+        "What's the weather today?",
+        "Sensex today",
+        "What is the USD to INR rate today?",
+        "How is Tesla doing today?",
+        "How is the stock doing today?",
+        "Is Infosys trading higher right now?",
+        "What is the current repo rate?",
+    ],
+)
+def test_short_queries_that_ask_for_something_are_sent(question):
+    assert web_query(question, utterance=question) == question
+
+
+def test_a_cue_that_leaves_nothing_to_search_drops_the_tool_and_keeps_the_hint():
+    """N1 end to end: "how is it doing today?" has a cue but no subject. The tool is dropped (nothing leaves), the
+    plan notes that live data was asked for and isn't there, and ``live`` stays set for the prompt's hint."""
+    req = request("how is it doing today?")
+    d = with_live_tools(decision_for(req, "general_qa"), req)
+    assert d.route.tools == ["web_search"] and d.live == "today"
+    dropped, query, note = live_search(d, req)
+    assert (query, note, dropped.route.tools) == (None, "failed", [])
+    assert "no English search query" in dropped.overrides[-1] and dropped.live == "today"
 
 
 # ------------------------------------------------------------------ the route
