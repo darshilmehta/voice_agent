@@ -1007,22 +1007,22 @@ class VoiceSession:
         """Synthesize chunks in order and send each: ``audio_chunk``, then its frames, one send-lock acquisition per
         frame (control messages and speech events aren't held up behind a whole chunk)."""
         while (text := await queue.get()) is not None:
-            if agent.tts_failed or agent.cut:
-                continue  # the text is still shown; one error per turn is enough
-            agent.tts_busy = True
-            try:
+            for piece in synthesis_pieces(text):  # a long sentence in clauses: its first words are heard sooner
+                if agent.tts_failed or agent.cut:
+                    break  # the text is still shown; one error per turn is enough
+                agent.tts_busy = True
                 try:
-                    pcm = await self.tts.synthesize(text, self._voice_for(agent, text))
-                except Exception as e:
-                    agent.tts_failed = True
-                    log.warning("voice session %s: speech synthesis failed: %s", self.id, _describe(e))
-                    await self._send_for(
-                        agent, {"type": "error", "detail": f"speech synthesis failed: {_describe(e)}", "stage": "tts"}
-                    )
-                    continue
-                await self._send_chunk(agent, text, pcm)
-            finally:
-                agent.tts_busy = False
+                    try:
+                        pcm = await self.tts.synthesize(piece, self._voice_for(agent, piece))
+                    except Exception as e:
+                        agent.tts_failed = True
+                        log.warning("voice session %s: speech synthesis failed: %s", self.id, _describe(e))
+                        detail = f"speech synthesis failed: {_describe(e)}"
+                        await self._send_for(agent, {"type": "error", "detail": detail, "stage": "tts"})
+                        break
+                    await self._send_chunk(agent, piece, pcm)
+                finally:
+                    agent.tts_busy = False
 
     @staticmethod
     def _voice_for(agent: AgentTurn, text: str) -> Language:
@@ -1441,6 +1441,32 @@ class VoiceSession:
 def _said_the_chart(agent: AgentTurn) -> bool:
     """The answer's speech already points at the chart ("The chart shows …"): "It's on screen now." would repeat it."""
     return any(_NAMES_THE_CHART.search(c.text) for c in agent.chunks if not c.filler)
+
+
+SPLIT_MIN_WORDS = 12  # a chunk this long is synthesized in clauses
+SPLIT_MIN_PART = 4  # ... none shorter than this
+_CLAUSE_CUT = re.compile(r"[,;:](?=\s)")  # "4,210" and "18.2%" never split
+
+
+def synthesis_pieces(text: str) -> list[str]:
+    """``text`` cut at clause boundaries into pieces of at least ``SPLIT_MIN_PART`` words, when it has
+    ``SPLIT_MIN_WORDS`` or more: each piece is synthesized and sent as its own chunk, so the first is heard while the
+    rest is synthesized (measured: Kokoro takes ~2.8 s on the CPU for a 20-word sentence, ~0.2 s per 5 words). A cut
+    goes to the boundary nearest the middle; each part is cut again if still long."""
+    words = text.split()
+    if len(words) < SPLIT_MIN_WORDS:
+        return [text]
+    best: tuple[float, int] | None = None
+    for m in _CLAUSE_CUT.finditer(text):
+        before = len(text[: m.end()].split())
+        if before >= SPLIT_MIN_PART and len(words) - before >= SPLIT_MIN_PART:
+            score = abs(before - len(words) / 2)
+            if best is None or score < best[0]:
+                best = (score, m.end())
+    if best is None:
+        return [text]
+    head, tail = text[: best[1]].strip(), text[best[1] :].strip()
+    return [*synthesis_pieces(head), *synthesis_pieces(tail)]
 
 
 def _answer_end_ms(agent: AgentTurn) -> float:
