@@ -414,7 +414,7 @@ async def test_a_hindi_live_question_searches_in_english(world):
     world.fakes.llm.route = lambda messages: {"intent": "general_qa", "query": "What is the dollar rate today?"}
     _, agent = await ask(world, "आज डॉलर का रेट क्या है?")
     assert world.web.queries == ["What is the dollar rate today?"]
-    assert agent.language == "hi" and "Answer in Hindi" in answer_prompts(world)[0][0].content
+    assert agent.route["language"] == "hi" and "Answer in Hindi" in answer_prompts(world)[0][0].content
 
 
 async def test_a_hindi_live_question_the_router_couldnt_translate_sends_nothing(world):

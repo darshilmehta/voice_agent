@@ -371,19 +371,67 @@ async def test_hinglish_hindi_and_switching_languages(world):
     json_calls = len(world.fakes.llm.json_calls)
     _, english = await say(world, "Now answer in English please")  # asked: English from now on
     assert english.language == "en" and len(world.fakes.llm.json_calls) == json_calls  # no router call
-    r = english.route  # the previous question again, in English, from the documents
+    r = english.route  # the previous question again, asked in English (B5), from the documents
     assert (r["intent"], r["answer"], r["rewritten_query"], r["query_en"]) == (
         "correction",
         "grounded",
-        "FY24 mein revenue kitna tha?",
         "How much was revenue in FY24?",
+        None,
     )
     assert r["router"]["overrides"] == ["language request: the previous question again"]
-    assert r["speculation"] == "reused_search" and english.text.startswith("Revenue grew 34%")
+    assert r["speculation"] == "used" and english.text.startswith("Revenue grew 34%")
+    question = answer_calls(world)[-1]["messages"][-1].content
+    assert "Question: How much was revenue in FY24?" in question and "answer only in English" in question
     _, agent = await say(world, "वित्त वर्ष 2024 में कर्ज कितना था?")
     assert agent.language == "en" and agent.citations  # the user's request beats the utterance's language
     _, agent = await say(world, "हिंदी में बताइए")  # asked again
     assert agent.language == "hi"
+
+
+def replies(*texts: str) -> Callable[[list[LLMMessage]], str]:
+    """Answers in this order (memory summaries keep their scripted reply)."""
+    queue = list(texts)
+
+    def reply(messages: list[LLMMessage]) -> str:
+        if messages[0].content.startswith("You keep the memory"):
+            return MEMORY
+        return queue.pop(0)
+
+    return reply
+
+
+async def test_b5_answer_in_english_reasks_in_english_and_retries_an_answer_in_hindi(world):
+    """Found in the real run: "answer in English please" re-asked the Hinglish question verbatim, the 4B model answered
+    in Hindi anyway, and the answer was saved `language: en` and spoken with the English voice."""
+    from app.services.prompts import LANGUAGE_INSISTENCE
+
+    world.fakes.llm.route = routes(
+        {"FY24 mein revenue kitna tha?": {"intent": "document_qa", "query": "How much was revenue in FY24?"}}
+    )
+    await say(world, "FY24 mein revenue kitna tha?")
+    world.fakes.llm.reply = replies("FY24 में राजस्व 34% बढ़ा [S1]।", "Revenue grew 34% in FY24 [S1].")
+    events, english = await say(world, "answer in English please")
+    first, second = answer_calls(world)[-2:]
+    asked = first["messages"][-1].content
+    assert "Question: How much was revenue in FY24?" in asked and "answer only in English" in asked
+    assert second["messages"][-1].content.endswith(LANGUAGE_INSISTENCE["en"])  # asked once more, insisting
+    assert second["messages"][:-1] == first["messages"][:-1]  # the same prompt otherwise (its prefix stays cached)
+    assert english.text == "Revenue grew 34% in FY24 [S1]." and english.language == "en"
+    assert "".join(e.text for e in events if isinstance(e, DeltaEvent)) == english.text  # no Hindi leaked out
+    assert english.route["language_retry"] is True and english.route["language"] == "en"
+
+
+async def test_b5_an_answer_still_in_the_other_script_is_saved_as_what_it_is(world):
+    world.fakes.llm.route = routes({"What was the EBITDA margin in FY24?": {"intent": "document_qa", "query": None}})
+    world.fakes.llm.reply = replies("FY24 में EBITDA 18.2% था [S1]।", "FY24 में EBITDA मार्जिन 18.2% था [S1]।")
+    _, agent = await say(world, "What was the EBITDA margin in FY24?")
+    assert agent.text == "FY24 में EBITDA मार्जिन 18.2% था [S1]।"
+    assert agent.language == "hi" and agent.route["language"] == "en" and agent.route["language_retry"] is True
+    world.fakes.llm.reply = replies("The EBITDA margin was 18.2% [S1].")  # the right script: one call, no retry
+    calls = len(answer_calls(world))
+    _, agent = await say(world, "What was the EBITDA margin in FY24?")
+    assert len(answer_calls(world)) == calls + 1 and agent.route["language_retry"] is False
+    assert agent.language == "en"
 
 
 async def test_the_memory_summary_is_refreshed_in_the_background_and_used(world):

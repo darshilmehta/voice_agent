@@ -185,6 +185,8 @@ Router input: the new utterance, the last few turns, the session state, and — 
 
 **Language rule** (first that applies): a language the user asks for (it then sticks) → the request's forced `language` → the pinned preference → the utterance's language (romanized Hindi counts as Hindi and is answered in Devanagari) → the previous answer's language. Hindi answers keep citations.
 
+**Answering in the asked language (B5, quality round).** A request that only changes the language ("answer in English please") asks the previous question again: asked for English, in its English form (`query_en`), with a line in the question saying the user asked for English (the 4B model answered a Hinglish question in Hindi whatever the system prompt said). Every model answer's first letters are held back until they show its script (two words or so of English; the first Devanagari word of Hindi), then sent as one piece; in the wrong script, with nothing sent yet, the stream is closed and the model asked once more, insisting on the language (`route.language_retry`). If it still answers in the other script, the answer stands: the message's `language` is the script actually written (`route.language` keeps the language asked for), and the voice that speaks it follows the text's script, decided on the answer's first chunk with letters and kept for the whole answer.
+
 ### 3.5 Conversation state and memory
 
 ```json

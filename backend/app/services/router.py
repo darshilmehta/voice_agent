@@ -421,6 +421,7 @@ class RouteDecision:
     error: str | None = None
     llm_ms: float | None = None
     reply: ReplyKind | None = None  # a fixed reply (heuristic thanks / greeting)
+    language_request: bool = False  # "answer in English please": the previous question again, in the asked language
     live: str | None = None  # the live-data cue of a question that wants current data (§3.7), tool or not
     retrieval_wait_ms: float | None = None  # waited for retrieval to check a "general" proposal (B1)
 
@@ -511,18 +512,24 @@ def fast_route(req: RouteRequest) -> RouteDecision | None:
     if only_asks_for_a_language(req.utterance):
         # "हिंदी में बताइए" after an answer: that question again, in the asked language (the turn's language);
         # before any answer: a short acknowledgement. The language itself is decided (and kept) by services/language.
+        # Asked for English, the question is asked again in English (its English query): a 4B model answers a
+        # Hinglish question in Hindi whatever the prompt says (B5).
         last, previous = req.last_answer, req.previous_question
         if last is not None and previous and (last.route or {}).get("answer") in _ANSWERED:
             r = last.route or {}
+            query, query_en = r.get("rewritten_query") or previous, r.get("query_en")
+            if req.language == "en" and query_en:
+                query, query_en = query_en, None
             route = _route(
                 req,
                 "correction",
                 confidence=CONFIDENCE["heuristic"],
-                query=r.get("rewritten_query") or previous,
-                query_en=r.get("query_en"),
+                query=query,
+                query_en=query_en,
                 topic=r.get("topic") or None,
             )
-            return RouteDecision(route, "heuristic", overrides=("language request: the previous question again",))
+            overrides = ("language request: the previous question again",)
+            return RouteDecision(route, "heuristic", overrides=overrides, language_request=True)
         route = _route(req, "conversation", confidence=CONFIDENCE["heuristic"])
         return RouteDecision(route, "heuristic", reply="language")
     ack = acknowledgement(req.utterance)

@@ -76,7 +76,13 @@ from .base import InvalidInput
 from .chats import ChatService
 from .conversation import ConversationStateService, TurnOutcome, state_writes
 from .documents import DocumentService
-from .language import asked_language, decide_language, message_language
+from .language import (
+    ScriptCheck,
+    asked_language,
+    decide_language,
+    message_language,
+    script_language,
+)
 from .live_data import LiveNote
 from .memory import MemoryKeeper, chat_activity
 from .messages import MessageService
@@ -101,6 +107,8 @@ from .prompts import (
     conversation_system_prompt,
     general_system_prompt,
     general_user_prompt,
+    insist_on_language,
+    language_request_note,
     live_notice,
     live_system_prompt,
     live_user_prefix,
@@ -326,6 +334,7 @@ class _Progress:
     answered: bool = False  # the answer's text is complete (a live-data continuation may still follow)
     llm_ms: float | None = None  # the answer's generation time, once complete
     notice: LiveNote | None = None  # the live-data notice the answer started with
+    language_retry: bool = False  # the answer came out in the wrong script and was asked again (B5)
 
     @property
     def citable(self) -> list[Source | WebSource]:
@@ -722,12 +731,11 @@ class ChatTurnService:
         p.llm_start = time.perf_counter()
         prompt = self._prompt(turn, plan, history, p.sources, p.memory, p)
         short = plan.mode in ("conversation", "clarification")
-        stream = self.llm.stream(
-            prompt, max_tokens=SHORT_REPLY_TOKENS if short else ANSWER_LENGTHS[turn.length].max_tokens
-        )
+        max_tokens = SHORT_REPLY_TOKENS if short else ANSWER_LENGTHS[turn.length].max_tokens
+        stream = self._answer_stream(prompt, plan.language, max_tokens, p)
         model_parts: list[str] = []
         try:
-            async with contextlib.aclosing(stream):  # type: ignore[type-var]  (closing the stream stops generation)
+            async with contextlib.aclosing(stream):  # closing the stream stops generation
                 async for piece in stream:
                     if p.first_delta_ms is None:
                         p.first_delta_ms = clock.ms()
@@ -767,6 +775,43 @@ class ChatTurnService:
         latency = self._latency(clock, p, first_delta_ms=p.first_delta_ms, llm_ms=llm_ms)
         async for event in self._save_answer(turn, answer, citations, route, latency, p):
             yield event
+
+    async def _answer_stream(
+        self, prompt: list[LLMMessage], language: Language, max_tokens: int, p: _Progress
+    ) -> AsyncGenerator[str, None]:
+        """The model's answer, in the answer language (B5). Its first letters are held back until they tell the script
+        (``ScriptCheck``: two words or so of English, the first Devanagari word of Hindi) and then sent as one piece;
+        in the wrong script the stream is closed and the model asked once more, insisting on the language. If it
+        still answers in the other script, that answer stands, and is saved (and spoken) as what it is
+        (``script_language``)."""
+        for attempt in (1, 2):
+            check = ScriptCheck(language)
+            held: list[str] = []
+            wrong = False
+            stream = self.llm.stream(prompt, max_tokens=max_tokens)
+            async with contextlib.aclosing(stream):  # type: ignore[type-var]  (closing the stream stops generation)
+                async for piece in stream:
+                    if check.verdict is not None:
+                        yield piece
+                        continue
+                    held.append(piece)
+                    if check.feed(piece) is None:
+                        continue
+                    if check.verdict is False and attempt == 1:
+                        wrong = True
+                        break
+                    yield "".join(held)
+                    held = []
+            if not wrong and attempt == 1 and check.finish() is False:
+                wrong = True
+            if wrong:
+                log.info("answer in the wrong script for %s (%r): asking again", language, "".join(held)[:80])
+                p.language_retry = True
+                prompt = insist_on_language(prompt, language)
+                continue
+            if held:
+                yield "".join(held)
+            return
 
     # -------------------------------------------------------------- live data (§3.7)
 
@@ -914,6 +959,8 @@ class ChatTurnService:
             system, question = clarification_system_prompt(language), turn.text
         else:
             system, question = conversation_system_prompt(language), turn.text
+        if plan.language_request:
+            question = f"{question}\n\n{language_request_note(language)}"
         return [*self._context(system, history, memory), LLMMessage("user", question)]
 
     @staticmethod
@@ -989,6 +1036,7 @@ class ChatTurnService:
             "input_language": turn.input_language or message_language(turn.text),
             "route_confidence": route.confidence if route is not None else None,
             "answer": plan.mode,
+            "language_retry": p.language_retry,
             "general_note": plan.general_note,
             "router": plan.decision.record() if plan.decision is not None else None,
             "speculation": p.speculation,
@@ -1079,7 +1127,7 @@ class ChatTurnService:
                 role=role,
                 text=answer,
                 modality=turn.modality,
-                language=p.plan.language,
+                language=script_language(answer) or p.plan.language,
                 citations=citations,
                 route=route,
                 latency=latency,
@@ -1123,7 +1171,7 @@ class ChatTurnService:
                 text=text,
                 modality=turn.modality,
                 heard_text=stop.heard_text if stop is not None else None,
-                language=p.plan.language,
+                language=script_language(text) or p.plan.language,
                 citations=citations,
                 route=route,
                 latency=latency,
@@ -1153,7 +1201,7 @@ class ChatTurnService:
                 role="agent",
                 text=text,
                 modality=turn.modality,
-                language=p.plan.language,
+                language=script_language(text) or p.plan.language,
                 citations=citations,
                 route=route,
                 latency=latency,

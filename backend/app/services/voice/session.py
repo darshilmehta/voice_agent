@@ -73,6 +73,7 @@ from ..chat_turns import (
     detach,
 )
 from ..chats import ChatService
+from ..language import script_language
 from ..messages import MessageService
 from .fillers import filler_audio
 from .protocol import (
@@ -183,6 +184,7 @@ class AgentTurn:
     tts_failed: bool = False
     first_audio_at: float | None = None  # the answer's first audio (not the filler's)
     queue: asyncio.Queue[SpeakItem] | None = None  # text waiting for TTS
+    voice_language: Language | None = None  # the voice speaking this answer: its text's script, once it tells (B5)
     tts_busy: bool = False  # the speaker is synthesizing or sending a chunk
     answer_queued: bool = False  # the answer's text is complete and all of it is queued for speech
     message_sent: bool = False  # agent_message was sent
@@ -817,7 +819,7 @@ class VoiceSession:
             agent.tts_busy = True
             try:
                 try:
-                    pcm = await self.tts.synthesize(text, agent.turn.language)
+                    pcm = await self.tts.synthesize(text, self._voice_for(agent, text))
                 except Exception as e:
                     agent.tts_failed = True
                     log.warning("voice session %s: speech synthesis failed: %s", self.id, _describe(e))
@@ -828,6 +830,15 @@ class VoiceSession:
                 await self._send_chunk(agent, text, pcm)
             finally:
                 agent.tts_busy = False
+
+    @staticmethod
+    def _voice_for(agent: AgentTurn, text: str) -> Language:
+        """The voice for a chunk of the answer: the script of the answer's first chunk that has letters (B5: an
+        answer asked for in English but written in Hindi is spoken by the Hindi voice), kept for the whole answer, so
+        "EBITDA 21.0%" in a Hindi answer doesn't switch voices."""
+        if agent.voice_language is None:
+            agent.voice_language = script_language(text)
+        return agent.voice_language or agent.turn.language
 
     async def _speak_filler(self, agent: AgentTurn) -> None:
         """The filler of a web search (§3.7), pre-synthesized: sent at once, before the turn's next message. If its

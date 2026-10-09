@@ -26,6 +26,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from ..providers.llm import LLMMessage
 from ..settings import Language
 from .live_data import LiveNote
 from .sources import Source, format_sources
@@ -336,6 +337,29 @@ def clarification_system_prompt(language: Language) -> str:
 
 def general_user_prompt(question: str, language: Language) -> str:
     return f"{question.strip()}\n\n(Answer in {LANGUAGE_NAMES[language]}.)"
+
+
+def language_request_note(language: Language) -> str:
+    """The user asked for this answer language ("answer in English please"): said in the question itself, which a 4B
+    model heeds better than the system prompt when the conversation so far is in the other language (B5)."""
+    name = LANGUAGE_NAMES[language]
+    return f"(The user asked for the answer in {name}: answer only in {name}, even though earlier messages are not.)"
+
+
+# One more try when an answer came out in the wrong script (B5): said as plainly as possible, in both languages.
+LANGUAGE_INSISTENCE: dict[Language, str] = {
+    "en": "IMPORTANT: write the whole answer in English only. Do not use Hindi or Devanagari script at all.",
+    "hi": (
+        "IMPORTANT: write the whole answer in Hindi, in Devanagari script (keep figures, source ids and terms such as "
+        "EBITDA or FY24 as written). महत्वपूर्ण: पूरा उत्तर केवल हिंदी में, देवनागरी लिपि में लिखें।"
+    ),
+}
+
+
+def insist_on_language(messages: Sequence[LLMMessage], language: Language) -> list[LLMMessage]:
+    """The same prompt, its last user message ending with ``LANGUAGE_INSISTENCE`` (the prefix stays cached)."""
+    *head, last = messages
+    return [*head, LLMMessage(last.role, f"{last.content}\n\n{LANGUAGE_INSISTENCE[language]}")]
 
 
 def with_memory(system: str, memory: str | None) -> str:

@@ -238,7 +238,10 @@ def test_text_without_letters_uses_the_chat_language(app, fakes):
     p, _ = project_with_report(app)
     chat = new_chat(app, p, language="hi")
     fakes.reranker.scorer = lambda q, passage: 0.9
-    assert payload(ask(app, chat, "18.2%?"), "agent_message")["language"] == "hi"
+    fakes.llm.reply = "EBITDA मार्जिन 18.2% था [S1]।"
+    agent = payload(ask(app, chat, "18.2%?"), "agent_message")
+    assert agent["language"] == "hi" and agent["route"]["language"] == "hi"
+    assert "Answer in Hindi" in fakes.llm.calls[-1]["messages"][0].content
 
 
 # ------------------------------------------------------------------ scope
@@ -292,7 +295,7 @@ def test_llm_failing_mid_answer_ends_the_stream_without_saving_a_partial_answer(
     fakes.llm.reply = "The margin was 18.2% according to [S1]."
     fakes.llm.fail_after = 2
     events = ask(app, chat, EN)
-    assert names(events) == ["user_message", "sources", "delta", "delta", "error"]
+    assert names(events) == ["user_message", "sources", "delta", "error"]  # the first words go out together (B5)
     assert payload(events, "error")["stage"] == "llm"
     assert app.get(f"/api/chats/{chat}/messages").json()["total"] == 1
 

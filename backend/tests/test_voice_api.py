@@ -614,6 +614,20 @@ def test_tts_failing_partway_reports_once_then_closes_the_turn_after_the_audio_s
 # ------------------------------------------------------------------ startup
 
 
+def test_b5_the_voice_follows_the_script_of_the_answer(voice):
+    """Asked in English, answered in Hindi even after one more try: saved as Hindi and spoken by the Hindi voice,
+    the whole answer (its "EBITDA 18.2%" chunk too), not by the English voice reading Devanagari."""
+    voice.fakes.llm.reply = "FY24 में EBITDA मार्जिन 18.2% था [S1]। EBITDA 18.2% [S2]। राजस्व 34% बढ़ा।"
+    with voice.connect() as ws:
+        c = VoiceClient(ws)
+        c.start(language="en")
+        c.say(QUESTION)
+        agent = one(c.until("agent_message"), "agent_message")["message"]
+    assert agent["language"] == "hi" and agent["route"]["language"] == "en"
+    spoken = [lang for _, lang in voice.fakes.tts.calls]
+    assert len(spoken) >= 2 and set(spoken) == {"hi"}
+
+
 def test_health_reports_the_model_preload(voice):
     body = voice.api.get("/health").json()
     preload = body["preload"]

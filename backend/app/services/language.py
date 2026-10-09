@@ -94,6 +94,62 @@ def message_language(text: str) -> Language | None:
     return "hi" if is_hinglish(text) else "en"
 
 
+def script_language(text: str) -> Language | None:
+    """The language a text is *written* in, by script alone: 'hi' when at least a quarter of its words are in
+    Devanagari, 'en' for Latin script (romanized Hindi included: the English voice reads it, the Hindi one can't),
+    None without letters ("₹ 7,365 [S1]"). For what was answered (saved ``language``) and which voice speaks it."""
+    devanagari, latin, _ = _counts(_MARKERS.sub(" ", text))
+    if devanagari == 0 and latin == 0:
+        return None
+    return "hi" if devanagari * 3 >= latin else "en"  # Hindi answers keep "FY24", "EBITDA", names in Latin script
+
+
+_MARKERS = re.compile(r"\[\s*[SW]\d+(?:\s*[,;]\s*[SW]\d+)*\s*\]", re.IGNORECASE)  # [S1] citation markers
+_DEVANAGARI_LETTER = re.compile("[\u0900-\u0963\u0966-\u097f]")
+_LATIN_LETTER = re.compile("[A-Za-z]")
+
+
+class ScriptCheck:
+    """Is a streamed answer in the expected language? Fed the first pieces; ``verdict`` becomes True or False as soon
+    as the letters so far tell (B5: asked for English, the 4B model may still answer a Hinglish question in Hindi):
+
+    - expected English: False at the first Devanagari word (3 letters); True after 8 Latin letters without any (two
+      words or so: "FY24 में…" is caught, "The EBITDA…" goes out at once);
+    - expected Hindi: True at the first Devanagari word; False after 24 Latin letters without any (Hindi answers often
+      start with "FY24", "EBITDA" or a company name, so Latin letters alone prove nothing at first).
+
+    ``finish()`` decides at the end of a short answer (None: too few letters to tell)."""
+
+    def __init__(self, expected: Language) -> None:
+        self.expected = expected
+        self.devanagari = 0
+        self.latin = 0
+        self.verdict: bool | None = None
+
+    def feed(self, piece: str) -> bool | None:
+        if self.verdict is None:
+            self.devanagari += len(_DEVANAGARI_LETTER.findall(piece))
+            self.latin += len(_LATIN_LETTER.findall(piece))
+            if self.expected == "en":
+                if self.devanagari >= 3:
+                    self.verdict = False
+                elif self.latin >= 8:
+                    self.verdict = True
+            elif self.devanagari >= 3:
+                self.verdict = True
+            elif self.latin >= 24:
+                self.verdict = False
+        return self.verdict
+
+    def finish(self) -> bool | None:
+        if self.verdict is None:
+            hindi_in_english = self.expected == "en" and self.devanagari >= 3
+            english_in_hindi = self.expected == "hi" and self.devanagari == 0 and self.latin >= 8
+            if hindi_in_english or english_in_hindi:
+                self.verdict = False
+        return self.verdict
+
+
 def is_devanagari(text: str) -> bool:
     """Mostly written in Devanagari (by words)."""
     devanagari, latin, _ = _counts(text)

@@ -108,6 +108,11 @@ class TurnPlan:
     prefetched: Prefetched | None = None
 
     @property
+    def language_request(self) -> bool:
+        """The user asked for this answer language and nothing else: the previous question again (B5)."""
+        return self.decision is not None and self.decision.language_request
+
+    @property
     def route(self) -> TurnRoute | None:
         return self.decision.route if self.decision is not None else None
 
