@@ -27,6 +27,7 @@ import { useBackend } from "@/lib/backend-context";
 import type { Turn } from "@/lib/chat-turns";
 import { citedIds, toSourceRefs, type SourceRef } from "@/lib/citations";
 import { clockTime, dayKey, dayLabel, fullDateTime, plural } from "@/lib/format";
+import { cutNote, cutReasonOf, stoppedNote } from "@/lib/interruption";
 
 import { AnswerText, CitationPopoverProvider, SourceList } from "./Citations";
 import { Icon } from "./Icon";
@@ -72,9 +73,23 @@ interface TranscriptProps {
   onRetry?: (turnKey: string) => void;
   /** An answer is streaming: Retry waits. */
   busy?: boolean;
+  /** Messages the voice session saved while this page was open (the session's `user_message` / `agent_message`). */
+  voiceMessages?: Message[];
+  /** The voice turn in progress, before it is saved: what the user is saying, what the agent has written so far. */
+  voice?: { userText: string | null; agentText: string | null; sources: SourcesPayload | null } | null;
 }
 
-export function Transcript({ chat, docsById, turns = [], onRetry, busy = false }: TranscriptProps) {
+const NO_MESSAGES: Message[] = [];
+
+export function Transcript({
+  chat,
+  docsById,
+  turns = [],
+  onRetry,
+  busy = false,
+  voiceMessages = NO_MESSAGES,
+  voice = null,
+}: TranscriptProps) {
   const { api, config } = useBackend();
   const [s, setS] = useState<TranscriptState>(INITIAL);
   const [attempt, setAttempt] = useState(0);
@@ -251,12 +266,26 @@ export function Transcript({ chat, docsById, turns = [], onRetry, busy = false }
     }
     return ids;
   }, [turns]);
-  const history = turnMessageIds.size ? s.items.filter((m) => !turnMessageIds.has(m.id)) : s.items;
+  // Likewise for what the voice session saved on this page: shown after the history, in time order with the turns.
+  const voiceIds = useMemo(() => new Set(voiceMessages.map((m) => m.id)), [voiceMessages]);
+  const history =
+    turnMessageIds.size || voiceIds.size
+      ? s.items.filter((m) => !turnMessageIds.has(m.id) && !voiceIds.has(m.id))
+      : s.items;
   const savedInTurns = turns.reduce((n, t) => n + (t.user ? 1 : 0) + (t.agent ? 1 : 0), 0);
-  const total = s.total + savedInTurns - (s.items.length - history.length);
   const remaining = Math.max(0, s.total - s.items.length);
+  const total = remaining + history.length + savedInTurns + voiceMessages.length;
   const ready = s.status === "ready";
-  const hasContent = history.length > 0 || turns.length > 0;
+  const tail = useMemo(
+    () =>
+      [
+        ...turns.map((turn) => ({ kind: "turn" as const, at: Date.parse(turn.user?.created_at ?? turn.startedAt), turn })),
+        ...voiceMessages.map((message) => ({ kind: "voice" as const, at: Date.parse(message.created_at), message })),
+      ].sort((a, b) => a.at - b.at),
+    [turns, voiceMessages],
+  );
+  const liveVoice = voice && (voice.userText !== null || voice.agentText !== null) ? voice : null;
+  const hasContent = history.length > 0 || tail.length > 0 || liveVoice !== null;
 
   let lastDay = history.length ? dayKey(history[history.length - 1].created_at) : null;
 
@@ -339,7 +368,23 @@ export function Transcript({ chat, docsById, turns = [], onRetry, busy = false }
                   <MessageItem message={m} docsById={docsById} showDebug={showDebug} />
                 </Fragment>
               ))}
-              {turns.map((t) => {
+              {tail.map((item) => {
+                if (item.kind === "voice") {
+                  const m = item.message;
+                  const divider = dayKey(m.created_at) !== lastDay;
+                  lastDay = dayKey(m.created_at);
+                  return (
+                    <Fragment key={m.id}>
+                      {divider && (
+                        <li className="tx-day">
+                          <span>{dayLabel(m.created_at)}</span>
+                        </li>
+                      )}
+                      <MessageItem message={m} docsById={docsById} showDebug={showDebug} />
+                    </Fragment>
+                  );
+                }
+                const t = item.turn;
                 const when = t.user?.created_at ?? t.startedAt;
                 const divider = dayKey(when) !== lastDay;
                 lastDay = dayKey(when);
@@ -365,6 +410,22 @@ export function Transcript({ chat, docsById, turns = [], onRetry, busy = false }
                   </Fragment>
                 );
               })}
+              {liveVoice?.userText != null && (
+                <li className="msg msg-user" data-pending>
+                  <div className="msg-meta">
+                    <span className="msg-who">You</span>
+                    <span className="msg-mode">
+                      <Icon name="mic" size={13} />
+                      Voice
+                    </span>
+                    <span className="msg-status">Listening…</span>
+                  </div>
+                  <div className="bubble">{liveVoice.userText || "…"}</div>
+                </li>
+              )}
+              {liveVoice?.agentText != null && (
+                <LiveVoiceAnswer text={liveVoice.agentText} sources={liveVoice.sources} docsById={docsById} />
+              )}
             </ol>
           )}
 
@@ -489,45 +550,57 @@ const MessageItem = memo(function MessageItem({
   const played = heard?.trimEnd() ?? "";
   const heardPrefix = cutOff && m.text.startsWith(played) ? played : null;
   const render = (text: string) => (isUser ? text : <AnswerText text={text} sources={map} />);
+  // Stopped before anything was written: the saved answer is empty, so there is no bubble to show, only the note.
+  const blank = !isUser && m.text.trim() === "";
+  const reason = cutReasonOf(m);
+  const cut = cutNote(reason, heard ?? "");
+  const stopped = stoppedFlag(m);
+  // The connection dropped while the answer was going out and nothing says how much of it was heard.
+  const droppedUnheard = !isUser && !stopped && reason === "disconnect" && heard === null;
 
   return (
     <li className={`msg msg-${m.role}`}>
       <MessageMeta m={m} isUser={isUser} />
 
-      <div className={abstained ? "bubble bubble-abstained" : "bubble"} lang={m.language ?? undefined}>
-        {abstained && <AbstainLabel />}
-        {heardPrefix !== null ? (
-          <>
-            {render(heardPrefix)}
-            <span className="unheard">
-              <span className="visually-hidden"> [not played:] </span>
-              {render(m.text.slice(heardPrefix.length))}
-            </span>
-          </>
-        ) : (
-          render(m.text)
-        )}
-      </div>
+      {!blank && (
+        <div className={abstained ? "bubble bubble-abstained" : "bubble"} lang={m.language ?? undefined}>
+          {abstained && <AbstainLabel />}
+          {heardPrefix !== null ? (
+            <>
+              {render(heardPrefix)}
+              <span className="unheard">
+                <span className="visually-hidden"> [not played:] </span>
+                {render(m.text.slice(heardPrefix.length))}
+              </span>
+            </>
+          ) : (
+            render(m.text)
+          )}
+        </div>
+      )}
 
       {cutOff && (
         <p className="msg-note">
           <Icon name="pulse" size={13} />
-          {heard ? (
-            <span>
-              Interrupted after: <q>{lastWords(heard, 8)}</q>
-            </span>
-          ) : (
-            <span>Interrupted before it was played</span>
-          )}
+          <span>
+            {cut.lead}
+            {cut.quote !== null && (
+              <>
+                {" "}
+                <q>{lastWords(cut.quote, 8)}</q>
+              </>
+            )}
+          </span>
         </p>
       )}
 
       {!isUser && <SourceList sources={listed} />}
 
-      {!isUser && stoppedFlag(m) && (
+      {/* A cut voice answer already says how it was cut (and is usually complete, so "wasn't written" would be wrong). */}
+      {!isUser && (stopped || droppedUnheard) && !cutOff && (
         <p className="msg-note msg-note-quiet">
           <Icon name="stop" size={12} />
-          Stopped. The rest of this answer wasn&apos;t written.
+          {stoppedNote(reason, blank, stopped)}
         </p>
       )}
 
@@ -557,6 +630,38 @@ function AbstainLabel() {
       <Icon name="info" size={14} />
       Not in your documents
     </span>
+  );
+}
+
+// ------------------------------------------------------------------ a voice answer being written
+
+/** The agent's answer to a spoken question while it is still being generated (the saved message replaces it). */
+function LiveVoiceAnswer({
+  text,
+  sources,
+  docsById,
+}: {
+  text: string;
+  sources: SourcesPayload | null;
+  docsById: Record<string, ProjectDocument>;
+}) {
+  const { map, listed } = useSources(text, NO_CITATIONS, sources, docsById);
+  if (!text) return null;
+  return (
+    <li className="msg msg-agent" aria-busy="true">
+      <div className="msg-meta">
+        <span className="msg-who">Agent</span>
+        <span className="msg-mode">
+          <Icon name="mic" size={13} />
+          Voice
+        </span>
+        <span className="msg-status">Answering…</span>
+      </div>
+      <div className="bubble">
+        <AnswerText text={text} sources={map} streaming />
+      </div>
+      <SourceList sources={listed} />
+    </li>
   );
 }
 

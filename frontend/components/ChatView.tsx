@@ -2,9 +2,13 @@
 
 /**
  * /chats/[chatId]: breadcrumb (project › chat), rename/pin/archive/delete, the documents the chat answers from
- * (toggle a chip to narrow or widen the chat's document scope), the transcript, and the composer: Enter sends,
- * Shift+Enter adds a line, Stop (or Esc) ends a streaming answer. Without a READY document in scope the composer
- * explains why it can't send and links to uploading. The voice view (§3.8) comes later.
+ * (toggle a chip to narrow or widen the chat's document scope), then the conversation.
+ *
+ * Voice first (docs §1, §3.9): the page opens in voice mode (components/voice/VoiceChat: presence field, mic, live
+ * captions, the answer's sources); the transcript is a panel beside it, open by default when the chat already has
+ * messages; "Type instead" expands the text composer: Enter sends, Shift+Enter adds a line, Stop (or Esc) ends a
+ * streaming answer. Without a READY document in scope the composer explains why it can't send and links to
+ * uploading. When the backend turns `features.voice` off, the page is the plain transcript + composer.
  */
 
 import Link from "next/link";
@@ -14,6 +18,8 @@ import { MESSAGE_MAX_CHARS, errorMessage, type Chat, type Language, type Project
 import { useBackend, useDocumentTitle } from "@/lib/backend-context";
 import { useChatTurns } from "@/lib/chat-turns";
 import { LANGUAGE_NAMES } from "@/lib/format";
+import { wantsAutoStart } from "@/lib/voice/autostart";
+import { useVoiceSession } from "@/lib/voice/use-voice-session";
 import { isIngesting, keys, projectName, slotOf, useWorkspace, useWorkspaceActions } from "@/lib/workspace";
 
 import { useEntityActions } from "./Actions";
@@ -23,6 +29,7 @@ import { Menu } from "./Menu";
 import { LoadFailed } from "./States";
 import { useToast } from "./Toast";
 import { Transcript } from "./Transcript";
+import { VoiceChat } from "./voice/VoiceChat";
 
 export function ChatView({ chatId }: { chatId: string }) {
   const state = useWorkspace();
@@ -115,6 +122,89 @@ function ChatPage({ chat }: { chat: Chat }) {
   const { canAsk, blocked } = readiness(chat, docs);
   const language = LANGUAGES.includes(chat.language as Language) ? (chat.language as Language) : null;
 
+  // Voice first (docs §1, §3.9): the page opens in voice mode, the transcript is a panel (open when reopening a chat
+  // that has messages), and typing is a collapsed fallback. A new chat starts listening at once.
+  const { config } = useBackend();
+  const voiceEnabled = config?.features.voice !== false;
+  const { session, snapshot } = useVoiceSession(chat.id, language);
+  const [autoStart] = useState(() => wantsAutoStart(chat.id));
+  const [panelOpen, setPanelOpen] = useState(() => chat.message_count > 0);
+  const [typeOpen, setTypeOpen] = useState(false);
+
+  // Messages the voice session saves change the chat's count, activity and (later) title.
+  const savedByVoice = snapshot.messages.length;
+  useEffect(() => {
+    if (savedByVoice > 0) onSettled();
+  }, [savedByVoice, onSettled]);
+
+  // The backend turned voice off while the page was open (the public config was reloaded): let go of the microphone
+  // and the socket.
+  useEffect(() => {
+    if (!voiceEnabled) void session.stop();
+  }, [voiceEnabled, session]);
+
+  // After a dropped connection the voice service starts a new session, which never sent what the old one saved (an
+  // answer that was being given, the last question): read the end of the transcript again.
+  const resyncs = snapshot.resyncs;
+  const knownCount = useRef(chat.message_count);
+  useEffect(() => {
+    knownCount.current = chat.message_count;
+  }, [chat.message_count]);
+  useEffect(() => {
+    if (resyncs === 0) return;
+    const ctrl = new AbortController();
+    const seen = Math.max(knownCount.current, ...session.getSnapshot().messages.map((m) => m.seq));
+    // A little before the newest message we have: the server may have updated the last answers after we saw them
+    // (an answer cut when it shut down gets its `heard_text` after the fact).
+    api
+      .listMessages(chatId, { after: Math.max(0, seen - 3), limit: 50 }, ctrl.signal)
+      .then((page) => {
+        session.mergeMessages(page.items);
+        onSettled();
+      })
+      .catch(() => undefined); // the next save refreshes it anyway
+    return () => ctrl.abort();
+  }, [resyncs, api, chatId, session, onSettled]);
+
+  // What's being said right now but not saved yet, for the transcript.
+  const voiceTurn = snapshot.turn;
+  const voiceLive = useMemo(() => {
+    const speaking = snapshot.caption === "user" && !snapshot.userFinal && (snapshot.userSpeaking || snapshot.userText !== "");
+    const answering =
+      !!voiceTurn && !voiceTurn.message && voiceTurn.deltaText !== "" && (snapshot.audible || snapshot.serverState !== "listening");
+    return {
+      userText: speaking ? snapshot.userText : null,
+      agentText: answering ? voiceTurn.deltaText : null,
+      sources: voiceTurn?.sources ?? null,
+    };
+  }, [snapshot.caption, snapshot.userFinal, snapshot.userSpeaking, snapshot.userText, snapshot.audible, snapshot.serverState, voiceTurn]);
+
+  const transcript = (
+    <Transcript
+      chat={chat}
+      docsById={docsById}
+      turns={conversation.turns}
+      busy={conversation.busy}
+      onRetry={canAsk ? conversation.retry : undefined}
+      voiceMessages={snapshot.messages}
+      voice={voiceLive}
+    />
+  );
+  const composer = (
+    <Composer
+      busy={conversation.busy}
+      loading={docs === null}
+      blocked={blocked}
+      onSend={(text) => {
+        const sent = conversation.send(text, language);
+        if (sent) setPanelOpen(true); // the typed answer shows in the transcript
+        return sent;
+      }}
+      onStop={conversation.stop}
+      announcement={conversation.announcement}
+    />
+  );
+
   return (
     <div className="chat-page">
       <header className="chat-head">
@@ -166,21 +256,28 @@ function ChatPage({ chat }: { chat: Chat }) {
         </div>
       )}
 
-      <Transcript
-        chat={chat}
-        docsById={docsById}
-        turns={conversation.turns}
-        busy={conversation.busy}
-        onRetry={canAsk ? conversation.retry : undefined}
-      />
-      <Composer
-        busy={conversation.busy}
-        loading={docs === null}
-        blocked={blocked}
-        onSend={(text) => conversation.send(text, language)}
-        onStop={conversation.stop}
-        announcement={conversation.announcement}
-      />
+      {voiceEnabled ? (
+        <VoiceChat
+          chat={chat}
+          docsById={docsById}
+          session={session}
+          snapshot={snapshot}
+          autoStart={autoStart}
+          panelOpen={panelOpen}
+          onPanelOpenChange={setPanelOpen}
+          typeOpen={typeOpen}
+          onTypeOpenChange={setTypeOpen}
+          messageCount={chat.message_count + snapshot.messages.filter((m) => m.seq > chat.message_count).length}
+          transcript={transcript}
+          composer={composer}
+          language={language}
+        />
+      ) : (
+        <>
+          {transcript}
+          {composer}
+        </>
+      )}
     </div>
   );
 }

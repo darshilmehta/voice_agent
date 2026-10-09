@@ -188,6 +188,7 @@
 /* ------------------------------------------------------------------ transcript */
 
 .transcript {
+  position: relative; /* absolutely positioned bits inside (visually hidden text) belong to the scroller, not an ancestor */
   flex: 1;
   min-height: 0;
   overflow-y: auto;

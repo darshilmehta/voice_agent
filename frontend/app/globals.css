@@ -35,6 +35,10 @@
   --toast-bg: #262624;
   --toast-text: #f4f3ef;
   --toast-accent: #a9bfff;
+  /* voice mode (docs §3.8): the agent is cool, the user is warm */
+  --voice-agent: #3b5bdb;
+  --voice-user: #d9480f;
+  --voice-dim: #94938c;
   --radius: 12px;
   --shadow: 0 1px 2px rgb(0 0 0 / 4%), 0 1px 1px rgb(0 0 0 / 3%);
   --shadow-lg: 0 12px 32px rgb(0 0 0 / 12%), 0 2px 6px rgb(0 0 0 / 6%);
@@ -75,6 +79,9 @@
     --toast-bg: #ecebe7;
     --toast-text: #1d1d1b;
     --toast-accent: #2f5bd3;
+    --voice-agent: #8fb0ff;
+    --voice-user: #ff9a6b;
+    --voice-dim: #77766f;
     --shadow: none;
     --shadow-lg: 0 16px 40px rgb(0 0 0 / 55%), 0 0 0 1px #33322f;
     color-scheme: dark;

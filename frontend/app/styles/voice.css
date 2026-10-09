@@ -1,0 +1,471 @@
+/* Voice mode of the chat page (docs/DESIGN.md §3.8, §3.9): stage, captions, mic controls, transcript panel. */
+
+.vc {
+  --vc-dock: 150px; /* height of the controls area; set from the page so an overlaid transcript stops above it */
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden; /* nothing inside may grow the page */
+}
+
+/* ------------------------------------------------------------------ stage */
+
+.vc-stage {
+  position: relative;
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+/* The presence field: the canvas fills the stage above the controls; its far edge fades out under the captions. */
+.vc-field {
+  position: absolute;
+  inset: 0 0 var(--vc-dock) 0;
+  z-index: -1;
+  pointer-events: none;
+  -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 66%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 0%, #000 66%, transparent 100%);
+}
+
+.vc-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.vc-top {
+  position: absolute;
+  z-index: 2;
+  top: 12px;
+  right: 16px;
+}
+
+.vc-panel-toggle {
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+  backdrop-filter: blur(8px);
+}
+
+.vc-count {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.vc-display {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Where the rings are centred: empty, so the field is never under the captions. */
+.vc-slot {
+  flex: 1 1 auto;
+  min-height: 96px;
+}
+
+.vc-say {
+  flex: none;
+  padding: 0 20px 14px;
+}
+
+/* ------------------------------------------------------------------ captions */
+
+.vc-caption {
+  --cap: clamp(17px, 2.1vw, 22px);
+  display: flex;
+  flex-direction: column;
+  justify-content: safe center;
+  width: min(680px, 100%);
+  height: calc(var(--cap) * 1.45 * 3);
+  margin: 0 auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+  font-size: var(--cap);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 1.45;
+  text-align: center;
+}
+
+.vc-caption::-webkit-scrollbar {
+  display: none;
+}
+
+.vc-words {
+  text-wrap: balance;
+  overflow-wrap: anywhere;
+}
+
+.vc-w {
+  color: var(--voice-dim);
+  transition: color 120ms linear;
+}
+
+.vc-w.on {
+  color: var(--text);
+}
+
+.vc-w.pending {
+  opacity: 0.6;
+}
+
+.vc-caption.is-user .vc-w.on {
+  color: var(--voice-user);
+}
+
+.vc-caption-hint {
+  color: var(--text-muted);
+  font-size: 0.78em;
+  font-weight: 450;
+}
+
+.vc-sources {
+  display: flex;
+  justify-content: center;
+  min-height: 32px;
+  margin-top: 8px;
+}
+
+.vc-sources .cites {
+  justify-content: center;
+  margin: 0;
+}
+
+.vc-abstain {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+/* ------------------------------------------------------------------ dock: state, alerts, controls */
+
+.vc-dock {
+  flex: none;
+  padding: 0 16px 14px;
+}
+
+.vc-state {
+  min-height: 20px;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13.5px;
+  letter-spacing: 0.02em;
+  text-align: center;
+  transition: color 0.2s;
+}
+
+.vc-state[data-tone="speaking"] {
+  color: var(--voice-agent);
+}
+
+.vc-state[data-tone="interrupted"] {
+  color: var(--voice-user);
+}
+
+.vc-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: 560px;
+  margin: 8px auto 0;
+  padding: 8px 8px 8px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--bad);
+  border-radius: 10px;
+  background: var(--surface);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.vc-alert > span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.vc-alert > .btn {
+  flex: none;
+}
+
+.vc-alert-icon {
+  margin-top: 2px;
+  color: var(--bad);
+}
+
+.vc-notice {
+  border-left-color: var(--warn);
+}
+
+.vc-notice .vc-alert-icon {
+  color: var(--warn);
+}
+
+.vc-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  margin-top: 8px;
+}
+
+.vc-round {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--surface) 80%, transparent);
+  backdrop-filter: blur(10px);
+  color: var(--text);
+  transition:
+    background 0.15s,
+    border-color 0.15s,
+    color 0.15s,
+    transform 0.15s,
+    opacity 0.15s;
+}
+
+.vc-round:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--surface);
+  transform: translateY(-1px);
+}
+
+.vc-round:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.vc-round:disabled,
+.vc-round[aria-disabled="true"] {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.vc-round[aria-disabled="true"]:hover {
+  transform: none;
+}
+
+/* Waiting for the microphone or the connection: busy, not dimmed. */
+.vc-mic[aria-disabled="true"] {
+  opacity: 1;
+}
+
+.vc-round[aria-expanded="true"] {
+  border-color: var(--accent);
+  color: var(--accent-text);
+  background: var(--accent-soft);
+}
+
+.vc-mic {
+  width: 72px;
+  height: 72px;
+  border-color: var(--text);
+  background: var(--text);
+  color: var(--bg);
+}
+
+.vc-mic:hover:not(:disabled) {
+  background: var(--text);
+  border-color: var(--text);
+}
+
+.vc-mic:disabled {
+  opacity: 0.4;
+}
+
+/* In a conversation: warm, with a ring that breathes outward. */
+.vc-mic[data-live] {
+  border-color: var(--voice-user);
+  background: color-mix(in srgb, var(--voice-user) 16%, var(--surface));
+  color: var(--voice-user);
+}
+
+.vc-mic[data-live]:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--voice-user) 24%, var(--surface));
+  border-color: var(--voice-user);
+}
+
+.vc-mic[data-live]::after,
+.vc-mic[data-busy]::after {
+  content: "";
+  position: absolute;
+  inset: -7px;
+  border: 2px solid var(--voice-user);
+  border-radius: 50%;
+  opacity: 0;
+  pointer-events: none;
+  animation: vc-ring 2.4s ease-out infinite;
+}
+
+.vc-mic[data-busy]::after {
+  inset: -6px;
+  border-color: var(--voice-user) transparent transparent transparent;
+  opacity: 0.9;
+  animation: vc-spin 0.9s linear infinite;
+}
+
+@keyframes vc-ring {
+  0% {
+    opacity: 0.55;
+    transform: scale(0.94);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.22);
+  }
+}
+
+@keyframes vc-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.vc-hint {
+  min-height: 16px;
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.vc-type {
+  max-width: 640px;
+  margin: 6px auto 0;
+}
+
+.vc-type-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 4px 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.vc-type .composer {
+  padding: 0;
+  background: transparent;
+}
+
+.vc-type .composer-box,
+.vc-type .composer-foot {
+  max-width: none;
+}
+
+/* ------------------------------------------------------------------ transcript panel */
+
+.vc-panel {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  width: min(400px, 42%);
+  min-height: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.vc-panel[hidden] {
+  display: none;
+}
+
+.vc-panel-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px 8px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.vc-panel-head h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  outline: none;
+}
+
+.vc-panel-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.vc-panel .transcript-inner {
+  padding: 14px 14px 22px;
+}
+
+.vc-panel .msg {
+  max-width: 94%;
+}
+
+/* Not enough room beside the stage: the transcript covers it, down to the controls, which stay usable. */
+.vc[data-overlay] .vc-panel {
+  position: absolute;
+  z-index: 6;
+  inset: 0 0 var(--vc-dock) 0;
+  width: auto;
+  border-left: 0;
+  animation: fade-in 0.15s ease-out;
+}
+
+@media (max-width: 819.98px) {
+  .vc-top {
+    top: 8px;
+    right: 12px;
+  }
+
+  .vc-say {
+    padding: 0 14px 10px;
+  }
+
+  .vc-caption {
+    --cap: 18px;
+  }
+
+  .vc-dock {
+    padding: 0 12px 10px;
+  }
+
+  .vc-controls {
+    gap: 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vc-mic[data-live]::after {
+    animation: none;
+    opacity: 0.4;
+    transform: none;
+  }
+}

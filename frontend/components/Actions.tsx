@@ -11,6 +11,7 @@ import { createContext, useCallback, useContext, useMemo, useState, type FormEve
 
 import { errorMessage, type Chat, type Project, type ProjectDocument } from "@/lib/api";
 import { plural } from "@/lib/format";
+import { requestAutoStart } from "@/lib/voice/autostart";
 import { useWorkspace, useWorkspaceActions } from "@/lib/workspace";
 
 import { Dialog } from "./Dialog";
@@ -124,6 +125,8 @@ export function ActionsProvider({ children }: { children: ReactNode }) {
       setCreatingChatIn(projectId);
       try {
         const chat = await ws.createChat(projectId);
+        // A new chat opens in voice mode and asks for the microphone (docs §3.9).
+        requestAutoStart(chat.id);
         router.push(`/chats/${chat.id}`);
       } catch (err) {
         toast({ tone: "error", message: `Couldn't create a chat: ${errorMessage(err)}` });
