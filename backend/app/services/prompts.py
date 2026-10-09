@@ -486,8 +486,13 @@ def resume_text(language: Language, topic: str | None, filenames: Sequence[str])
     return with_topic.format(documents=documents, topic=said) if said else without.format(documents=documents)
 
 
-AckKind = Literal["ack", "thanks", "greeting", "language"]
+AckKind = Literal["ack", "thanks", "greeting", "language", "repeat"]
 ACK_TEXTS: dict[AckKind, dict[Language, str]] = {
+    # A transcript that looks garbled (quality round, item 8): asked again, never answered or "clarified".
+    "repeat": {
+        "en": "Sorry, I didn't catch that. Could you say it again?",
+        "hi": "माफ़ कीजिए, मैं ठीक से सुन नहीं पाया। क्या आप फिर से कह सकते हैं?",
+    },
     # After "okay" / "got it" / "theek hai" while the agent is idle: what ChatGPT's voice mode does, keep the floor
     # open in two words. (A backchannel *during* an answer never gets here: the voice session resumes playback.)
     "ack": {"en": "Anything else?", "hi": "और कुछ जानना है?"},
@@ -502,7 +507,7 @@ def ack_text(kind: AckKind, language: Language) -> str:
 
 
 # Saved (as an ``event`` message, nothing spoken) for turns that get no answer.
-SILENT_NOTICES = {"stop": "Stopped", "backchannel": "Acknowledged"}
+SILENT_NOTICES = {"stop": "Stopped", "backchannel": "Acknowledged", "clarification": "Not understood"}
 
 
 # ------------------------------------------------------------------ memory summary

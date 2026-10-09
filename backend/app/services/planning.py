@@ -23,6 +23,8 @@
       thanks / greeting (fast path), backchannel                             → no search, fixed short reply
       resume without a question                                              → no search, fixed text
       stop, or a backchannel right after "Anything else?"                    → nothing is said
+      a garbled voice transcript (fast path, ``RouteRequest.garbled``)        → "Sorry, I didn't catch that. Could
+                                                                               you say it again?"; nothing after one
       canvas_edit ("make that a bar chart", "हटा दो", §12.1)                  → no search, the edit, "Done."
       document search off for the chat → general answer saying so; no READY documents → abstain (mixed: general)
     route.visual (§12.1): "requested" / "suggest" from the user's words for document, mixed and correction turns
@@ -210,7 +212,13 @@ def policy(
     intent = route.intent
     mode, search = _MODES[intent]
     ack: AckKind | None = None
-    if intent == "backchannel":
+    if decision.reply == "repeat":  # a garbled transcript: "Sorry, I didn't catch that…", once (then nothing)
+        last = (req.last_answer.route or {}) if req.last_answer is not None else {}
+        mode, ack = (
+            ("silent" if last.get("answer") == "ack" and last.get("intent") == "clarification" else "ack"),
+            "repeat",
+        )
+    elif intent == "backchannel":
         last = req.last_answer
         if last is not None and (last.route or {}).get("answer") == "ack":
             mode = "silent"  # "okay" after "Anything else?": don't nag

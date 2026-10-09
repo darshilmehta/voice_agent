@@ -320,6 +320,7 @@ class Turn:
     length: AnswerLength = "short"
     input_language: Language | None = None  # the language the user spoke (STT); None: read from the text's script
     input_latency: dict[str, Any] | None = None  # saved as the user message's latency (voice: VAD and STT timings)
+    garbled: bool = False  # the transcript looks garbled (voice): the user is asked to say it again (item 8)
 
 
 # Why a voice answer was cut short: the user talked over it, pressed stop, or the session ended (client gone, replaced
@@ -555,13 +556,15 @@ class ChatTurnService:
         length: AnswerLength = "short",
         input_language: Language | None = None,
         input_latency: dict[str, Any] | None = None,
+        garbled: bool = False,
     ) -> Turn:
         """Check the chat and the message before any event is produced (unknown chat → NotFound, bad text →
         InvalidInput). The answer language follows ``services/language.py``: a language the user asks for (now or
         earlier in the chat), ``language`` when the caller forces one, else the language of the message (the spoken
         one for voice), else the previous answer's. ``modality`` is recorded on both messages; ``length`` sets the
         answer style and token cap. Voice turns pass the spoken language (``input_language``, saved on the user
-        message) and the STT timings (``input_latency``)."""
+        message), the STT timings (``input_latency``) and whether the transcript looks garbled (``garbled``: the
+        user is asked to say it again, nothing is answered)."""
         chat = await self.chats.get(chat_id)
         text = text.strip()
         if not text:
@@ -579,7 +582,7 @@ class ChatTurnService:
             preferred=state.preferred_language,
             fallback=self._fallback_language(chat, state),
         )
-        return Turn(chat, text, decision.language, language, modality, length, input_language, input_latency)
+        return Turn(chat, text, decision.language, language, modality, length, input_language, input_latency, garbled)
 
     def _fallback_language(self, chat: Chat, state: ConversationState) -> Language:
         if state.response_language is not None:
@@ -746,6 +749,7 @@ class ChatTurnService:
             interrupted_answer(history),
             available_tools=self.available_tools(),
             enabled_tools=self.enabled_tools(),
+            garbled=turn.garbled,
         )
         request = await self._with_screen(chat.id, request, p)
         plan = p.plan = await self.planner.plan(

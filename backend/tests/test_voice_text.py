@@ -11,8 +11,10 @@ from app.services.voice.speech_text import (
     is_acknowledgement,
     is_backchannel,
     is_filler,
+    looks_garbled,
     real_words,
     spoken_text,
+    transcript_garbled,
 )
 
 
@@ -253,3 +255,62 @@ def test_a_marker_opening_a_chunk_mid_sentence_is_said_in_lower_case():
         "rose 0.3% today.",
         "A web source adds that it closed higher.",
     ]
+
+
+# ------------------------------------------------------------------ garbled transcripts (quality round, item 8)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [  # from the real run, with a film playing
+        "आब आब आब आब आब आब आब आब आब आब आब आब",
+        "It just takes 1 profit from only 1 army... Which most likely means 1 profit from only 1 army... "
+        "Just 1 employee sign here... Just 1 employee sign here... Just 1 employee sign here...",
+        "अप बवबवववववववववववववववव",
+        "आश़््गें। आश़््गें।",
+        "यह सब पड़़ा। शावन बढ़ लेरा है। उतो चण दिखे तुछु। तुछु। तुछु। तुछु। तुछु।",
+        "Let's start with thank you and what I want to wish always away my understandgradeelle걱",
+        "Is used by runsTAIC traffic",
+        "Our highlight by recording these songs for its меня dollars series",
+    ],
+)
+def test_garbled_transcripts(text):
+    assert looks_garbled(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "What was the EBITDA margin in FY24?",
+        "No no no, I meant FY23",
+        "okay okay okay",
+        "Mm-hmm.",
+        "FY24 में EBITDA margin क्या था?",
+        "वालमोरा की FY24 की तिमाही आय का चार्ट दिखाओ",
+        "कृपया बताएं कि पिछले साल कंपनी का शुद्ध लाभ कितना था?",
+        "What is the hotel limit for our L3 employee in a tier 1 city?",
+        "What's the café's revenue?",
+        "इसे टेबल में दिखाओ",
+        "What is the profit that Wilmura made in FY24?",  # misheard, but speech: answered (item 10)
+    ],
+)
+def test_ordinary_speech_is_not_garbled(text):
+    assert not looks_garbled(text)
+
+
+class _Transcript:
+    def __init__(self, text: str, **fields: float) -> None:
+        self.text = text
+        self.__dict__.update(fields)
+
+
+def test_the_recognizers_confidence_counts_when_it_reports_one():
+    question = "What was the EBITDA margin in FY24?"
+    assert not transcript_garbled(_Transcript(question))  # no confidence fields: the text decides
+    assert not transcript_garbled(_Transcript(question, avg_logprob=-0.4, no_speech_prob=0.1))
+    assert transcript_garbled(_Transcript(question, avg_logprob=-1.4))
+    assert transcript_garbled(_Transcript(question, avg_logprob=-1.1, no_speech_prob=0.8))  # Whisper's "silence"
+    assert not transcript_garbled(_Transcript(question, avg_logprob=-1.1, no_speech_prob=0.2))
+    assert transcript_garbled(_Transcript(question, compression_ratio=3.1))  # a repetition loop
+    assert transcript_garbled(_Transcript(question, confidence=0.2))
+    assert transcript_garbled(_Transcript("आब आब आब आब आब आब", avg_logprob=-0.2))

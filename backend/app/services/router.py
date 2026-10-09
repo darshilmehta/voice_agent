@@ -67,7 +67,7 @@ TOPIC_MAX = 60
 # Route confidence by how it was decided (the model's own confidence isn't calibrated, and costs output tokens).
 CONFIDENCE = {"stop": 0.95, "heuristic": 0.9, "llm": 0.8, "llm_overridden": 0.6, "fallback": 0.0}
 
-ReplyKind = Literal["thanks", "greeting", "language"]
+ReplyKind = Literal["thanks", "greeting", "language", "repeat"]
 
 # ------------------------------------------------------------------ text helpers
 
@@ -403,6 +403,9 @@ class RouteRequest:
     # The chat's canvas as a few lines (services/canvas/conversation.screen_lines, §12.1): kinds, titles, x and series
     # labels, what the utterance points at; empty when nothing is on screen.
     screen: Sequence[str] = ()
+    # The transcript looks garbled (voice: speech recognition's confidence, or nonsense; services/voice/speech_text):
+    # the user is asked to say it again, nothing is answered (quality round, item 8).
+    garbled: bool = False
 
     def live_cue(self, *texts: str | None) -> str | None:
         """The live-data cue of the utterance, else of the given texts (its standalone question), or None."""
@@ -550,6 +553,10 @@ _ANSWERED = frozenset({"grounded", "mixed", "general"})
 def fast_route(req: RouteRequest) -> RouteDecision | None:
     """A route without the model, or None. Conservative: only turns whose type is unmistakable."""
     n = normalize(req.utterance)
+    if req.garbled and n not in STOP_PHRASES:  # misheard: neither answered nor "clarified" (item 8)
+        route = _route(req, "clarification", confidence=CONFIDENCE["heuristic"])
+        overrides = ("garbled transcript: asked to say it again",)
+        return RouteDecision(route, "heuristic", overrides=overrides, reply="repeat")
     if n in STOP_PHRASES:
         return RouteDecision(_route(req, "stop", confidence=CONFIDENCE["stop"]), "heuristic")
     if canvas_edit(req) is not None:  # "make that a bar chart", "हटा दो", "pin this" (§12.1)
