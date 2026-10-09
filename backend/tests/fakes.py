@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -469,15 +469,18 @@ class FakeSTT(SpeechRecognizer):
 
     def __init__(self) -> None:
         self.scripts: dict[int, str | Callable[[float], str]] = {}  # a callable gets the audio's length in ms
+        self.confidence: dict[int, dict[str, float]] = {}  # tone → Whisper's confidence fields (avg_logprob, …)
         self.calls: list[dict[str, Any]] = []
         self.cancelled = 0  # transcriptions cancelled while running (stale speculative jobs)
         self.fail_with: Exception | None = None
         self.delay = 0.0
 
-    async def transcribe(self, pcm16k: np.ndarray, languages: Sequence[str]) -> Transcript:  # type: ignore[override]
+    async def transcribe(  # type: ignore[override]
+        self, pcm16k: np.ndarray, languages: Sequence[str], *, prompts: Mapping[str, str] | None = None
+    ) -> Transcript:
         tone = round(float(np.abs(pcm16k).max()) * 100) if pcm16k.size else 0
         ms = len(pcm16k) * 1000 / IN_RATE
-        self.calls.append({"tone": tone, "ms": ms, "languages": list(languages)})
+        self.calls.append({"tone": tone, "ms": ms, "languages": list(languages), "prompts": prompts})
         if self.delay:
             try:
                 await asyncio.sleep(self.delay)
@@ -489,7 +492,7 @@ class FakeSTT(SpeechRecognizer):
         script = self.scripts.get(tone, "")
         text = script(ms) if callable(script) else script
         language = languages[0] if len(languages) == 1 else (message_language(text) or "en")
-        return Transcript(text, language)  # type: ignore[arg-type]
+        return Transcript(text, language, **self.confidence.get(tone, {}))  # type: ignore[arg-type]
 
 
 class FakeTTS(SpeechSynthesizer):

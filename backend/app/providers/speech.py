@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from ..settings import Language, STTSection, TTSSection, VADSection
 
 SAMPLE_RATE = 16_000  # microphone audio: PCM mono 16 kHz (what Silero and Whisper take)
+MLX_CACHE_LIMIT_BYTES = 256 * 2**20  # MLX's buffer cache (mlx-whisper is the process's only MLX user), §8
 VAD_FRAME_SAMPLES = 512  # 32 ms: the window Silero v5 expects at 16 kHz
 KOKORO_SAMPLE_RATE = 24_000
 
@@ -165,24 +166,110 @@ class _SileroStream:
 
 @dataclass(frozen=True, slots=True)
 class Transcript:
+    """One transcribed utterance. The confidence fields are Whisper's own, None when the recognizer can't tell or
+    nothing was decoded: ``avg_logprob``, the mean log probability of the decoded tokens; ``no_speech_prob``, the
+    probability that the audio held no speech; ``compression_ratio``, the text's gzip ratio (a repetition loop is
+    above 2.4). ``voice/speech_text.transcript_garbled`` reads them to ask the user to say it again. Measured on the
+    synthetic clips (§9.3): clear questions -0.05 to -0.5, Hindi -0.2 to -0.6, garbled or wrong-language transcripts
+    -0.7 to -1.0."""
+
     text: str
     language: Language  # spoken language: detected among the allowed ones, or the only one allowed
     language_probability: float | None = None  # None when the language was given, not detected
+    avg_logprob: float | None = None
+    no_speech_prob: float | None = None
+    compression_ratio: float | None = None
+    prompted: bool = False  # decoded with a vocabulary prompt (the chat's names and terms)
+
+
+NO_SPEECH_MAX = 0.6  # Whisper's own no-speech threshold
+
+# Whisper conditions on at most 223 prompt tokens (half its 448-token text context); a vocabulary prompt longer than
+# this is cut by the model from its start. Callers keep prompts well under it (it is also decoding time).
+PROMPT_MAX_TOKENS = 223
+
+TranscriptionPrompts = Mapping[str, str]  # language → vocabulary prompt (the chat's names and terms, §9.3)
 
 
 class SpeechRecognizer(Provider):
     capability = "stt"
 
-    async def transcribe(self, pcm16k: np.ndarray, languages: Sequence[Language]) -> Transcript:
+    async def transcribe(
+        self, pcm16k: np.ndarray, languages: Sequence[Language], *, prompts: TranscriptionPrompts | None = None
+    ) -> Transcript:
         """Transcribe one utterance: float32 mono PCM at 16 kHz. ``languages`` restricts language detection (one
-        language: no detection)."""
+        language: no detection). ``prompts``: a vocabulary prompt per language (names and terms the speaker may use);
+        the one for the spoken language, once known, biases the decoding toward those spellings."""
         raise NotImplementedError(f"{type(self).__name__}.transcribe")
+
+    def count_tokens(self, text: str) -> int | None:
+        """How many tokens the recognizer's tokenizer makes of ``text`` (None: unknown). A word the model knows well
+        is one token; a name it has never seen is several, which is what a vocabulary prompt should carry."""
+        return None
 
 
 def pick_language(probabilities: Mapping[str, float], languages: Sequence[Language]) -> tuple[Language, float]:
     """The most probable of the allowed languages."""
     best = max(languages, key=lambda lang: probabilities.get(lang, 0.0))
     return best, float(probabilities.get(best, 0.0))
+
+
+def segment_confidence(segments: Sequence[Mapping[str, Any]]) -> tuple[float | None, float | None, float | None]:
+    """(mean token log probability, highest no-speech probability, highest compression ratio) over decoded segments
+    (dicts with ``avg_logprob``, ``no_speech_prob``, ``compression_ratio`` and ``tokens``); Nones without segments."""
+    weighted, count = 0.0, 0
+    no_speech: float | None = None
+    compression: float | None = None
+    for s in segments:
+        logprob = s.get("avg_logprob")
+        n = max(1, len(s.get("tokens") or ()))
+        if logprob is not None:
+            weighted, count = weighted + float(logprob) * n, count + n
+        if (p := s.get("no_speech_prob")) is not None:
+            no_speech = float(p) if no_speech is None else max(no_speech, float(p))
+        if (r := s.get("compression_ratio")) is not None:
+            compression = float(r) if compression is None else max(compression, float(r))
+    return (weighted / count if count else None), no_speech, compression
+
+
+def _squash(text: str) -> str:
+    return " ".join("".join(ch if ch.isalnum() else " " for ch in text.casefold()).split())
+
+
+def echoes_prompt(text: str, prompt: str | None) -> bool:
+    """The transcript only repeats (part of) the prompt: Whisper's known failure on near-silence when prompted
+    ("Valmora Industries, Zephyra Logistics" for a breath)."""
+    if not prompt:
+        return False
+    words = _squash(text)
+    return len(words.split()) >= 2 and words in _squash(prompt)
+
+
+# A prompted decode is one greedy pass, its length capped by the audio's: a prompt can tip Whisper into a repetition
+# loop ("ॐ ॐ ॐ …" to the 224-token limit, measured on Hindi clips), and its own temperature fallback then re-decoded
+# it up to five times (3.9-5.8 s instead of 0.5 s). Loops, and other unreliable prompted decodes, are decoded again
+# without the prompt, exactly as an unprompted transcription (fallback included).
+PROMPTED_TOKENS_BASE = 16
+PROMPTED_TOKENS_PER_S = 30  # Devanagari costs ~1.3 tokens per letter: fast Hindi speech is ~20 tokens/s
+COMPRESSION_RATIO_MAX = 2.4  # Whisper's own threshold for a looping decode
+LOGPROB_MIN = -1.0  # Whisper's own threshold for a failed decode
+
+
+def prompted_token_cap(samples: int) -> int:
+    return min(PROMPT_MAX_TOKENS, PROMPTED_TOKENS_BASE + int(PROMPTED_TOKENS_PER_S * samples / SAMPLE_RATE))
+
+
+def prompted_decode_failed(text: str, segments: Sequence[Mapping[str, Any]], prompt: str) -> bool:
+    """The prompted decode can't be trusted: it echoes the prompt, loops, decoded poorly, or came from audio Whisper
+    thinks held no speech (with a prompt Whisper turns noise into "Thank you." where it otherwise says nothing)."""
+    if echoes_prompt(text, prompt):
+        return True
+    logprob, no_speech, compression = segment_confidence(segments)
+    if compression is not None and compression > COMPRESSION_RATIO_MAX:
+        return True
+    if logprob is not None and logprob < LOGPROB_MIN:
+        return True
+    return no_speech is not None and no_speech > NO_SPEECH_MAX
 
 
 class _Whisper(SpeechRecognizer, LazyModelProvider):
@@ -192,24 +279,48 @@ class _Whisper(SpeechRecognizer, LazyModelProvider):
     def cfg(self) -> STTSection:
         return self.config  # type: ignore[return-value]
 
-    async def transcribe(self, pcm16k: np.ndarray, languages: Sequence[Language]) -> Transcript:
+    async def transcribe(
+        self, pcm16k: np.ndarray, languages: Sequence[Language], *, prompts: TranscriptionPrompts | None = None
+    ) -> Transcript:
         allowed = list(dict.fromkeys(languages or self.cfg.languages))
         if not allowed:
             raise ValueError("no language allowed for transcription")
         audio = np.ascontiguousarray(pcm16k, dtype=np.float32).reshape(-1)
         if audio.size == 0:
             return Transcript("", allowed[0])
-        return await self._run(self._transcribe_sync, audio, allowed)
+        return await self._run(self._transcribe_sync, audio, allowed, dict(prompts or {}))
 
-    def _transcribe_sync(self, audio: np.ndarray, languages: list[Language]) -> Transcript:
+    def _transcribe_sync(self, audio: np.ndarray, languages: list[Language], prompts: dict[str, str]) -> Transcript:
         with self._lock:
-            return self._transcribe_locked(self._model_locked(), audio, languages)
+            model = self._model_locked()
+            language, probability = self._language_locked(model, audio, languages)
+            prompt = (prompts.get(language) or "").strip() or None
+            if prompt is not None:
+                text, segments = self._decode_locked(model, audio, language, prompt)
+                if prompted_decode_failed(text, segments, prompt):
+                    prompt = None
+            if prompt is None:
+                text, segments = self._decode_locked(model, audio, language, None)
+            logprob, no_speech, compression = segment_confidence(segments)
+            return Transcript(text, language, probability, logprob, no_speech, compression, prompt is not None)
 
-    def _transcribe_locked(self, model: Any, audio: np.ndarray, languages: list[Language]) -> Transcript:
+    def _language_locked(
+        self, model: Any, audio: np.ndarray, languages: list[Language]
+    ) -> tuple[Language, float | None]:
+        """The spoken language among ``languages`` (no detection for one) and its probability (None if given)."""
+        raise NotImplementedError
+
+    def _decode_locked(
+        self, model: Any, audio: np.ndarray, language: Language, prompt: str | None
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """(text, segments as dicts with avg_logprob, no_speech_prob, compression_ratio, tokens). With a prompt: one
+        greedy pass of at most ``prompted_token_cap`` tokens; without: Whisper's usual decode (temperature fallback)."""
         raise NotImplementedError
 
     def _warm(self, model: Any) -> None:
-        self._transcribe_locked(model, np.zeros(SAMPLE_RATE, dtype=np.float32), list(self.cfg.languages))
+        silence = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        language, _ = self._language_locked(model, silence, list(self.cfg.languages))
+        self._decode_locked(model, silence, language, None)
 
 
 @register
@@ -227,6 +338,14 @@ class MlxWhisper(_Whisper):
     def extra_problems(self) -> list[str]:
         return [] if models.APPLE_SILICON else ["mlx-whisper runs only on Apple Silicon; use faster_whisper elsewhere"]
 
+    def count_tokens(self, text: str) -> int | None:
+        try:  # Whisper's multilingual BPE (tiktoken, bundled with mlx-whisper): no model needed
+            from mlx_whisper.tokenizer import get_tokenizer
+
+            return len(get_tokenizer(multilingual=True).encode(text))
+        except Exception:
+            return None
+
     async def _run[T](self, fn: Any, *args: Any) -> T:
         if self._executor is None:
             self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx-whisper")
@@ -237,21 +356,32 @@ class MlxWhisper(_Whisper):
         from mlx_whisper.transcribe import ModelHolder
 
         self._path = str(snapshot)
+        # MLX keeps freed Metal buffers for reuse, without limit by default: 751 MiB after the first transcriptions
+        # beside the 462 MiB model (measured). Capped, a transcription re-allocates some of them (+17 ms p50).
+        mx.set_cache_limit(MLX_CACHE_LIMIT_BYTES)
         # transcribe() looks the model up in this holder by path: loading through it keeps a single copy in memory.
         return ModelHolder.get_model(self._path, mx.float16)
 
-    def _transcribe_locked(self, model: Any, audio: np.ndarray, languages: list[Language]) -> Transcript:
+    def _language_locked(
+        self, model: Any, audio: np.ndarray, languages: list[Language]
+    ) -> tuple[Language, float | None]:
         import mlx.core as mx
-        import mlx_whisper
         from mlx_whisper.audio import N_FRAMES, N_SAMPLES, log_mel_spectrogram, pad_or_trim
 
-        probability: float | None = None
         if len(languages) == 1:
-            language = languages[0]
-        else:
-            mel = log_mel_spectrogram(audio, n_mels=model.dims.n_mels, padding=N_SAMPLES)
-            _, probs = model.detect_language(pad_or_trim(mel, N_FRAMES, axis=-2).astype(mx.float16))
-            language, probability = pick_language(probs, languages)
+            return languages[0], None
+        mel = log_mel_spectrogram(audio, n_mels=model.dims.n_mels, padding=N_SAMPLES)
+        _, probs = model.detect_language(pad_or_trim(mel, N_FRAMES, axis=-2).astype(mx.float16))
+        return pick_language(probs, languages)
+
+    def _decode_locked(
+        self, model: Any, audio: np.ndarray, language: Language, prompt: str | None
+    ) -> tuple[str, list[dict[str, Any]]]:
+        import mlx_whisper
+
+        prompted: dict[str, Any] = {}
+        if prompt is not None:
+            prompted = {"initial_prompt": prompt, "temperature": 0.0, "sample_len": prompted_token_cap(audio.size)}
         result = mlx_whisper.transcribe(
             audio,
             path_or_hf_repo=self._path,
@@ -259,8 +389,9 @@ class MlxWhisper(_Whisper):
             fp16=True,
             verbose=None,
             condition_on_previous_text=False,
+            **prompted,
         )
-        return Transcript(str(result.get("text", "")).strip(), language, probability)
+        return str(result.get("text", "")).strip(), list(result.get("segments") or [])
 
     def _release(self, model: Any) -> None:
         from mlx_whisper.transcribe import ModelHolder
@@ -287,8 +418,22 @@ class FasterWhisper(_Whisper):
     name = "faster_whisper"
     required_modules = ("faster_whisper",)
 
+    def __init__(self, config: BaseModel, ctx: ProviderContext) -> None:
+        super().__init__(config, ctx)
+        self._tokenizer: Any = None
+
     def extra_problems(self) -> list[str]:
         return [] if self.cfg.device in ("cpu", "cuda") else [f"device {self.cfg.device!r}: use cpu or cuda"]
+
+    def count_tokens(self, text: str) -> int | None:
+        try:  # the model's own tokenizer.json, without loading the model
+            if self._tokenizer is None:
+                from tokenizers import Tokenizer
+
+                self._tokenizer = Tokenizer.from_file(str(self.snapshot_path() / "tokenizer.json"))
+            return len(self._tokenizer.encode(text, add_special_tokens=False).ids)
+        except Exception:
+            return None
 
     def _load(self, snapshot: Path) -> Any:
         from faster_whisper import WhisperModel
@@ -298,18 +443,34 @@ class FasterWhisper(_Whisper):
             str(snapshot), device=cfg.device, compute_type=cfg.compute_type or "default", local_files_only=True
         )
 
-    def _transcribe_locked(self, model: Any, audio: np.ndarray, languages: list[Language]) -> Transcript:
-        probability: float | None = None
+    def _language_locked(
+        self, model: Any, audio: np.ndarray, languages: list[Language]
+    ) -> tuple[Language, float | None]:
         if len(languages) == 1:
-            language = languages[0]
-        else:
-            _, _, all_probs = model.detect_language(audio)
-            language, probability = pick_language(dict(all_probs), languages)
+            return languages[0], None
+        _, _, all_probs = model.detect_language(audio)
+        return pick_language(dict(all_probs), languages)
+
+    def _decode_locked(
+        self, model: Any, audio: np.ndarray, language: Language, prompt: str | None
+    ) -> tuple[str, list[dict[str, Any]]]:
+        prompted: dict[str, Any] = {}
+        if prompt is not None:
+            prompted = {"initial_prompt": prompt, "temperature": 0.0, "max_new_tokens": prompted_token_cap(audio.size)}
         segments, _ = model.transcribe(
-            audio, language=language, beam_size=1, condition_on_previous_text=False, vad_filter=False
+            audio, language=language, beam_size=1, condition_on_previous_text=False, vad_filter=False, **prompted
         )
-        text = "".join(s.text for s in segments).strip()  # segments is lazy: decoding happens here
-        return Transcript(text, language, probability)
+        decoded = [  # segments is lazy: decoding happens here
+            {
+                "text": s.text,
+                "avg_logprob": s.avg_logprob,
+                "no_speech_prob": s.no_speech_prob,
+                "compression_ratio": s.compression_ratio,
+                "tokens": s.tokens,
+            }
+            for s in segments
+        ]
+        return "".join(s["text"] for s in decoded).strip(), decoded
 
 
 # ------------------------------------------------------------------ TTS

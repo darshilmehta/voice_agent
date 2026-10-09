@@ -54,7 +54,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
@@ -131,6 +131,7 @@ from .turn_taking import (
     Verdict,
     barge_in_verdict,
 )
+from .vocabulary import SpeechHints, SpeechVocabulary, speech_vocabulary
 
 if TYPE_CHECKING:
     from ..canvas.service import CanvasService
@@ -268,6 +269,7 @@ class VoiceSession:
         stt: SpeechRecognizer,
         tts: SpeechSynthesizer,
         settings: Settings,
+        vocabulary: SpeechVocabulary | None = None,
     ) -> None:
         self.id = new_id("vsn")
         self.chat = chat
@@ -309,10 +311,20 @@ class VoiceSession:
         self._state: AgentState | None = None
         self._errors_sent: dict[str, float] = {}
         self._tails: set[Language] = set()  # languages whose visual tail is synthesized (or being)
+        # The chat's names and terms for the recognizer (§9.3): refreshed in the background, never awaited by STT.
+        self._vocabulary = vocabulary
+        self._hints: SpeechHints | None = vocabulary.cached(chat.id) if vocabulary is not None else None
+        self._hints_task: asyncio.Task[None] | None = None
 
     @classmethod
     def from_container(
-        cls, chat: Chat, transport: Transport, container: Container, *, canvas: CanvasService | None = None
+        cls,
+        chat: Chat,
+        transport: Transport,
+        container: Container,
+        *,
+        canvas: CanvasService | None = None,
+        vocabulary: SpeechVocabulary | None = None,
     ) -> VoiceSession:
         db, vad, stt, tts = (container[c] for c in ("metadata_db", "vad", "stt", "tts"))
         if not (
@@ -331,6 +343,7 @@ class VoiceSession:
             stt=stt,
             tts=tts,
             settings=container.settings,
+            vocabulary=vocabulary,
         )
 
     # -------------------------------------------------------------- lifecycle
@@ -495,6 +508,7 @@ class VoiceSession:
                         "language": language,
                     }
                 )
+                self._refresh_hints()
                 await self._resend_state()
             case BargeInStart():
                 await self._on_barge_in_start(message)
@@ -584,14 +598,38 @@ class VoiceSession:
             self._speculative.cancel()
             self._speculative = None
 
-    async def _transcribe(self, audio: np.ndarray, *, report: bool) -> Transcript | None:
+    async def _transcribe(self, audio: np.ndarray, *, report: bool, hinted: bool = True) -> Transcript | None:
+        """``hinted``: with the chat's vocabulary (prompt, and near-miss names corrected); the barge-in checks go
+        without, they only need to know whether real words were said."""
+        hints = self._hints if hinted else None
         try:
-            return await self.stt.transcribe(audio, self._languages())
+            if hints is not None and hints.prompts:
+                transcript = await self.stt.transcribe(audio, self._languages(), prompts=hints.prompts)
+            else:
+                transcript = await self.stt.transcribe(audio, self._languages())
         except Exception as e:
             log.warning("voice session %s: transcription failed: %s", self.id, _describe(e))
             if report:
                 await self._error("stt", f"transcription failed: {_describe(e)}")
             return None
+        if hints is not None and (text := hints.correct(transcript.text)) != transcript.text:
+            log.info("voice session %s: transcript names corrected: %r → %r", self.id, transcript.text, text)
+            transcript = replace(transcript, text=text)
+        return transcript
+
+    def _refresh_hints(self) -> None:
+        """Bring the chat's speech hints up to date in the background (rebuilt only when its documents changed)."""
+        vocabulary = self._vocabulary
+        if vocabulary is None or (self._hints_task is not None and not self._hints_task.done()):
+            return
+
+        async def refresh() -> None:
+            try:
+                self._hints = await vocabulary.hints(self.chat)
+            except Exception as e:  # transcription goes on with the hints it has (or none)
+                log.warning("voice session %s: speech vocabulary unavailable: %s", self.id, _describe(e))
+
+        self._hints_task = self._spawn(refresh(), f"{self.id}-vocabulary")
 
     async def _speculate(self, audio: np.ndarray) -> Transcript | None:
         """Transcribe the utterance during the end-of-turn silence (§9.4); also evidence for a pending barge-in."""
@@ -742,6 +780,7 @@ class VoiceSession:
         self._turn = agent
         await self._set_state("thinking")
         agent.task = self._spawn(self._run_turn(agent), f"{self.id}-turn-{agent.id}")
+        self._refresh_hints()  # a document that became READY since: its names for the next utterance
 
     # -------------------------------------------------------------- the answer
 
@@ -968,22 +1007,22 @@ class VoiceSession:
         """Synthesize chunks in order and send each: ``audio_chunk``, then its frames, one send-lock acquisition per
         frame (control messages and speech events aren't held up behind a whole chunk)."""
         while (text := await queue.get()) is not None:
-            if agent.tts_failed or agent.cut:
-                continue  # the text is still shown; one error per turn is enough
-            agent.tts_busy = True
-            try:
+            for piece in synthesis_pieces(text):  # a long sentence in clauses: its first words are heard sooner
+                if agent.tts_failed or agent.cut:
+                    break  # the text is still shown; one error per turn is enough
+                agent.tts_busy = True
                 try:
-                    pcm = await self.tts.synthesize(text, self._voice_for(agent, text))
-                except Exception as e:
-                    agent.tts_failed = True
-                    log.warning("voice session %s: speech synthesis failed: %s", self.id, _describe(e))
-                    await self._send_for(
-                        agent, {"type": "error", "detail": f"speech synthesis failed: {_describe(e)}", "stage": "tts"}
-                    )
-                    continue
-                await self._send_chunk(agent, text, pcm)
-            finally:
-                agent.tts_busy = False
+                    try:
+                        pcm = await self.tts.synthesize(piece, self._voice_for(agent, piece))
+                    except Exception as e:
+                        agent.tts_failed = True
+                        log.warning("voice session %s: speech synthesis failed: %s", self.id, _describe(e))
+                        detail = f"speech synthesis failed: {_describe(e)}"
+                        await self._send_for(agent, {"type": "error", "detail": detail, "stage": "tts"})
+                        break
+                    await self._send_chunk(agent, piece, pcm)
+                finally:
+                    agent.tts_busy = False
 
     @staticmethod
     def _voice_for(agent: AgentTurn, text: str) -> Language:
@@ -1266,7 +1305,7 @@ class VoiceSession:
 
     async def _barge_in_transcript(self, pending: PendingBargeIn, audio: np.ndarray) -> None:
         try:
-            transcript = await self._transcribe(audio, report=False)
+            transcript = await self._transcribe(audio, report=False, hinted=False)
         finally:
             pending.transcribing -= 1
         if self._pending is not pending:
@@ -1344,7 +1383,7 @@ class VoiceSession:
         watch.stt = self._spawn(self._watch_transcript(watch, ep.snapshot()), f"{self.id}-watch-stt")
 
     async def _watch_transcript(self, watch: SpeechWatch, audio: np.ndarray) -> None:
-        transcript = await self._transcribe(audio, report=False)
+        transcript = await self._transcribe(audio, report=False, hinted=False)
         agent = watch.agent
         if transcript is None or not transcript.text or self._turn is not agent or agent.interrupted:
             return
@@ -1404,6 +1443,32 @@ def _said_the_chart(agent: AgentTurn) -> bool:
     return any(_NAMES_THE_CHART.search(c.text) for c in agent.chunks if not c.filler)
 
 
+SPLIT_MIN_WORDS = 12  # a chunk this long is synthesized in clauses
+SPLIT_MIN_PART = 4  # ... none shorter than this
+_CLAUSE_CUT = re.compile(r"[,;:](?=\s)")  # "4,210" and "18.2%" never split
+
+
+def synthesis_pieces(text: str) -> list[str]:
+    """``text`` cut at clause boundaries into pieces of at least ``SPLIT_MIN_PART`` words, when it has
+    ``SPLIT_MIN_WORDS`` or more: each piece is synthesized and sent as its own chunk, so the first is heard while the
+    rest is synthesized (measured: Kokoro takes ~2.8 s on the CPU for a 20-word sentence, ~0.2 s per 5 words). A cut
+    goes to the boundary nearest the middle; each part is cut again if still long."""
+    words = text.split()
+    if len(words) < SPLIT_MIN_WORDS:
+        return [text]
+    best: tuple[float, int] | None = None
+    for m in _CLAUSE_CUT.finditer(text):
+        before = len(text[: m.end()].split())
+        if before >= SPLIT_MIN_PART and len(words) - before >= SPLIT_MIN_PART:
+            score = abs(before - len(words) / 2)
+            if best is None or score < best[0]:
+                best = (score, m.end())
+    if best is None:
+        return [text]
+    head, tail = text[: best[1]].strip(), text[best[1] :].strip()
+    return [*synthesis_pieces(head), *synthesis_pieces(tail)]
+
+
 def _answer_end_ms(agent: AgentTurn) -> float:
     """Where the answer's audio ends in the turn's audio: the visual's tail, if any, comes after it (§12.1)."""
     return agent.answer_ms if agent.answer_ms is not None else agent.sent_ms
@@ -1428,6 +1493,7 @@ class VoiceSessions:
     def __init__(self, container: Container, *, canvas: CanvasService | None = None) -> None:
         self.container = container
         self.canvas = canvas
+        self.vocabulary = speech_vocabulary(container)  # shared: a chat's hints outlive a reconnect
         self._sessions: dict[str, VoiceSession] = {}
         self._lock = asyncio.Lock()
 
@@ -1442,7 +1508,9 @@ class VoiceSessions:
         chat = await ChatService(db).get(chat_id)
         async with self._lock:
             previous = self._sessions.get(chat_id)
-            session = VoiceSession.from_container(chat, transport, self.container, canvas=self.canvas)
+            session = VoiceSession.from_container(
+                chat, transport, self.container, canvas=self.canvas, vocabulary=self.vocabulary
+            )
             self._sessions[chat_id] = session
         if previous is not None:
             previous.close(CLOSE_REPLACED, "another voice session was opened for this chat")
