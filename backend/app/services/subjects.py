@@ -18,6 +18,7 @@ rest: it keeps the passages that are about the named documents, or declines when
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -229,8 +230,86 @@ def misheard_names(texts: Sequence[str | None], labels: Mapping[str, str]) -> di
     return out
 
 
+# ------------------------------------------------------------------ misheard words (last round, item 1)
+
+# Devanagari consonants by how they sound to a recognizer that confuses aspiration, voicing and dental / retroflex
+# ("टूलकिट" heard as "तूलकेच", "बैंक ऋण" as "बेख रिन"); vowel signs, the anusvara and the virama say little.
+_HINDI_SOUNDS = {
+    **dict.fromkeys("कख", "k"),
+    **dict.fromkeys("चछजझ", "c"),
+    **dict.fromkeys("टठडढतथदध", "t"),
+    **dict.fromkeys("णनञङ", "n"),
+    **dict.fromkeys("पफबभव", "p"),
+    "म": "m",
+    "य": "y",
+    "र": "r",
+    "ऋ": "r",
+    "ृ": "r",
+    **dict.fromkeys("लळ", "l"),
+    **dict.fromkeys("शषस", "s"),
+    "ह": "h",
+}
+_DEVANAGARI_WORD = re.compile("[ऀ-ॣॱ-ॿ]+")
+# Words of a question that say nothing about its subject (question words, postpositions, auxiliaries, common verbs).
+_HINDI_FUNCTION_WORDS = wordset(
+    """
+    क्या कितना कितनी कितने कौन कौनसा कौनसी कब कहाँ कहां क्यों कैसे का की के को में से पर तक और या भी है हैं था थी थे
+    हो होगा होगी होता होती होते मिलता मिलती मिलते मिलेगा मिलेगी मिलेंगे दिया दी दिए दिया जाता जाती जाते जाएगा जाएगी
+    करना करता करती करते करें कर सकता सकती सकते चाहिए लिए लिये वाला वाली वाले यह वह ये वो इस उस इसका उसका इसकी उसकी
+    बताओ बताइए बताइये बताएं बताएँ मुझे हमें आप आपको आपके आपकी अपने अपनी कुछ सब सभी बारे बार एक दो
+    """
+)
+
+
+def hindi_sound_key(word: str) -> str:
+    """A Devanagari word's consonants as they sound, repeats merged: "टूलकिट" → "tlkt", "बैंक" and "बेख" → "pk", "ऋण"
+    and "रिन" → "rn"."""
+    keys = [_HINDI_SOUNDS.get(ch, "") for ch in unicodedata.normalize("NFD", word)]
+    keys = [k for k in keys if k]
+    return "".join(k for i, k in enumerate(keys) if i == 0 or k != keys[i - 1])
+
+
+def misheard_words(question: str, passages: Sequence[str]) -> dict[str, str]:
+    """Words of a (spoken) question that the passages have in another spelling that sounds the same: likely misheard
+    ({"बेख": "बैंक", "रिन": "ऋण"}). Devanagari words of three letters or more that aren't function words and aren't in
+    any passage as written; a sound key of two consonants or more, equal to a passage word's (one that is spelled
+    differently, or of four consonants or more and one consonant off: "तूलकेच" for "टूलकिट"). Latin words are left
+    to ``misheard_names``."""
+    norm = lambda w: unicodedata.normalize("NFC", w).replace("़", "")  # noqa: E731  (nukta: "दस्तावेज़" = "दस्तावेज")
+    written = {norm(w) for p in passages for w in _DEVANAGARI_WORD.findall(p)}
+    by_key: dict[str, str] = {}
+    for w in sorted(written, key=len, reverse=True):
+        key = hindi_sound_key(w)
+        if len(key) >= 2:
+            by_key.setdefault(key, w)
+    out: dict[str, str] = {}
+    for word in _DEVANAGARI_WORD.findall(question):
+        w = norm(word)
+        if len(w) < 3 or w in written or w in _HINDI_FUNCTION_WORDS:
+            continue
+        key = hindi_sound_key(w)
+        if len(key) >= 2 and key in by_key:
+            out[word] = by_key[key]
+        elif len(key) >= 4:
+            near = [v for k, v in by_key.items() if k[0] == key[0] and _one_off(k, key)]
+            if len(near) == 1:
+                out[word] = near[0]
+    return out
+
+
+def _one_off(a: str, b: str) -> bool:
+    """One substitution, insertion or deletion apart."""
+    if abs(len(a) - len(b)) > 1 or a == b:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b, strict=True)) == 1
+    short, long_ = sorted((a, b), key=len)
+    return any(long_[:i] + long_[i + 1 :] == short for i in range(len(long_)))
+
+
 def respell(text: str, renames: Mapping[str, str]) -> str:
-    """``text`` with each misheard name replaced by the documents' spelling (whole words: "Mora's" → "Valmora's")."""
+    """``text`` with each misheard name (or Hindi word) replaced by the documents' spelling (whole words: "Mora's" →
+    "Valmora's", "बेख" → "बैंक")."""
     for said, name in sorted(renames.items(), key=lambda kv: -len(kv[0])):
-        text = re.sub(rf"(?<![A-Za-z]){re.escape(said)}(?![A-Za-z])", name, text, flags=re.IGNORECASE)
+        text = re.sub(rf"(?<![A-Za-z\u0900-\u097f]){re.escape(said)}(?![A-Za-z\u0900-\u097f])", name, text, flags=re.I)
     return text

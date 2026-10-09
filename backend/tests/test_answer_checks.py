@@ -340,19 +340,20 @@ async def test_a_garbled_transcript_is_asked_again_once(world, fakes):
 async def test_a_spoken_general_answer_to_a_fact_question_says_it_isnt_from_the_documents(world, fakes):
     service, chat_id = world
     fakes.llm.route = {"intent": "general_qa", "query": None}
-    fakes.llm.reply = "The population of Mumbai is about 21 million."
+    fakes.llm.reply = "The capital of Maharashtra is Mumbai."
     fakes.reranker.scorer = lambda q, p: 0.0  # the documents don't match: the general answer stands
-    events = await turn(service, chat_id, "How many people live in Mumbai?", modality="voice")
+    events = await turn(service, chat_id, "Which city is the capital of Maharashtra?", modality="voice")
     agent = saved(events)
-    assert agent.text == "Not from your documents, but the population of Mumbai is about 21 million."
+    assert agent.text == "Not from your documents, but the capital of Maharashtra is Mumbai."
     assert agent.route["not_from_documents"] is True
     assert "go straight on with the answer" in fakes.llm.calls[-1]["messages"][0].content
     fakes.llm.reply = "EBITDA is earnings before interest, taxes, depreciation and amortisation."
     events = await turn(service, chat_id, "What is EBITDA?", modality="voice")  # a definition: no prefix
     assert not saved(events).text.startswith(NOT_FROM_DOCUMENTS["en"])
-    fakes.llm.reply = "The population of Mumbai is about 21 million."
-    events = await turn(service, chat_id, "How many people live in Mumbai?")  # typed: the label says it
-    assert saved(events).text == "The population of Mumbai is about 21 million."
+    fakes.llm.reply = "The capital of Maharashtra is Mumbai."
+    events = await turn(service, chat_id, "Which city is the capital of Maharashtra?")  # typed: the label says it
+    assert saved(events).text == "The capital of Maharashtra is Mumbai."
+    # (a question for a figure gets no general answer in a documents chat: tests/test_last_round.py, item 1)
 
 
 # ------------------------------------------------------------------ item 10: misheard names

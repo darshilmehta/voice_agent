@@ -361,6 +361,38 @@ def asks_about_facts(text: str) -> bool:
     )
 
 
+# Asks for an amount, a number, a limit, a rate or a date ("how much", "what is the limit", "कितनी", "kab"): in a chat
+# with documents, a figure from general knowledge passes for the documents' (the last real run: "टूलकिट के लिए कितनी
+# सहायता मिलती है?", misheard "तूलकेच…", was answered "… ₹ 1,500 प्रति माह"; the notice says ₹ 10,000).
+_FIGURE_QUESTION = re.compile(
+    r"\bhow\s+(?:much|many|long|old|far|big|large|high|often|soon)\b"
+    r"|\bwhat(?:'s|\s+is|\s+was|\s+are|\s+were|\s+will\s+be)?\s+(?:the\s+|its\s+|their\s+|our\s+|my\s+)?"
+    r"(?:\w+\s+){0,3}?(?:amount|number|limit|cap|ceiling|rate|price|cost|fee|fees|value|percentage|percent|share|"
+    r"salary|stipend|subsidy|grant|allowance|budget|total|count|size|figure|age|date|deadline|year|time|duration|"
+    r"period|interest|tax|ratio|margin|revenue|profit|turnover)s?\b"
+    r"|\bwhat\s+(?:percentage|percent|share|date|year|time)\b|\bwhich\s+(?:year|date|month)\b"
+    r"|^(?:when|by\s+when|till\s+when|until\s+when)\b|\bwhen\s+(?:is|was|does|did|will|do|are|were)\b",
+    re.IGNORECASE,
+)
+_FIGURE_WORDS = wordset("कितना कितनी कितने कितनों कब kitna kitni kitne kitno kab")
+_FIGURE_PHRASES = re.compile(
+    "किस\\s+(?:तारीख|तारीख़|तिथि|दिन|वर्ष|साल|महीने)|अंतिम\\s+तिथि|(?:सीमा|राशि|दर|फीस|शुल्क|तारीख|तिथि)\\s+(?:क्या|kya)"
+    "|kis\\s+(?:tarikh|din|saal|sal|mahine)|(?:seema|rashi|dar|fees)\\s+kya",
+    re.IGNORECASE,
+)
+
+
+def asks_for_figure(text: str | None) -> bool:
+    """The question asks for an amount, a number, a limit, a rate or a date ("How much…", "how many…", "what is the
+    hotel limit…", "when…", "कितनी…", "कब…", "अंतिम तिथि क्या है?"): one a general-knowledge answer must not give a figure
+    for in a chat with documents (last round, item 1)."""
+    if not text:
+        return False
+    return bool(
+        _FIGURE_QUESTION.search(text) or _FIGURE_PHRASES.search(text) or any(w in _FIGURE_WORDS for w in words(text))
+    )
+
+
 def heuristic_topic(text: str) -> str:
     """A short, stable topic label: the question's content words without years or figures ("What was the EBITDA
     margin in FY24?" → "ebitda margin"), so a follow-up about another year stays on the same topic."""

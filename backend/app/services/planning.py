@@ -67,6 +67,7 @@ from .router import (
     TurnRouter,
     about_the_documents,
     asks_about_facts,
+    asks_for_figure,
     asks_for_judgement,
     fallback_route,
     fast_route,
@@ -368,6 +369,11 @@ class TurnPlanner:
         about = about_the_documents(req.utterance, req.documents) or (
             route.rewritten_query is not None and about_the_documents(route.rewritten_query, req.documents)
         )
+        # An amount, a number, a limit, a rate or a date: the documents answer it or nothing does. A general answer
+        # would give a figure from general knowledge that passes for theirs (last round, item 1: "तूलकेच के लिए कितनी
+        # सहायता मिलती है?", misheard "टूलकिट…", got "₹ 1,500 प्रति माह"; the notice says ₹ 10,000).
+        figure = not about and any(asks_for_figure(t) for t in (req.utterance, route.rewritten_query, proposal.query))
+        about = about or figure
         searched = validate(proposal.model_copy(update={"intent": "document_qa"}), req, llm_ms=decision.llm_ms)
         query = searched.route.rewritten_query or req.utterance
         t0 = time.perf_counter()
@@ -390,7 +396,8 @@ class TurnPlanner:
         elif about:  # about the documents' subject: searched, and if they don't say, the answer abstains
             intent = "document_qa"
             found_part = f"best match {score}" if lookup.done() else "retrieval still running"
-            why = f"{was}→document_qa: asks about the documents' subject ({found_part})"
+            asks = "asks for a figure" if figure else "asks about the documents' subject"
+            why = f"{was}→document_qa: {asks} ({found_part})"
         else:
             lookup.cancel()
             kept = f"{was} kept: " + ("the documents don't match" if lookup.done() else "retrieval too slow")

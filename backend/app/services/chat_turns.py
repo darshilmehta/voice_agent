@@ -122,6 +122,7 @@ from .prompts import (
     ANSWER_LENGTHS,
     CONTINUATION_NOTHING,
     CONTINUATION_PROMPT_VERSION,
+    GENERAL_FIGURE_TEXTS,
     LIVE_FIGURE_TEXTS,
     LIVE_NOTICES,
     LIVE_PROMPT_VERSION,
@@ -169,7 +170,15 @@ from .retrieval import (
     fiscal_year_ends,
     scope_of,
 )
-from .router import LLMTurnRouter, RouteRequest, TurnRouter, asks_about_facts, fast_route, heard
+from .router import (
+    LLMTurnRouter,
+    RouteRequest,
+    TurnRouter,
+    asks_about_facts,
+    asks_for_figure,
+    fast_route,
+    heard,
+)
 from .sources import (
     Source,
     answer_declines,
@@ -180,7 +189,7 @@ from .sources import (
     strip_markers,
     trim_open_marker,
 )
-from .subjects import misheard_names, respell
+from .subjects import misheard_names, misheard_words, respell
 from .web_search import ToolEvent, WebSearchRun, WebSource
 
 if TYPE_CHECKING:
@@ -361,6 +370,9 @@ class Turn:
     input_language: Language | None = None  # the language the user spoke (STT); None: read from the text's script
     input_latency: dict[str, Any] | None = None  # saved as the user message's latency (voice: VAD and STT timings)
     garbled: bool = False  # the transcript looks garbled (voice): the user is asked to say it again (item 8)
+    # Speech recognition wasn't sure of the transcript (voice: a low average log probability) without it looking
+    # garbled: a question the documents don't answer is asked again rather than declined (last round, item 1).
+    unsure: bool = False
 
 
 # Why a voice answer was cut short: the user talked over it, pressed stop, or the session ended (client gone, replaced
@@ -614,6 +626,7 @@ class ChatTurnService:
         input_language: Language | None = None,
         input_latency: dict[str, Any] | None = None,
         garbled: bool = False,
+        unsure: bool = False,
     ) -> Turn:
         """Check the chat and the message before any event is produced (unknown chat → NotFound, bad text →
         InvalidInput). The answer language follows ``services/language.py``: a language the user asks for (now or
@@ -621,7 +634,8 @@ class ChatTurnService:
         one for voice), else the previous answer's. ``modality`` is recorded on both messages; ``length`` sets the
         answer style and token cap. Voice turns pass the spoken language (``input_language``, saved on the user
         message), the STT timings (``input_latency``) and whether the transcript looks garbled (``garbled``: the
-        user is asked to say it again, nothing is answered)."""
+        user is asked to say it again, nothing is answered) or unsure (``unsure``: a question the documents don't
+        answer is asked again)."""
         chat = await self.chats.get(chat_id)
         text = text.strip()
         if not text:
@@ -639,7 +653,9 @@ class ChatTurnService:
             preferred=state.preferred_language,
             fallback=self._fallback_language(chat, state),
         )
-        return Turn(chat, text, decision.language, language, modality, length, input_language, input_latency, garbled)
+        return Turn(
+            chat, text, decision.language, language, modality, length, input_language, input_latency, garbled, unsure
+        )
 
     def _fallback_language(self, chat: Chat, state: ConversationState) -> Language:
         if state.response_language is not None:
@@ -908,27 +924,27 @@ class ChatTurnService:
         if plan.needs_retrieval and not covered:
             if p.web_sources:  # the documents don't answer it, the web may: say so and answer from the web
                 yield SourcesEvent(web_citations, confidence, abstained=False)
-            elif plan.mode == "mixed":  # the document part isn't covered: general knowledge, saying so
+            elif plan.mode == "mixed" and not (ready and self._withholds_figure(turn, p)):
+                # the document part isn't covered: general knowledge, saying so (never a figure for a question that
+                # asks for one: that is the documents' or nobody's, last round item 1)
                 plan = p.plan = plan.as_general("not_covered" if ready else "no_documents")
                 yield SourcesEvent([], confidence, abstained=False)
             else:
                 reason: AbstainReason = "no_documents" if not ready else "not_covered"
-                p.abstained, p.reason = True, reason
-                yield SourcesEvent([], confidence, abstained=True)
-                p.notice = plan.live_note
-                notice = live_notice(plan.live_note, plan.language) + " " if plan.live_note else ""
-                answer = notice + abstention(plan.language, reason)
-                p.parts.append(answer)
-                yield DeltaEvent(answer)
-                route = self._route(turn, p, abstained=True, reason=reason, model_used=False)
-                latency = self._latency(clock, p, first_delta_ms=clock.ms(), llm_ms=None)
-                async for event in self._save_answer(turn, answer, [], route, latency, p):
+                async for event in self._abstain(turn, p, clock, confidence, reason):
                     yield event
                 return
         elif covered:
             await self._start_draft(turn, p)  # the visual's draft, built while the answer is written (§12.1)
             await self._draft_evidence(turn, p)  # its tables among the answer's sources (quality round, item 1)
             yield SourcesEvent([*(s.citation() for s in p.sources), *web_citations], confidence, abstained=False)
+        elif plan.mode == "general" and not p.web_sources and self._withholds_figure(turn, p):
+            # A general answer to a question for an amount, a number, a limit, a rate or a date, in a chat with
+            # documents: they weren't searched (the router said general and the B1 check couldn't run), and a figure
+            # from general knowledge would pass for theirs. Declined (or asked again), never guessed (last round, 1).
+            async for event in self._abstain(turn, p, clock, None, "not_covered"):
+                yield event
+            return
         else:
             yield SourcesEvent(web_citations, None, abstained=False)
 
@@ -1037,6 +1053,67 @@ class ChatTurnService:
         async for event in self._save_answer(turn, answer, citations, route, latency, p):
             yield event
 
+    async def _abstain(
+        self, turn: Turn, p: _Progress, clock: _Clock, confidence: Confidence | None, reason: AbstainReason
+    ) -> AsyncGenerator[ChatEvent, None]:
+        """The documents don't answer it: a fixed answer, no model. Spoken, a question that speech recognition wasn't
+        sure of (``Turn.unsure``), or with a word the turn's passages have in another spelling that sounds the same
+        ("बेख रिन" for "बैंक ऋण"), is asked again instead: "Sorry, I didn't catch that…" (last round, item 1)."""
+        plan = p.plan
+        p.abstained, p.reason = True, reason
+        yield SourcesEvent([], confidence, abstained=True)
+        p.notice = plan.live_note
+        notice = live_notice(plan.live_note, plan.language) + " " if plan.live_note else ""
+        spoken = reason == "not_covered" and turn.modality == "voice"
+        misheard = self._misheard_words(turn, p) if spoken else {}
+        say_again = spoken and (turn.unsure or bool(misheard))
+        answer = notice + (ack_text("repeat", plan.language) if say_again else abstention(plan.language, reason))
+        p.parts.append(answer)
+        yield DeltaEvent(answer)
+        route = self._route(turn, p, abstained=True, reason=reason, model_used=False)
+        if say_again:
+            route["say_again"] = {"unsure": turn.unsure, "misheard": misheard}
+        latency = self._latency(clock, p, first_delta_ms=clock.ms(), llm_ms=None)
+        async for event in self._save_answer(turn, answer, [], route, latency, p):
+            yield event
+
+    def _figure_question(self, turn: Turn, p: _Progress) -> bool:
+        """The question asks for an amount, a number, a limit, a rate or a date (as said, or in its standalone or
+        English form)."""
+        plan = p.plan
+        route = plan.route
+        proposal = plan.decision.proposal if plan.decision is not None else None
+        texts = (
+            turn.text,
+            plan.query,
+            plan.query_en,
+            route.rewritten_query if route is not None else None,
+            proposal.query if proposal is not None else None,
+        )
+        return any(asks_for_figure(t) for t in texts)
+
+    def _withholds_figure(self, turn: Turn, p: _Progress) -> bool:
+        """A general (or not-from-the-documents) answer would give a figure from general knowledge for a question that
+        asks for one, in a chat whose documents are searched: it is declined instead (last round, item 1). Live data
+        has its own fixed line (§3.7), and with document search turned off general answers are what the user chose."""
+        plan = p.plan
+        if (
+            not p.ready
+            or plan.general_note == "retrieval_off"
+            or (p.state is not None and not p.state.retrieval_enabled)
+        ):
+            return False
+        if plan.live_hint or plan.live_note is not None or (plan.decision is not None and plan.decision.live):
+            return False
+        return self._figure_question(turn, p)
+
+    @staticmethod
+    def _misheard_words(turn: Turn, p: _Progress) -> dict[str, str]:
+        """Words of the question that the turn's passages have in another spelling that sounds the same: likely
+        misheard ("बेख" → "बैंक"). Only the passages retrieval found for it (the best few, whatever their score)."""
+        passages = [r.chunk.text for r in (p.result.chunks if p.result is not None else [])]
+        return misheard_words(turn.text, passages) if passages else {}
+
     async def _answer_stream(
         self, prompt: list[LLMMessage], language: Language, max_tokens: int, p: _Progress
     ) -> AsyncGenerator[str, None]:
@@ -1116,20 +1193,41 @@ class ChatTurnService:
         plan = p.plan
         documents = plan.mode in ("grounded", "mixed") and not p.web_sources
         figures = None
+        line = LIVE_FIGURE_TEXTS[plan.language][0 if p.notice is None else 1]
+        check = "live_figure"
+        said = [turn.text, plan.query, plan.query_en or ""]
         if documents and (plan.live_hint or plan.live_note is not None) and p.sources:
-            said = [turn.text, plan.query, plan.query_en or ""]
             figures = figures_in([*(s.chunk.text for s in p.sources), *said])
+        elif self._general_about_facts(turn, p):
+            # A general answer about facts in a chat with documents: a figure that isn't in the question is replaced
+            # (once; another is dropped), as a live figure is (last round, item 1): it would pass for the documents'.
+            figures = figures_in(said)
+            line = GENERAL_FIGURE_TEXTS[plan.language][0 if p.prefix is None else 1]
+            check = "general_figure"
         short = turn.length == "short" and plan.mode in ("grounded", "mixed", "general")
         return AnswerGuard(
             coverage=self._coverage(turn, p) if documents else None,
             identifiers=identifiers_in(s.chunk.text for s in p.sources),
             figures=figures,
-            live_line=LIVE_FIGURE_TEXTS[plan.language][0 if p.notice is None else 1],
+            live_line=line,
+            figure_check=check,
             renames=p.renames,
             max_words=SHORT_ANSWER_WORDS if short else None,
             max_sentences=SHORT_ANSWER_SENTENCES if short else None,
             lower_first=p.prefix is not None and plan.language == "en",
+            after_disclaimer=p.prefix is not None,
         )
+
+    @staticmethod
+    def _general_about_facts(turn: Turn, p: _Progress) -> bool:
+        """A general answer, in a chat with READY documents that are searched, to a question about facts (not a
+        definition, a how-to or small talk) or to one the documents were searched for and don't cover."""
+        plan = p.plan
+        if plan.mode != "general" or p.web_sources or not p.ready or plan.general_note == "retrieval_off":
+            return False
+        if plan.live_hint or plan.live_note is not None:
+            return False
+        return plan.general_note == "not_covered" or asks_about_facts(turn.text)
 
     def _coverage(self, turn: Turn, p: _Progress) -> Coverage | None:
         """What answers the question already (the draft's tables, the strong passages), as the coverage check's units,
@@ -1177,11 +1275,16 @@ class ChatTurnService:
         return plan.general_note == "not_covered" or asks_about_facts(turn.text)
 
     def _renames(self, turn: Turn, p: _Progress) -> dict[str, str]:
-        """Names the user was misheard as, and the documents' spelling ("Wall Mora" → "Valmora", item 10)."""
+        """Names the user was misheard as, and the documents' spelling ("Wall Mora" → "Valmora", item 10); spoken, also
+        Hindi words the answer's passages spell differently but that sound the same ("बेख रिन" → "बैंक ऋण", last round,
+        item 1): the answer model reads the question as the documents spell it."""
         if not p.ready or p.plan.mode not in ("grounded", "mixed", "general"):
             return {}
         plan = p.plan
-        return misheard_names([turn.text, plan.query, plan.query_en], self._labels_now(p))
+        renames = misheard_names([turn.text, plan.query, plan.query_en], self._labels_now(p))
+        if turn.modality == "voice" and p.sources:
+            renames.update(misheard_words(turn.text, [s.chunk.text for s in p.sources]))
+        return renames
 
     async def _draft_evidence(self, turn: Turn, p: _Progress) -> None:
         """The visual's draft is on screen from the answer's first words (§12.1): its tables must be among the

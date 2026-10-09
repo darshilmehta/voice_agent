@@ -22,6 +22,7 @@ from app.services.subjects import (
     label_words,
     mentions,
     misheard_names,
+    misheard_words,
     named_documents,
     respell,
     sound_key,
@@ -370,3 +371,26 @@ def test_respelling_keeps_the_rest_of_the_question():
 def test_a_question_that_puts_the_documents_side_by_side_without_naming_them(question, compares):
     assert compares_documents([question]) is compares
     assert compares_documents([None, question]) is compares  # (the English query may be missing)
+
+
+# ------------------------------------------------------------------ last round: misheard Hindi words (item 1)
+
+BENEFITS = [
+    "प्रशिक्षण सफलतापूर्वक पूरा करने पर ₹ 10,000 की टूलकिट सहायता मिलेगी।",
+    "स्वरोज़गार शुरू करने के लिए बैंक ऋण पर 35 प्रतिशत अनुदान दिया जाएगा, जो अधिकतम ₹ 1,75,000 होगा।",
+    "प्रशिक्षुओं को प्रति माह ₹ 3,500 का वजीफ़ा दिया जाएगा।",
+]
+
+
+@pytest.mark.parametrize(
+    ("heard", "misheard"),
+    [
+        ("तूलकेच के लिए कितनी सहायता मिलती है?", {"तूलकेच": "टूलकिट"}),  # the last real run
+        ("बेख रिन पर कितना अनुदान मिलता है?", {"बेख": "बैंक", "रिन": "ऋण"}),
+        ("टूलकिट के लिए कितनी सहायता मिलती है?", {}),  # heard right
+        ("वजीफा कितना मिलता है?", {}),  # the nukta is spelling, not mishearing
+        ("मुंबई की आबादी कितनी है?", {}),  # nothing like it in the passages
+    ],
+)
+def test_words_the_passages_spell_differently_but_that_sound_the_same(heard, misheard):
+    assert misheard_words(heard, BENEFITS) == misheard

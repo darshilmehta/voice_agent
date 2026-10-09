@@ -461,3 +461,18 @@ def transcript_garbled(transcript: object) -> bool:
     if confidence is not None and 0.0 <= confidence <= 1.0 and confidence < CONFIDENCE_MIN:
         return True
     return looks_garbled(str(getattr(transcript, "text", "") or ""))
+
+
+# Below this average log probability speech recognition isn't sure of the words, though they may read as a question
+# (measured on the synthetic clips, §9.3: clear questions -0.05 to -0.5, Hindi -0.2 to -0.6, misheard or wrong-language
+# transcripts -0.7 to -1.0): a question the documents don't answer is then asked again rather than declined.
+AVG_LOGPROB_UNSURE = -0.7
+
+
+def transcript_unsure(transcript: object) -> bool:
+    """Speech recognition wasn't sure of this transcript (``avg_logprob`` below ``AVG_LOGPROB_UNSURE``, or a 0-1
+    ``confidence`` below 0.6), when it reports it."""
+    logprob, confidence = getattr(transcript, "avg_logprob", None), getattr(transcript, "confidence", None)
+    if isinstance(logprob, int | float) and logprob < AVG_LOGPROB_UNSURE:
+        return True
+    return isinstance(confidence, int | float) and 0.0 <= confidence < 0.6

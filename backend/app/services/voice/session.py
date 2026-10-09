@@ -116,6 +116,7 @@ from .speech_text import (
     normalize_utterance,
     real_words,
     transcript_garbled,
+    transcript_unsure,
 )
 from .turn_taking import (
     FRAME_SAMPLES,
@@ -737,6 +738,7 @@ class VoiceSession:
                 input_language=transcript.language,
                 input_latency=latency,
                 garbled=transcript_garbled(transcript),  # asked to say it again, not answered (quality round)
+                unsure=transcript_unsure(transcript),  # declined questions are asked again (last round, item 1)
             )
         except NotFound:
             await self._error("storage", "this chat no longer exists")

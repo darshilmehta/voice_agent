@@ -251,7 +251,9 @@ def general_system_prompt(
     if prefixed:
         situation = (
             "The user's documents don't answer this. Your answer is spoken right after the words \"Not from your "
-            "documents, but\": go straight on with the answer and don't say again that it isn't from the documents."
+            'documents, but" (in Hindi: "यह आपके दस्तावेज़ों से नहीं है, लेकिन"): go straight on with the answer and '
+            "don't say again that it isn't from the documents. Never give a specific amount, number, limit, rate or "
+            "date: say you don't have a reliable figure instead."
         )
     live = _without_live_data("from general knowledge, or say briefly that you don't know") if live_note else ""
     return (
@@ -606,9 +608,10 @@ def fiscal_year_end_note(years: Sequence[int]) -> str:
 
 
 def names_note(renames: Mapping[str, str]) -> str:
-    """The user's words for a name, as speech recognition heard them, and the documents' spelling (item 10)."""
+    """The user's words for a name (or a Hindi word), as speech recognition heard them, and the documents' spelling
+    (item 10; last round, item 1)."""
     pairs = "; ".join(f'"{said}" is {name}' for said, name in renames.items())
-    return f"(Speech recognition misheard a name: {pairs}. Always write the name as the documents spell it.)"
+    return f"(Speech recognition misheard: {pairs}. Always write them as the documents spell them.)"
 
 
 def coverage_note(evidence: str) -> str:
@@ -648,6 +651,15 @@ def passage_correction(document: str, where: str | None, source_id: str, languag
 NOT_FROM_DOCUMENTS: dict[Language, str] = {
     "en": "Not from your documents, but ",
     "hi": "यह आपके दस्तावेज़ों से नहीं है, लेकिन ",
+}
+
+
+# A general answer in a chat with documents that states a figure (last round, item 1: "… सहायता ₹ 1,500 प्रति माह
+# मिलती है" where the documents say ₹ 10,000): the sentence is replaced by this. After the fixed "Not from your
+# documents, but …", the second form.
+GENERAL_FIGURE_TEXTS: dict[Language, tuple[str, str]] = {
+    "en": ("I couldn't find that in your documents.", "I don't have a reliable figure for that."),
+    "hi": ("यह जानकारी आपके दस्तावेज़ों में नहीं मिली।", "मेरे पास इसका भरोसेमंद आँकड़ा नहीं है।"),
 }
 
 
