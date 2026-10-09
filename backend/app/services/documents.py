@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -309,32 +310,38 @@ class DocumentService(Service):
             return [DocumentTable.model_validate(t) for t in (await s.scalars(stmt)).all()]
 
 
+def _table_fields(t: ParsedTable) -> dict[str, Any]:
+    return {
+        "table_index": t.index,
+        "page_start": t.page_start,
+        "page_end": t.page_end,
+        "bbox": list(t.bbox) if t.bbox is not None else None,
+        "heading_path": list(t.heading_path),
+        "caption": t.caption,
+        "num_rows": t.num_rows,
+        "num_cols": t.num_cols,
+        "markdown": t.markdown,
+        "cells": [c.model_dump(mode="json") for c in t.cells],
+    }
+
+
 async def _replace_tables(
     s: AsyncSession, document_id: str, version: int, tables: Sequence[ParsedTable], now: datetime
 ) -> None:
-    await s.execute(
-        delete(orm.DocumentTable).where(
-            orm.DocumentTable.document_id == document_id, orm.DocumentTable.version == version
-        )
-    )
-    for t in tables:
-        s.add(
-            orm.DocumentTable(
-                document_id=document_id,
-                version=version,
-                table_index=t.index,
-                page_start=t.page_start,
-                page_end=t.page_end,
-                bbox=list(t.bbox) if t.bbox is not None else None,
-                heading_path=list(t.heading_path),
-                caption=t.caption,
-                num_rows=t.num_rows,
-                num_cols=t.num_cols,
-                markdown=t.markdown,
-                cells=[c.model_dump(mode="json") for c in t.cells],
-                created_at=now,
-            )
-        )
+    """Store a version's tables. When the stored ones are the same (a re-index of an unchanged file, see
+    ``DocumentPipeline.reindex_outdated``) the rows are kept, so their ids (and the canvas datasets and cell
+    references built on them, §12.1) stay valid."""
+    of_version = (orm.DocumentTable.document_id == document_id, orm.DocumentTable.version == version)
+    query = select(orm.DocumentTable).where(*of_version).order_by(orm.DocumentTable.table_index)
+    stored = (await s.scalars(query)).all()
+    fields = [_table_fields(t) for t in tables]
+    if len(stored) == len(fields) and all(
+        all(getattr(row, k) == v for k, v in f.items()) for row, f in zip(stored, fields, strict=True)
+    ):
+        return
+    await s.execute(delete(orm.DocumentTable).where(*of_version))
+    for f in fields:
+        s.add(orm.DocumentTable(document_id=document_id, version=version, created_at=now, **f))
 
 
 def _clip(text: str) -> str:

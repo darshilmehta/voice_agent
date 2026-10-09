@@ -427,6 +427,7 @@ def test_a_reindexed_document_stays_searchable_until_its_job_starts(app, fakes):
     doc_id = upload(app, p, "a.txt", REPORT).json()["id"]
     other = upload(app, p, "b.txt", b"gamma delta").json()["id"]
     drain(app)
+    tables = _run(app, DocumentService(_db(app)).tables, doc_id)
     for cid, point in list(fakes.store.points.items()):  # as if indexed by the previous release
         if point.chunk.document_id == doc_id:
             fakes.store.points[cid] = replace(point, chunk=point.chunk.model_copy(update={"chunking_version": "old"}))
@@ -446,6 +447,56 @@ def test_a_reindexed_document_stays_searchable_until_its_job_starts(app, fakes):
     assert app.get(f"/api/documents/{doc_id}").json()["status"] == "READY"
     assert _versions(fakes, doc_id) == {version} and _versions(fakes, other) == {version}
     assert [j.status for j in _run(app, _jobs, _db(app), other)] == ["SUCCEEDED"]  # up to date: untouched
+    # the same file parses into the same tables: their rows (and the canvas datasets built on them) are kept
+    assert [t.id for t in _run(app, DocumentService(_db(app)).tables, doc_id)] == [t.id for t in tables] != []
+
+
+async def test_finishing_a_job_keeps_unchanged_tables_and_replaces_changed_ones(db):
+    from app.providers.ingestion import ParsedTable, TableCell
+    from app.services.projects import ProjectService
+
+    def table(value: str) -> ParsedTable:
+        cells = [TableCell(row=0, col=0, text="Metric", column_header=True), TableCell(row=1, col=0, text=value)]
+        return ParsedTable(
+            index=0,
+            ref="#/tables/0",
+            page_start=1,
+            page_end=1,
+            bbox=None,
+            heading_path=["H"],
+            caption=None,
+            num_rows=2,
+            num_cols=1,
+            markdown=f"| Metric |\n|---|\n| {value} |",
+            cells=cells,
+        )
+
+    docs = DocumentService(db)
+    project = await ProjectService(db).create("P")
+    doc, job = await docs.create(
+        project.id,
+        document_id="doc_t",
+        filename="a.pdf",
+        mime="application/pdf",
+        size_bytes=1,
+        sha256="x",
+        storage_key="k",
+    )
+
+    async def ingest(*tables: ParsedTable) -> list[str]:
+        nonlocal job
+        if await docs.start_job(job) is None:
+            job = await docs.queue_reindex(doc.id)
+            await docs.start_job(job)
+        await docs.finish_job(job, page_count=1, chunk_count=1, tables=list(tables))
+        job = ""
+        return [t.id for t in await docs.tables(doc.id)]
+
+    first = await ingest(table("18.2%"))
+    assert await ingest(table("18.2%")) == first  # re-index of the same file: same rows
+    changed = await ingest(table("21.0%"))
+    assert changed != first and [t.markdown for t in await docs.tables(doc.id)] == ["| Metric |\n|---|\n| 21.0% |"]
+    assert await ingest() == []
 
 
 def test_documents_missing_from_the_index_are_reindexed(app, fakes):
