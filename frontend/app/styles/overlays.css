@@ -177,6 +177,12 @@
   animation: menu-in 0.1s ease-out;
 }
 
+/* Shortened to the room there is (never over the voice stage's captions): the passage scrolls inside. */
+.cite-pop[data-clamped] {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 .cite-pop-head {
   display: flex;
   align-items: center;

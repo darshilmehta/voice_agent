@@ -113,6 +113,7 @@ export function Captions({
     <p
       ref={boxRef}
       className={`vc-caption${showUser ? " is-user" : ""}${visible.length === 0 ? " is-empty" : ""}`}
+      data-cite-avoid // a citation popover opened from the chips below stays off the words being spoken
       lang={lang}
       data-final={showUser ? userFinal || undefined : undefined}
     >

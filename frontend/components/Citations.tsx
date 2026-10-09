@@ -47,6 +47,7 @@ import {
   withoutPartialMarker,
   type SourceRef,
 } from "@/lib/citations";
+import { EDGE, placePopover, type PopoverPlace } from "@/lib/popover-place";
 
 import { Icon } from "./Icon";
 
@@ -72,15 +73,13 @@ interface PopoverApi {
 
 const PopoverContext = createContext<PopoverApi | null>(null);
 
-const GAP = 6;
-const EDGE = 8;
 const HOVER_IN_MS = 120;
 const HOVER_OUT_MS = 160;
 const SCROLL_QUIET_MS = 300;
 
 export function CitationPopoverProvider({ children }: { children: ReactNode }) {
   const [open, setOpen] = useState<Open | null>(null);
-  const [pos, setPos] = useState<{ top: number; left: number; above: boolean } | null>(null);
+  const [pos, setPos] = useState<PopoverPlace | null>(null);
   const popRef = useRef<HTMLDivElement>(null);
   const hideTimer = useRef<number | null>(null);
   const showTimer = useRef<number | null>(null);
@@ -141,7 +140,8 @@ export function CitationPopoverProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => () => clearTimers(), []);
 
-  // Place it under the chip (or above when there's no room), and keep it there while things scroll.
+  // Place it under the chip (or above when there's no room, or shortened to the room there is), never over a live
+  // caption, and keep it there while things scroll.
   const place = useCallback(() => {
     const pop = popRef.current;
     if (!open || !pop) return;
@@ -152,15 +152,16 @@ export function CitationPopoverProvider({ children }: { children: ReactNode }) {
     // Scrolled out of its scrolling area (the transcript), or off screen: close rather than float over the header.
     const area = open.anchor.closest("[data-scroll-root]")?.getBoundingClientRect() ?? { top: 0, bottom: vh };
     if (r.bottom < area.top || r.top > area.bottom) return setOpen(null);
-    const { offsetWidth: w, offsetHeight: h } = pop;
-    const left = Math.min(Math.max(EDGE, r.left + r.width / 2 - 28), vw - w - EDGE);
-    let top = r.bottom + GAP;
-    let above = false;
-    if (top + h > vh - EDGE && r.top - GAP - h > EDGE) {
-      top = r.top - GAP - h;
-      above = true;
-    }
-    setPos((p) => (p && p.top === Math.round(top) && p.left === Math.round(left) && p.above === above ? p : { top: Math.round(top), left: Math.round(left), above }));
+    const left = Math.round(Math.min(Math.max(EDGE, r.left + r.width / 2 - 28), vw - pop.offsetWidth - EDGE));
+    // Its height whole, whatever the last placement clamped it to (the border is what offset and client heights differ by).
+    const natural = pop.scrollHeight + (pop.offsetHeight - pop.clientHeight);
+    const keepOut = [...document.querySelectorAll<HTMLElement>("[data-cite-avoid]")]
+      .map((el) => el.getBoundingClientRect())
+      .filter((b) => b.width > 0 && b.height > 0);
+    const next = { ...placePopover({ top: r.top, bottom: r.bottom }, natural, vh, keepOut), left };
+    setPos((p) =>
+      p && p.top === next.top && p.left === next.left && p.above === next.above && p.maxHeight === next.maxHeight ? p : next,
+    );
   }, [open]);
 
   useLayoutEffect(() => {
@@ -241,7 +242,8 @@ export function CitationPopoverProvider({ children }: { children: ReactNode }) {
             className="cite-pop"
             data-kind={web ? "web" : undefined}
             data-above={pos?.above || undefined}
-            style={pos ? { top: pos.top, left: pos.left } : { top: 0, left: 0, visibility: "hidden" }}
+            data-clamped={pos?.maxHeight != null || undefined}
+            style={pos ? { top: pos.top, left: pos.left, maxHeight: pos.maxHeight ?? undefined } : { top: 0, left: 0, visibility: "hidden" }}
             onMouseEnter={() => {
               if (hideTimer.current !== null) window.clearTimeout(hideTimer.current);
               hideTimer.current = null;
