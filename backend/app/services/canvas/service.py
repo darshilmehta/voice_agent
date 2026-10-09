@@ -7,8 +7,10 @@ canvases and the entry point the conversation will use. Long-lived (one per app,
     startup ─────────backfill job (long lane, after the model preload)─► type READY documents that have tables but no
                                         (current) datasets, then rebuild overviews that are out of date
     API ─────────────canvas, ops, POST visuals (spec → validate → build → store), overview, datasets
-    conversation ────prepare_visual(chat, question, …) → VisualEvent preparing / ready | failed, CanvasEvent
-                     (a turn runs it after its answer's text is complete: ``conversation.TurnVisual``)
+    conversation ────prepare_visual(chat, question, …) → VisualEvent preparing / ready | failed, CanvasEvent: the
+                     draft (``draft.py``, code) at once, then, unless it is confident, the planner once the answer's
+                     text is complete, replacing it in place (a turn starts it when its retrieval returns:
+                     ``conversation.TurnVisual``)
                      edit(chat, CanvasEdit, …) → the canvas events of a spoken edit, then its EditResult
                      visual_tables(chat, visual) → the tables behind a visual (questions about what is on screen)
 """
@@ -19,7 +21,8 @@ import asyncio
 import hashlib
 import json
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import datetime
 
@@ -36,10 +39,20 @@ from ...settings import Settings
 from ..base import InvalidInput, NotFound
 from ..documents import DocumentService
 from .builder import build_visual
-from .conversation import CanvasEdit, EditOutcome, EditResult, describe, resolve_target
+from .conversation import (
+    WITHDRAW,
+    CanvasEdit,
+    EditOutcome,
+    EditResult,
+    TurnVisual,
+    VisualTrace,
+    describe,
+    resolve_target,
+)
 from .datasets import TYPER_VERSION, table_contexts, type_document
+from .draft import Draft, draft_visual, filename_labels, same_choice, turn_context
 from .overview import overview_specs
-from .planner import VisualPlanner, builds, first_valid, visual_intent
+from .planner import NO_VISUAL, PlanResult, VisualPlanner, builds, first_valid, visual_intent
 from .spec import SpecError, VisualSpec, resolve, split_ref
 from .store import CanvasStore
 
@@ -338,55 +351,202 @@ class CanvasService:
         query_en: str | None = None,
         force: bool = False,
         visual_id: str | None = None,
+        turn: TurnVisual | None = None,
+        labels: Mapping[str, str] | None = None,
+        show_unsure: bool = True,
     ) -> AsyncIterator[VisualEvent | CanvasEvent]:
-        """The conversation's entry point (run beside the spoken answer, never before it): decide whether the
-        question deserves a visual, plan it with the model, build it from the cells, add it to the chat's canvas.
+        """The conversation's entry point (§12.1, "Instant draft, then refine"): decide whether the question deserves
+        a visual, draw a draft in code at once, have the planner refine it once the answer's text is complete, and keep
+        the chat's canvas up to date. Never raises for planning or building problems.
 
         Yields nothing when the question doesn't call for a visual (``visual_intent`` "none", unless ``force``);
-        otherwise ``visual{phase: preparing}`` first (show a skeleton), then ``visual{phase: ready, visual}`` and
-        ``canvas{panels}``, or ``visual{phase: failed, detail}``. ``sources``: the turn's citations, so the visual's
-        cells reuse their [S#] ids. ``visual_id``: the id to give it (the turn announces it before planning starts).
-        Never raises for planning or building problems."""
-        if self.planner is None:
-            return
+        otherwise ``visual{phase: preparing}`` first (show a skeleton), then:
+
+        - the draft (``draft.draft_visual``: code, milliseconds; the same validator and builder), as soon as it is
+          built: ``visual{phase: ready, visual}`` and ``canvas{panels}``. A confident draft ends it (no model call);
+        - otherwise, once the answer's text is known (``answer``, or ``turn.answer()``: a turn starts this as soon as
+          its retrieval returns, before the answer is written), the planner, with the draft's candidates. When it
+          chooses differently the panel is rebuilt in place (same id): ``visual{ready}`` and ``canvas`` again; when it
+          finds no table fits, the draft is withdrawn (``visual{failed}``, ``canvas`` without it); when it fails or
+          times out, the draft stays. An answer that was cut keeps the draft and skips the planner; one that
+          abstained withdraws it (``failed {detail: "cancelled"}``, ``canvas``).
+        - Without a draft, the planner's visual (or its heuristic fallback for a requested one) is added as before,
+          or ``visual{phase: failed, detail}``.
+
+        ``sources``: the turn's citations, so the visual's cells reuse their [S#] ids (and their tables and documents
+        rank first). ``labels``: document id → label (file name and title) for ``subjects.named_documents`` (default:
+        the file names). ``turn``: the turn's ``TurnVisual`` (its answer, its trace). ``show_unsure``: off, a draft that
+        isn't confident is not shown: the planner decides alone (a visual only the answer's figures suggested)."""
         if visual_intent(question, answer) == "none" and not force:
             return
-        visual_id = visual_id or new_id("vis")
+        trace = turn.trace if turn is not None else VisualTrace()
+        visual_id = visual_id or (turn.visual_id if turn is not None else None) or new_id("vis")
         yield VisualEvent(phase="preparing", visual_id=visual_id)
         try:
             project_id, datasets, filenames, _ = await self._chat_datasets(chat_id)
-            spec = await self.planner.plan(
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("canvas: the datasets of chat %s can't be read: %s", chat_id, e)
+            yield VisualEvent(phase="failed", visual_id=visual_id, detail=str(e)[:300])
+            return
+        pool = list(datasets.values())
+        ctx = turn_context(question, query_en, sources, labels or filename_labels(filenames))
+        shown: Visual | None = None
+        draft: Draft | None = None
+        try:
+
+            def draw() -> tuple[Draft, Visual | None]:
+                """The draft and its visual: pure code, run in a thread so the turn's own work (its answer's request,
+                the voice session's audio) isn't held up by it."""
+                d = draft_visual(
+                    question,
+                    language,
+                    pool,
+                    query_en=query_en,
+                    source_chunks=ctx.source_chunks,
+                    documents=ctx.documents,
+                    source_documents=ctx.source_documents,
+                    names=ctx.names,
+                    companies=ctx.companies,
+                    filenames=filenames,
+                    limit=self.cfg.planner_candidates,
+                )
+                if d.spec is None or not (d.confident or show_unsure):
+                    return d, None
+                built = self._build(
+                    d.spec,
+                    datasets,
+                    filenames,
+                    project_id=project_id,
+                    chat_id=chat_id,
+                    visual_id=visual_id,
+                    sources=sources,
+                )
+                return d, built
+
+            draft, visual = await asyncio.to_thread(draw)
+            trace.reasons = list(draft.reasons)
+            if draft.spec is not None and visual is not None:
+                shown = await self.store.add_panel(
+                    chat_id,
+                    visual,
+                    draft.spec.model_dump(mode="json", by_alias=True),
+                    _documents(draft.spec, datasets),
+                    max_panels=self.cfg.max_panels,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # the planner may still find one
+            log.warning("canvas: the draft visual for %r failed: %s", question[:80], e)
+            shown = None
+        trace.draft = "none" if shown is None else "confident" if draft is not None and draft.confident else "refine"
+        trace.draft_ms = trace.ms()
+        log.info("visual draft: %s in %sms (%s)", trace.draft, trace.draft_ms, "; ".join(trace.reasons))
+        if shown is not None:
+            trace.draft_at = time.perf_counter()
+            yield VisualEvent(phase="ready", visual_id=visual_id, visual=shown)
+            with suppress(Exception):
+                yield CanvasEvent(panels=await self.store.panels(chat_id))
+            if trace.draft == "confident":
+                trace.planner = "skipped"
+                return
+        if self.planner is None:
+            trace.planner = "not_run"
+            if shown is None:
+                yield VisualEvent(phase="failed", visual_id=visual_id, detail="no table fits this question")
+            return
+
+        text: str | None = answer
+        if text is None and turn is not None:  # the planner reads the answer: wait for its text
+            said = await turn.answer()
+            if said is WITHDRAW or said is None:
+                trace.planner = "not_run"
+                if said is WITHDRAW and shown is not None:  # the answer abstained: no visual
+                    async for event in self._withdraw(chat_id, visual_id, "cancelled"):
+                        yield event
+                elif shown is None:  # cut before it was written: the skeleton goes
+                    yield VisualEvent(phase="failed", visual_id=visual_id, detail="cancelled")
+                return
+            text = str(said)
+
+        started = time.perf_counter()
+        try:
+            planned = await self.planner.plan_detailed(
                 question,
                 language,
-                list(datasets.values()),
-                answer=answer,
+                pool,
+                answer=text,
                 filenames=filenames,
                 query_en=query_en,
-                source_chunks=[c.chunk_id for c in sources],
-                force=force,
-            )
-            if spec is None:
-                yield VisualEvent(phase="failed", visual_id=visual_id, detail="no table fits this question")
-                return
-            visual = self._build(
-                spec, datasets, filenames, project_id=project_id, chat_id=chat_id, visual_id=visual_id, sources=sources
-            )
-            stored = await self.store.add_panel(
-                chat_id,
-                visual,
-                spec.model_dump(mode="json", by_alias=True),
-                _documents(spec, datasets),
-                max_panels=self.cfg.max_panels,
+                source_chunks=ctx.source_chunks,
+                documents=ctx.documents,
+                source_documents=ctx.source_documents,
+                names=ctx.names,
+                ranked=draft.candidates if draft is not None and draft.candidates else None,
+                force=force or shown is not None,
+                fallback=shown is None,
             )
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # the conversation is unaffected by a visual that fails
-            log.warning("canvas: visual for %r failed: %s", question[:80], e)
-            yield VisualEvent(phase="failed", visual_id=visual_id, detail=str(e)[:300])
+        except Exception as e:
+            log.warning("canvas: the planner for %r failed: %s", question[:80], e)
+            planned = PlanResult(None, "none", "none", f"planner failed: {e}")
+        trace.planner_ms = round((time.perf_counter() - started) * 1000, 1)
+        spec = planned.spec
+        if shown is not None and draft is not None and draft.spec is not None:
+            if spec is None:
+                trace.planner = "none" if planned.reason == NO_VISUAL else "failed"
+                if trace.planner == "none":  # the model says no table fits: a draft that wasn't sure goes
+                    async for event in self._withdraw(chat_id, visual_id, "no table fits this question"):
+                        yield event
+                return
+            if same_choice(spec, draft.spec, datasets):
+                trace.planner = "same"
+                return
+        if spec is None:
+            trace.planner = "none" if planned.reason == NO_VISUAL else "failed"
+            yield VisualEvent(phase="failed", visual_id=visual_id, detail="no table fits this question")
             return
+        try:
+            visual = self._build(
+                spec, datasets, filenames, project_id=project_id, chat_id=chat_id, visual_id=visual_id, sources=sources
+            )
+            spec_json = spec.model_dump(mode="json", by_alias=True)
+            documents = _documents(spec, datasets)
+            if shown is not None:  # the draft rebuilt in place: same id, position and pin
+                stored = await self.store.replace_panel(chat_id, visual_id, visual, spec_json, documents)
+                trace.planner = "changed"
+            else:
+                stored = await self.store.add_panel(
+                    chat_id, visual, spec_json, documents, max_panels=self.cfg.max_panels
+                )
+                trace.planner = "planned"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # the conversation is unaffected by a visual that fails (a shown draft stays)
+            log.warning("canvas: visual for %r failed: %s", question[:80], e)
+            trace.planner = "failed"
+            if shown is None:
+                yield VisualEvent(phase="failed", visual_id=visual_id, detail=str(e)[:300])
+            return
+        trace.refined_at = time.perf_counter()
         yield VisualEvent(phase="ready", visual_id=visual_id, visual=stored)
         with suppress(Exception):
             yield CanvasEvent(panels=await self.store.panels(chat_id))
+
+    async def _withdraw(self, chat_id: str, visual_id: str, detail: str) -> AsyncIterator[VisualEvent | CanvasEvent]:
+        """Take a shown draft back: ``visual{failed}`` (a quiet note; none for "cancelled") and the canvas without
+        it."""
+        await self.remove_visual(chat_id, visual_id)
+        yield VisualEvent(phase="failed", visual_id=visual_id, detail=detail)
+        with suppress(Exception):
+            yield CanvasEvent(panels=await self.store.panels(chat_id))
+
+    async def remove_visual(self, chat_id: str, visual_id: str) -> None:
+        """Take a turn's visual off the chat's canvas (a draft withdrawn); nothing if it is gone already."""
+        with suppress(NotFound):
+            await self.store.apply(chat_id, CanvasOp(op="remove", visual_id=visual_id), max_panels=self.cfg.max_panels)
 
     # -------------------------------------------------------------- the conversation's edits and questions
 

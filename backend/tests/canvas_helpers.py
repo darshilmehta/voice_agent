@@ -199,3 +199,35 @@ def report_datasets(document_id: str = "doc_1") -> dict[str, TypedDataset]:
             chunk_id=f"{document_id}:v1:{n:04d}",
         )
     return out
+
+
+# ------------------------------------------------------------------ two companies with lookalike tables
+
+V, Z = "doc_valmora", "doc_zephyra"
+TWO_LABELS = {V: "valmora annual report fy24", Z: "zephyra investor deck q4fy24"}
+TWO_FILES = {V: "valmora_annual_report_fy24.pdf", Z: "zephyra_investor_deck_q4fy24.pptx"}
+ZEPHYRA_SEGMENTS = [
+    ["Segment", "Revenue FY24", "Revenue FY23"],
+    ["Freight Services", "2,140", "1,920"],
+    ["Contract Logistics", "1,310", "1,180"],
+    ["Digital Services", "420", "300"],
+    ["Total", "3,870", "3,400"],
+]
+ZEPHYRA_GLANCE = [
+    ["Metric", "FY24", "FY23"],
+    ["Revenue from operations (₹ crore)", "3,870", "3,400"],
+    ["EBITDA (₹ crore)", "620", "540"],
+    ["EBITDA margin", "16.0%", "15.9%"],
+    ["Number of employees", "6,100", "5,800"],
+]
+
+
+def two_companies() -> list[TypedDataset]:
+    """Valmora's segment results and highlights, Zephyra's lookalike segment table (its title says "segment revenue"
+    word for word: by words alone it ranks first for a question about Valmora's segments) and its highlights."""
+    return [
+        typed(SEGMENTS, heading=("Results by business",), page=18, document_id=V, dataset_id="ds_v_seg"),
+        typed(ZEPHYRA_SEGMENTS, heading=("Segment revenue overview",), page=5, document_id=Z, dataset_id="ds_z_seg"),
+        typed(ZEPHYRA_GLANCE, heading=("Zephyra at a glance",), page=3, document_id=Z, dataset_id="ds_z_glance"),
+        report_datasets(V)["highlights"].model_copy(update={"id": "ds_v_hl"}),
+    ]

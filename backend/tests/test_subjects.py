@@ -15,7 +15,7 @@ from app.services.retrieval import (
     confidence_of,
     prefer_named_documents,
 )
-from app.services.subjects import asked_names, label_words, mentions, named_documents
+from app.services.subjects import asked_names, documents_by_name, label_words, mentions, named_documents
 from app.settings import RetrievalSection
 
 from .fakes import FakeEmbedder, FakeReranker, FakeStore, hit, make_chunk
@@ -293,3 +293,11 @@ def test_speculative_retrieval_checks_the_subject_too():
     result, outcome = asyncio.run(run())
     assert outcome == "used" and result.confidence.above_threshold is False
     assert RetrievalFilters(PROJECT, tuple(LABELS)) == svc.store.searches[0][1]
+
+
+def test_the_named_documents_by_company():
+    n = named_documents(("Compare Valmora and Zephyra revenue",), LABELS)
+    assert n is not None
+    assert documents_by_name(n, LABELS) == {"valmora": frozenset(VALMORA), "zephyra": frozenset({"deck"})}
+    one = named_documents(("Show Zephyra's segments",), LABELS)
+    assert one is not None and documents_by_name(one, LABELS) == {"zephyra": frozenset({"deck"})}

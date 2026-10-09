@@ -7,7 +7,9 @@ spec.py          VisualSpec (what the model fills) and resolve(), the validator 
 calculator.py    growth, CAGR, diff, ratio, share, sum: units, formula text, CellRef inputs
 builder.py       resolved spec → Visual (contract v1), Citations, summary in the chat language; check_grounding()
 overview.py      the project overview's specs (KPI tiles, a trend, a composition)
-planner.py       visual_intent() heuristics and VisualPlanner (qwen3 JSON with per-request enums, bounded, timed out)
+planner.py       visual_intent() heuristics, company-aware candidates and VisualPlanner (qwen3 JSON with per-request
+                 enums, bounded, timed out)
+draft.py         the instant draft: a chart picked and built by code in milliseconds, and how sure it is
 store.py         table_datasets, canvas_visuals, project_overviews rows
 service.py       CanvasService: ingestion hook, backfill job, overview, chat canvas, prepare_visual() for turns
 

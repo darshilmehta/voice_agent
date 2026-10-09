@@ -30,12 +30,15 @@ Every saved agent message has ``route.basis`` (``answer_basis``): what it drew o
 
 The live visual canvas (§12.1): with a ``CanvasService``, the canvas is read before routing (``RouteRequest.screen``:
 the router sees what is on screen; a question about a chart there gets that chart's tables first among its sources).
-A document answer whose question calls for a visual (``route.visual``), or whose figures suggest one, starts it once
-its text is complete (``_start_visual``: never ahead of the answer's own request on the serial model) → VisualEvent
-preparing / ready | failed, CanvasEvent, in this stream after the answer (the stream stays open for them, bounded)
-or, with ``run(on_visual=…)`` (voice), to the caller as they come. A visual still being planned is cancelled by the
-next turn that needs the model, waited for by an edit. A ``canvas_edit`` turn applies the edit (its events in the
-stream) and says "Done." / "हो गया।".
+A document answer whose question calls for a visual (``route.visual``) gets its draft as soon as its retrieval returns
+(``_start_draft``: code, no model call, so nothing queues ahead of the answer on the serial model) → VisualEvent
+preparing / ready, CanvasEvent, in this stream with the answer's first delta, or, with ``run(on_visual=…)`` (voice), to
+the caller as they come (the session holds them until the answer's first audio). A draft that isn't confident is
+refined by the planner once the answer's text is complete (``_start_visual``), replaced in place (another ready with
+its id) or withdrawn; an answer whose own figures suggest a visual starts one then. The stream stays open for the
+refinement (bounded). A visual still being refined is cancelled by the next turn that needs the model (the draft
+stays), waited for by an edit. A ``canvas_edit`` turn applies the edit (its events in the stream) and says "Done." /
+"हो गया।".
 
 Every turn that doesn't fail ends with ``AgentMessageEvent``. A "stop" turn says nothing: no ``DeltaEvent``, and the
 message it ends with has role ``event`` (a short notice for the transcript, carrying the route).
@@ -78,7 +81,7 @@ from ..domain.canvas import CanvasEvent, Visual, VisualEvent
 from ..domain.conversation import ConversationState, VisualWant
 from ..domain.projects import Chat, Citation, Message, Modality
 from ..providers.base import PlaceholderProvider
-from ..providers.ingestion import Chunk
+from ..providers.ingestion import Chunk, document_label
 from ..providers.llm import LLMClient, LLMMessage
 from ..providers.registry import Container
 from ..providers.storage import MetadataDB
@@ -143,7 +146,7 @@ from .prompts import (
     resume_text,
     with_memory,
 )
-from .retrieval import Confidence, RankedChunk, RetrievalResult, RetrievalService, SpeculationOutcome
+from .retrieval import Confidence, RankedChunk, RetrievalResult, RetrievalService, SpeculationOutcome, scope_of
 from .router import LLMTurnRouter, RouteRequest, TurnRouter, fast_route, heard
 from .sources import Source, build_sources, finalize_answer, says_not_covered, strip_markers, trim_open_marker
 from .web_search import ToolEvent, WebSearchRun, WebSource
@@ -349,6 +352,7 @@ class AnswerStop:
     user: Message | None = None
     answered: bool = False
     on_answered: Callable[[], None] | None = None
+    visual: TurnVisual | None = None  # the turn's visual (§12.1), once started
 
 
 @dataclass
@@ -391,6 +395,7 @@ class _Progress:
     screen_visual: Visual | None = None  # the visual a question is about ("what's the second bar?")
     screen: list[str] = field(default_factory=list)  # that visual, described for the answer prompt
     edit: dict[str, Any] | None = None  # route.canvas_edit of an edit turn
+    labels: dict[str, str] = field(default_factory=dict)  # document id → label, for the company a question names
 
     @property
     def citable(self) -> list[Source | WebSource]:
@@ -424,6 +429,14 @@ def with_evidence(result: RetrievalResult | None, shown: Sequence[RankedChunk], 
         else Confidence(top_score=1.0, gap=1.0, dense_similarity=None, above_threshold=True)
     )
     return replace(result, chunks=chunks, confidence=confidence)
+
+
+def _delivered(visual: TurnVisual, events: Sequence[VisualEvent | CanvasEvent]) -> list[VisualEvent | CanvasEvent]:
+    """Events of a turn's visual on their way to the client (SSE): a ready visual among them is on screen now, so
+    a cut no longer withdraws it."""
+    if any(isinstance(e, VisualEvent) and e.phase == "ready" for e in events):
+        visual.delivered = True
+    return list(events)
 
 
 Basis = Literal["documents", "web", "general"]
@@ -614,12 +627,14 @@ class ChatTurnService:
         ``user``: the user message, if the caller already saved it with ``save_user_message``. While the turn runs,
         the chat's memory summary waits (or gives way if it is running): one LLM serves both.
 
-        The answer's visual (§12.1) is planned once the answer's text is complete. Its events (``VisualEvent``,
-        ``CanvasEvent``) travel in this stream unless ``on_visual`` is given: the stream then stays open after
-        ``AgentMessageEvent`` until the visual is ready, failed or given up (``canvas.planner_timeout_ms`` and a
-        little more). With ``on_visual`` (voice) they go there instead, as they come, and the stream ends with the
-        answer. A canvas edit's events are always in the stream (they come before its reply). The memory summary and
-        the next prompt's warm-up wait for the visual too: they would queue behind it on the model."""
+        The answer's visual (§12.1) is drafted when the retrieval returns and, unless the draft is confident, refined
+        by the planner once the answer's text is complete. Its events (``VisualEvent``, ``CanvasEvent``) travel in this
+        stream unless ``on_visual`` is given: the draft's with the answer's first delta, the refinement's after
+        ``AgentMessageEvent`` (the stream stays open until the visual is settled or given up:
+        ``canvas.planner_timeout_ms`` and a little more). With ``on_visual`` (voice) they go there instead, as they
+        come, and the stream ends with the answer. A canvas edit's events are always in the stream (they come before
+        its reply). The memory summary and the next prompt's warm-up wait for the planner too: they would queue
+        behind it on the model."""
         activity = chat_activity()
         activity.turn_started(turn.chat.id)
         p = _Progress(TurnPlan(query=turn.text, language=turn.language), stop=stop, visual_sink=on_visual)
@@ -630,6 +645,8 @@ class ChatTurnService:
         finally:
             job = functools.partial(self._after_turn, turn)
             visual = p.visual
+            if visual is not None:  # (a no-op once it was given the answer's text)
+                visual.answer_cut()  # never left waiting for an answer that won't come
             if visual is not None and visual.task is not None and not visual.done:
                 chat_id = turn.chat.id
                 visual.task.add_done_callback(lambda _: activity.turn_finished(chat_id, job, spawn=detach))
@@ -661,14 +678,23 @@ class ChatTurnService:
             async with contextlib.aclosing(self._answer(turn, history, clock, p)) as answer:
                 async for event in answer:
                     yield event
+            if p.visual is not None and not p.visual.answer_known:  # the answer failed: no planner, unseen draft goes
+                p.visual.answer_cut()
+                if not p.visual.delivered:
+                    p.visual.withdraw()
             if p.visual is not None and p.visual_sink is None:
-                # The answer is saved; the stream stays open for its visual, bounded (the planner's own timeout, then
-                # building it from the cells).
+                # The answer is saved; the stream stays open for its visual (the planner refining the draft, or
+                # planning one), bounded (the planner's own timeout, then building it from the cells).
                 async for event in p.visual.events(timeout=self._visual_wait_s()):
-                    yield event
+                    yield _delivered(p.visual, [event])[0]
         except (asyncio.CancelledError, GeneratorExit):
-            if p.visual is not None and p.visual_sink is None:
-                p.visual.cancel()  # the stream that would carry it is gone
+            if p.visual is not None:
+                if not p.answered:  # cut while it was written: the draft (if shown) stays, without the planner
+                    p.visual.answer_cut()
+                if p.visual_sink is None:  # the stream that would carry it is gone
+                    p.visual.cancel()
+                    if not p.visual.delivered:
+                        p.visual.withdraw()
             # Stopped (client gone, barge-in, "stop"): keep what was generated. Saves run as their own tasks, so a
             # consumer whose cancellation keeps re-firing (anyio cancel scopes) can't interrupt them; this frame waits
             # if it can. A caller passing ``stop`` (voice) always gets a saved answer, even an empty one.
@@ -839,6 +865,7 @@ class ChatTurnService:
                     yield event
                 return
         elif covered:
+            await self._start_draft(turn, p)  # the visual's draft, built while the answer is written (§12.1)
             yield SourcesEvent([*(s.citation() for s in p.sources), *web_citations], confidence, abstained=False)
         else:
             yield SourcesEvent(web_citations, None, abstained=False)
@@ -867,6 +894,9 @@ class ChatTurnService:
                     p.parts.append(piece)
                     model_parts.append(piece)
                     yield DeltaEvent(piece)
+                    if p.visual is not None and p.visual_sink is None:  # the draft, once the answer has started
+                        for event in _delivered(p.visual, p.visual.pending()):
+                            yield event
                     # The search ended with nothing left to add: the "searching the web" badge can go now.
                     if web is not None and web.taken == len(web.results) and (end := web.terminal_event()):
                         yield end
@@ -902,7 +932,8 @@ class ChatTurnService:
             p.abstained, p.reason = True, "not_covered"
         self._start_visual(turn, p, answer)
         if p.visual is not None and p.visual_sink is None:
-            for event in p.visual.pending():  # "preparing": the skeleton shows while the answer is saved
+            # the draft (or a skeleton) if no delta carried it yet: it shows while the answer is saved
+            for event in _delivered(p.visual, p.visual.pending()):
                 yield event
         route = self._route(turn, p, abstained=p.abstained, reason=p.reason)
         if p.abstained:
@@ -1013,46 +1044,116 @@ class ChatTurnService:
         async for event in self._save_answer(turn, answer, [], route_json, latency, p):
             yield event
 
-    def _start_visual(self, turn: Turn, p: _Progress, answer: str) -> None:
-        """The answer's visual (§12.1), started once the answer's text is complete (and before it is saved): Ollama
-        serves one request at a time, so a planner sent earlier would delay the answer's first token (measured: 0.8
-        → 4.1 s), and sent with the answer's first token it lands no sooner than now (§12.1). Only for an answer from
-        the documents (document, mixed or correction turns with sources, not abstained) whose question calls for a
-        visual (``route.visual``), or whose own figures suggest one when it drew on a table."""
+    def _wants_visual(self, p: _Progress, answer: str | None = None) -> VisualWant:
+        """``route.visual`` for an answer from the documents (document, mixed or correction turns with sources, not
+        abstained, not about a chart on screen), with the answer's own figures counted once there is one; a suggestion
+        needs a table among the sources."""
         plan = p.plan
         route = plan.route
-        if self.canvas is None or self.canvas.planner is None or route is None:
-            return
+        if self.canvas is None or route is None:
+            return "none"
         if plan.intent not in VISUAL_INTENTS or plan.mode not in ("grounded", "mixed"):
-            return
+            return "none"
         if p.abstained or not p.sources or p.screen_visual is not None:  # (a question about a chart on screen)
-            return
-        spoken = strip_markers(answer)
-        want = route.visual if route.visual != "none" else visual_want(answer=spoken)
-        p.visual_want = want
-        if want == "none":
-            return
+            return "none"
+        want = route.visual
+        if want == "none" and answer is not None:
+            want = visual_want(answer=answer)
         if want == "suggest" and not any(s.chunk.content_type == "table" for s in p.sources):
-            p.visual_want = "none"  # a suggestion needs a table behind the answer
+            return "none"  # a suggestion needs a table behind the answer
+        return want
+
+    async def _start_draft(self, turn: Turn, p: _Progress) -> None:
+        """The answer's visual (§12.1, "Instant draft, then refine"), started as soon as the turn's retrieval returns
+        when its words ask for one (``route.visual``): the draft is code (milliseconds, no model call, so nothing
+        queues in front of the answer on the serial model) and is on screen when the answer starts (voice: with its
+        first audio; SSE: with its first delta). The planner, when the draft isn't confident, waits for the answer's
+        text (``_start_visual``)."""
+        want = self._wants_visual(p)
+        if want == "none" or self.canvas is None:
             return
-        question = plan.query
+        p.visual_want = want
+        question = p.plan.query
+        if want == "suggest" and visual_intent(question) == "none":
+            question = turn.text  # the words that suggested it
+        self._launch_visual(turn, p, question, want, answer=None, labels=await self._document_labels(turn, p))
+
+    def _start_visual(self, turn: Turn, p: _Progress, answer: str) -> None:
+        """The answer's text is complete (and not yet saved). A visual started with the draft gets it: the planner
+        may refine the draft now (Ollama serves one request at a time, so a planner sent earlier would delay the
+        answer's first token: 0.8 → 4.1 s measured; §12.1), or, for an answer that turned out to abstain, the draft is
+        withdrawn. Otherwise the answer's own figures may suggest a visual (three or more, with a table among the
+        sources): its draft and, if needed, the planner run now, back to back."""
+        spoken = strip_markers(answer)
+        if p.visual is not None:
+            if p.abstained:
+                p.visual.answer_abstained()
+            else:
+                p.visual.answered(spoken)
+            return
+        want = self._wants_visual(p, spoken)
+        if want == "none" or self.canvas is None:
+            if p.visual_want != "none" and p.abstained:
+                p.visual_want = "none"
+            return
+        p.visual_want = want
+        question = p.plan.query
         if want == "suggest" and visual_intent(question, spoken) == "none":
             question = turn.text  # the words that suggested it
-        visual = p.visual = TurnVisual(turn.chat.id, new_id("vis"), want, announce=want == "requested")
+        # (only the answer's figures suggest it: a draft that isn't sure stays hidden, the planner decides)
+        self._launch_visual(turn, p, question, want, answer=spoken, labels=self._labels_now(p), show_unsure=False)
+
+    def _launch_visual(
+        self,
+        turn: Turn,
+        p: _Progress,
+        question: str,
+        want: VisualWant,
+        *,
+        answer: str | None,
+        labels: Mapping[str, str] | None,
+        show_unsure: bool = True,
+    ) -> None:
+        assert self.canvas is not None
+        canvas, chat_id = self.canvas, turn.chat.id
+        visual = p.visual = TurnVisual(chat_id, new_id("vis"), want, announce=want == "requested")
+        visual_id = visual.visual_id
+        visual.remove = lambda: canvas.remove_visual(chat_id, visual_id)
+        if answer is not None:
+            visual.answered(answer)
+        if p.stop is not None:
+            p.stop.visual = visual
         visual.start(
-            self.canvas.prepare_visual(
-                turn.chat.id,
+            canvas.prepare_visual(
+                chat_id,
                 question,
-                language=plan.language,
-                answer=spoken,
+                language=p.plan.language,
+                answer=answer,
                 sources=[s.citation() for s in p.sources],
-                query_en=plan.query_en,
+                query_en=p.plan.query_en,
                 force=want == "requested",
-                visual_id=visual.visual_id,
+                visual_id=visual_id,
+                turn=visual,
+                labels=labels,
+                show_unsure=show_unsure,
             )
         )
         if p.visual_sink is not None:
             detach(self._forward_visual(visual, p.visual_sink))
+
+    async def _document_labels(self, turn: Turn, p: _Progress) -> dict[str, str]:
+        """The chat's documents' labels (file name and title) as retrieval knows them (fetched with the search and
+        remembered, so this costs nothing), for which company a question names; file names otherwise."""
+        labels = self._labels_now(p)
+        if len(p.ready) >= 2:
+            with contextlib.suppress(Exception):
+                labels |= await self.retrieval.document_labels(scope_of(turn.chat.project_id, list(p.ready)))
+        p.labels = labels
+        return labels
+
+    @staticmethod
+    def _labels_now(p: _Progress) -> dict[str, str]:
+        return p.labels or {d: document_label(name, None) for d, name in p.ready.items()}
 
     @staticmethod
     async def _forward_visual(visual: TurnVisual, sink: VisualSink) -> None:
@@ -1485,12 +1586,17 @@ class ChatTurnService:
         visual = p.visual
         if visual is None:
             return
-        saved = (message.route or {}).get("visual_status")
+        saved = dict(message.route or {})
 
         async def write(v: TurnVisual) -> None:
             record = v.record()
-            if record and record.get("visual_status") != saved:
-                await self.messages.update_route(message.id, record)
+            changes = {k: value for k, value in record.items() if saved.get(k) != value}
+            if saved.get("visual_id") and record.get("visual_status") != "ready":  # a draft shown, then withdrawn
+                changes["visual_id"] = None
+                changes.setdefault("visual_status", v.status)
+            if changes:
+                saved.update(changes)
+                await self.messages.update_route(message.id, changes)
 
         visual.when_settled(write)
 

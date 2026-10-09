@@ -126,6 +126,8 @@ async def test_the_canvas_in_a_real_conversation(corpus: dict[str, CorpusDocumen
     if ready:
         METRICS["visual ready after the answer's text (ms, each)"] = [r["ready_after_answer_ms"] for r in ready]
         METRICS["visual ready after the first delta (ms, each)"] = [r["ready_after_first_ms"] for r in ready]
+        METRICS["the draft after the first delta (ms, each)"] = [r["draft_after_first_ms"] for r in ready]
+        METRICS["visual plans"] = [r["plan"] for r in ready]
     METRICS["follow-up first delta: visual cancelled vs done (ms)"] = follow
     marked = [m.route.get("visual_id") for m in transcript if m.role == "agent" and m.route]
     METRICS["agent messages with a visual id"] = f"{sum(1 for v in marked if v)}/{len(marked)}"
@@ -203,7 +205,9 @@ async def sse_turn(service: ChatTurnService, chat_id: str, t: T, titles: dict[st
             marks["agent_message"] = now
             agent = event.message
         elif isinstance(event, VisualEvent):
-            marks[f"visual_{event.phase}"] = now
+            marks[f"visual_{event.phase}"] = now  # the last one: the planner's, when it replaced the draft
+            if event.phase == "ready":
+                marks.setdefault("visual_first_ready", now)  # the draft (or the planner's, without one)
             if event.visual is not None:
                 visual = event.visual
         elif isinstance(event, CanvasEvent):
@@ -221,6 +225,8 @@ async def sse_turn(service: ChatTurnService, chat_id: str, t: T, titles: dict[st
         "agent_message": round(marks.get("agent_message", 0)),
         "ready_after_answer_ms": None,
         "ready_after_first_ms": None,
+        "draft_after_first_ms": None,
+        "plan": route.get("visual_plan"),
         "grounded": None,
         "visual": "none",
         "table_ok": None,
@@ -235,6 +241,7 @@ async def sse_turn(service: ChatTurnService, chat_id: str, t: T, titles: dict[st
         if "visual_ready" in marks and t.edit is None:
             row["ready_after_answer_ms"] = round(marks["visual_ready"] - marks["answer_done"])
             row["ready_after_first_ms"] = round(marks["visual_ready"] - marks["first_delta"])
+            row["draft_after_first_ms"] = round(marks["visual_first_ready"] - marks["first_delta"])
     elif "visual_failed" in marks:
         row["visual"] = "failed"
     if t.edit is not None:

@@ -21,7 +21,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { errorMessage, isAbort, type Api, type Language, type Message, type SourcesPayload, type StreamFailure } from "./api";
 import { publishRawCanvasEvent } from "./canvas/events";
 import { splitCitations } from "./citations";
-import { withVisual } from "./route";
+import { withVisual, withoutVisual } from "./route";
 import { applyTool, endSearch, NO_WEB, type WebTurn } from "./web-search";
 
 export type TurnPhase = "sending" | "searching" | "answering" | "done" | "failed" | "stopped";
@@ -62,9 +62,18 @@ export const spokenText = (text: string) =>
 
 /** The id of a visual that just became ready (`event: visual`, phase ready), else null. */
 function readyVisualId(name: string, data: unknown): string | null {
+  return visualIdIn(name, data, "ready");
+}
+
+/** The id of a visual that failed or was withdrawn (`event: visual`, phase failed), else null. */
+function failedVisualId(name: string, data: unknown): string | null {
+  return visualIdIn(name, data, "failed");
+}
+
+function visualIdIn(name: string, data: unknown, phase: string): string | null {
   if (name !== "visual" || !data || typeof data !== "object") return null;
   const d = data as { phase?: unknown; visual_id?: unknown };
-  return d.phase === "ready" && typeof d.visual_id === "string" ? d.visual_id : null;
+  return d.phase === phase && typeof d.visual_id === "string" ? d.visual_id : null;
 }
 
 let counter = 0;
@@ -113,6 +122,9 @@ export function useChatTurns(api: Api, chatId: string, onSettled?: () => void, o
             publishRawCanvasEvent(chatId, ev.name, ev.data); // the canvas follows visuals as they are prepared (lib/canvas)
             const visualId = readyVisualId(ev.name, ev.data);
             if (visualId) update(key, (t) => (t.agent ? { ...t, agent: withVisual(t.agent, visualId) } : t)); // "Chart added"
+            // a draft shown, then withdrawn (the planner found no table for it): no "Chart added" any more
+            const gone = failedVisualId(ev.name, ev.data);
+            if (gone) update(key, (t) => (t.agent ? { ...t, agent: withoutVisual(t.agent, gone) } : t));
             continue;
           }
           if (ev.type === "delta") {

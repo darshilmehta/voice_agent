@@ -13,6 +13,7 @@ import pytest
 from app.domain.canvas import CanvasEvent, Visual, VisualEvent
 from app.services.canvas.builder import build_visual
 from app.services.canvas.conversation import (
+    WITHDRAW,
     CanvasEdit,
     TurnVisual,
     describe,
@@ -21,6 +22,7 @@ from app.services.canvas.conversation import (
     refers_to_screen,
     resolve_target,
     screen_lines,
+    settled_callbacks,
     visual_in_progress,
     visual_want,
 )
@@ -242,7 +244,9 @@ async def test_a_requested_visual_announces_itself_and_ends_ready():
         ("visual", "ready"),
         ("canvas", None),
     ]
-    assert v.status == "ready" and v.record() == {"visual_status": "ready", "visual_id": "vis_a"}
+    assert v.status == "ready"
+    plan = {"draft": None, "planner": None}
+    assert v.record() == {"visual_status": "ready", "visual_id": "vis_a", "visual_plan": plan}
     await v.wait()
     assert visual_in_progress("c1") is None
 
@@ -295,6 +299,74 @@ async def test_preparing_that_yields_nothing_ends_as_none():
     got = [e async for e in v.events()]
     assert [(e.phase, e.detail) for e in got] == [("preparing", None), ("failed", "no visual")]  # type: ignore[union-attr]
     assert v.status == "none"
+
+
+async def test_a_shown_draft_stays_when_its_refinement_is_cancelled():
+    v = TurnVisual("c7", "vis_g", "requested", announce=True)
+    v.start(events_of(ready("vis_g"), CanvasEvent(panels=[]), hang=60))  # the draft, then the planner (slow)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert [e.name for e in v.pending()] == ["visual", "visual", "canvas"]
+    v.trace.draft = "refine"
+    v.cancel()  # the next question needs the model
+    assert [e async for e in v.events()] == []  # no "failed": the draft is the turn's visual
+    assert v.status == "ready" and v.trace.planner == "cancelled"
+    assert v.record()["visual_id"] == "vis_g"
+
+
+async def test_withdrawing_a_draft_nobody_saw_takes_it_off_the_canvas():
+    removed: list[str] = []
+
+    async def remove() -> None:
+        removed.append("vis_h")
+
+    v = TurnVisual("c8", "vis_h", "requested", announce=True, remove=remove)
+    v.start(events_of(ready("vis_h"), CanvasEvent(panels=[]), hang=60))
+    for _ in range(3):
+        await asyncio.sleep(0)
+    v.withdraw()  # cut before its first audio
+    await v.wait()
+    await settled_callbacks()
+    assert removed == ["vis_h"] and v.pending() == [] and [e async for e in v.events()] == []
+    assert v.status == "cancelled" and v.record() == {"visual_status": "cancelled", "visual_detail": "withdrawn"}
+
+
+async def test_a_delivered_draft_is_never_withdrawn():
+    v = TurnVisual("c9", "vis_i", "suggest", announce=False)
+    v.start(events_of(ready("vis_i")))
+    await v.wait()
+    v.delivered = True
+    v.withdraw()
+    assert v.status == "ready"
+
+
+@pytest.mark.parametrize(("how", "expected"), [("answered", "Revenue rose."), ("cut", None), ("abstained", WITHDRAW)])
+async def test_the_planner_waits_for_the_answer_or_its_cut(how, expected):
+    v = TurnVisual("c10", "vis_j", "requested", announce=True)
+    v.start(events_of())
+    waiting = asyncio.ensure_future(v.answer())
+    await asyncio.sleep(0)
+    assert not waiting.done()
+    {"answered": lambda: v.answered("Revenue rose."), "cut": v.answer_cut, "abstained": v.answer_abstained}[how]()
+    assert await waiting is expected or await waiting == expected
+    v.answered("too late")  # settled once
+    assert (await v.answer()) == expected
+
+
+async def test_a_withdrawn_visual_rewrites_what_was_recorded():
+    v = TurnVisual("c11", "vis_k", "requested", announce=True)
+    seen: list[str] = []
+
+    async def note(tv: TurnVisual) -> None:
+        seen.append(tv.status)
+
+    v.start(events_of(ready("vis_k")))
+    await v.wait()
+    v.when_settled(note)
+    await settled_callbacks()
+    v.withdraw()
+    await settled_callbacks()
+    assert seen == ["ready", "cancelled"]
 
 
 def test_visual_fixture_sanity():

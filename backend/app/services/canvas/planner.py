@@ -11,8 +11,11 @@ and which one.
              → for a "requested" visual the model can't place (timeout, invalid): a default chart of the best
                candidate (``source: "heuristic"``)
 
-A turn calls ``VisualPlanner.plan`` once its answer's text is complete (``CanvasService.prepare_visual`` through
-``conversation.TurnVisual``), and a spoken edit the rules can't read asks it again with the visual as context.
+A turn draws a draft first (``draft.py``: code, the same candidates) and calls ``VisualPlanner.plan_detailed`` only when
+the draft isn't confident, once its answer's text is complete (``CanvasService.prepare_visual`` through
+``conversation.TurnVisual``), with the draft's candidates; a spoken edit the rules can't read asks it again with the
+visual as context. Candidates are company-aware (``rank_candidates``): a question that names one company's documents
+is offered only their tables.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ import logging
 import re
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -42,21 +45,66 @@ log = logging.getLogger(__name__)
 
 Intent = Literal["requested", "suggested", "none"]
 
-_REQUESTED = re.compile(
-    r"\b(show|chart|graph|plot|visuali[sz]e|draw|display|dashboard|diagram|pie|bar\s+chart|line\s+chart|"
-    r"put\s+(it|that|this)\s+on\s+(the\s+)?screen|on\s+screen|"
-    r"dikhao|dikhaao|dikhaiye|dikhaye|dikha\s+do|dikhana|chart\s+banao|graph\s+banao)\b"
-    r"|दिखाओ|दिखाइए|दिखाएं|दिखाएँ|दिखा\s+दो|दिखाना|चार्ट|ग्राफ़|ग्राफ|आरेख",
-    re.I,
+_GATE_LETTER = "A-Za-z0-9ऀ-ॣ०-ॿ"
+
+
+def _gate(alternatives: str) -> re.Pattern[str]:
+    """Whole words or phrases, in English, Hinglish or Hindi (\\b fails after Hindi vowel signs)."""
+    return re.compile(f"(?<![{_GATE_LETTER}])(?:{alternatives})(?![{_GATE_LETTER}])", re.I)
+
+
+# The user asks to see something.
+_REQUESTED = _gate(
+    r"show|chart|charts|graph|graphs|plot|visuali[sz]e|draw|display|dashboard|diagram|pie|bar\s+chart|line\s+chart|"
+    r"put\s+(?:it|that|this|them)\s+on\s+(?:the\s+)?screen|on\s+(?:the\s+)?screen|"
+    r"put\s+(?:\S+\s+){1,6}?up\s+(?:against|next\s+to|beside|alongside|side\s+by\s+side)|"
+    r"let\s+me\s+see|can\s+i\s+see|i(?:\s+want|\s+would\s+like|['\u2019]d\s+like)\s+to\s+see|"
+    r"dikhao|dikhaao|dikhaiye|dikhayiye|dikhaye|dikha\s+do|dikhana|chart\s+banao|graph\s+banao|"
+    r"दिखाओ|दिखाइए|दिखाइये|दिखाएं|दिखाएँ|दिखा\s+दो|दिखाना|चार्ट|ग्राफ़|ग्राफ|आरेख"
 )
-_SUGGESTED = re.compile(
-    r"\b(compare|comparison|versus|vs\.?|trend|trends|over\s+(the\s+)?(years|quarters|time|period)|"
-    r"year\s+on\s+year|yoy|quarter\s+(by|on)\s+quarter|quarterly|breakdown|break\s+down|split|share|mix|"
-    r"composition|growth|grew|grown|increase|decrease|declined?|rise|rose|fell|fall|moved?|changed?|"
-    r"how\s+has|how\s+did|bridge|segment(s|-wise)?|by\s+segment|by\s+district|each|all\s+the|"
-    r"tulna|badhat|badha|ghata|hissa|rujhan)\b"
-    r"|तुलना|रुझान|बढ़त|वृद्धि|बढ़ा|घटा|हिस्सा|बंटवारा|हर\s+तिमाही|तिमाही|सालाना|खंड",
-    re.I,
+# ... unless "show" is what a document does ("What does the report show about debt?").
+_SHOWS = re.compile(r"\b(?:does|did|do|will|would)\s+(?:[^\s?.!।]+\s+){0,5}?show\b|\bshows\b", re.I)
+_VERBS_OF_CHANGE = (
+    r"move[ds]?|moving|change[ds]?|changing|grow|grows|grew|grown|growing|evolve[ds]?|trend\w*|perform\w*|fare[ds]?|"
+    r"stack\s+up|compare[ds]?|do|did|go|went|look"
+)
+_CATEGORY_NOUNS = (
+    r"segments?|business(?:es)?|divisions?|districts?|regions?|grades?|courses?|categor(?:y|ies)|plants?|"
+    r"facilit(?:y|ies)|units?"
+)
+_SUPERLATIVE = r"most|highest|lowest|largest|biggest|smallest|least|fastest|slowest|best|worst|top|sabse|सबसे"
+# The words suggest a visual helps: a trend, a comparison, a breakdown, a ranking of categories, a bridge, headline
+# numbers, dates. Plain facts ("What share of revenue came from exports?", "dividend per share", "each day") don't.
+_SUGGESTED = _gate(
+    # trends
+    r"trends?|trending|over\s+(?:the\s+)?(?:years|quarters|months|time|period)|year\s+(?:on|over)\s+year|yoy|"
+    r"quarter\s+(?:by|on|after|to|over)\s+quarter|quarterly|(?:each|every)\s+quarter|"
+    r"across\s+(?:the\s+|all\s+(?:the\s+)?)?(?:quarters|years|segments|businesses)|"
+    rf"how\s+(?:has|have|did|does|do|is|are)\s+(?:\S+\s+){{0,6}}?(?:{_VERBS_OF_CHANGE})|"
+    # comparisons
+    r"compare[ds]?|comparing|comparison|versus|vs\.?|stack\s+up|stacks\s+up|relative\s+to|"
+    r"against\s+(?:the\s+)?(?:previous|last|prior|same|a\s+year)|"
+    r"(?:better|worse|higher|lower|bigger|smaller|stronger|weaker)\s+than|"
+    r"(?:which|who)\s+(?:\S+\s+){0,5}?(?:better|worse|stronger|weaker)|"
+    r"(?:from|since|over|against|versus|than|with)\s+(?:the\s+)?(?:last|previous|prior)\s+year|"
+    r"(?:a|one)\s+year\s+(?:ago|earlier|before)|"
+    r"tulna|mukable|mukabale|muqable|pichle\s+saal|तुलना|मुक़ाबले|मुकाबले|पिछले\s+साल|"
+    # breakdowns
+    r"break\s*down|breakdown|break\s+(?:\S+\s+){1,4}?down|split\s+(?:by|across|between|of|into)|composition|"
+    r"distribution|(?:revenue|sales|business|product|segment|portfolio)\s+mix|made\s+up\s+of|consists?\s+of|"
+    rf"comprises?|by\s+(?:{_CATEGORY_NOUNS})|segment-?wise|district-?wise|each\s+(?:{_CATEGORY_NOUNS})|"
+    r"who\s+owns|ownership|shareholding|contribut\w*\s+(?:the\s+)?most|kis\s+kis|"
+    r"बंटवारा|बँटवारा|किस[\s-]+किस|जिलेवार|ज़िलेवार|खंडवार|"
+    # rankings of categories
+    rf"(?:which|what|kaun\s*s[aei]|kaunsa|kaunsi|कौन\s*स[ाीे]|किस)\s+(?:\S+\s+){{0,6}}?(?:{_SUPERLATIVE})|"
+    rf"(?:{_SUPERLATIVE})\s+(?:\S+\s+){{0,6}}?(?:which|kaun|किस|कौन)|rank\w*|top\s+(?:\d+|three|five|ten)|"
+    # bridges and headline numbers
+    r"walk\s+(?:me\s+|us\s+)?through|bridge|waterfall|turns?\s+into|from\s+(?:revenue|sales|ebitda)\s+(?:\S+\s+){0,3}?to|"
+    r"headline\s+(?:numbers|figures|metrics)|key\s+(?:numbers|figures|metrics|financials|highlights|indicators)|"
+    r"highlights|at\s+a\s+glance|snapshot|scorecard|ek\s+nazar|एक\s+नज़र|एक\s+नजर|मुख्य\s+(?:आंकड़े|आँकड़े|वित्तीय)|"
+    # dates
+    r"timeline|milestones|(?:key|important)\s+dates|schedule|"
+    r"rujhan|रुझान|हर\s+तिमाही|तिमाही\s+दर\s+तिमाही|har\s+(?:quarter|timahi|saal)"
 )
 # "Q3 FY24" is one period (a single quarter's figure is a fact, not a comparison); "Q3 and Q4", "FY23 vs FY24" are two.
 _PERIOD_TOKEN = re.compile(
@@ -66,16 +114,19 @@ _NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
 
 def visual_intent(question: str, answer: str | None = None) -> Intent:
-    """Is a visual worth it? "requested": the user asked to see something; "suggested": a trend, comparison,
-    breakdown, several periods, or an answer with three or more numbers; "none": a plain fact or a chat turn."""
-    if _REQUESTED.search(question):
+    """Is a visual worth it? "requested": the user asked to see something ("show", "chart", "put … up against",
+    "dikhao", "दिखाओ"); "suggested": a trend, a comparison, a breakdown, a ranking of categories ("which segment grew
+    the fastest"), a bridge, headline numbers, dates, two or more periods, or an answer with three or more numbers;
+    "none": a plain fact or a chat turn (EN, HI, Hinglish)."""
+    text = question.casefold()
+    if _REQUESTED.search(text) and not (_SHOWS.search(text) and not _REQUESTED.search(_SHOWS.sub(" ", text))):
         return "requested"
     if (
-        _SUGGESTED.search(question)
+        _SUGGESTED.search(text)
         or len({m.group(0).upper().replace(" ", "") for m in _PERIOD_TOKEN.finditer(question)}) >= 2
     ):
         return "suggested"
-    if answer is not None and len(_NUMBER.findall(answer)) >= 3:
+    if answer is not None and len(_NUMBER.findall(_PERIOD_TOKEN.sub(" ", answer))) >= 3:  # figures, not "FY24"
         return "suggested"
     return "none"
 
@@ -129,31 +180,74 @@ def _dataset_words(ds: TypedDataset) -> set[str]:
     return set().union(*(_words(t) for t in texts))
 
 
+RETRIEVED_TABLE_BOOST = 3  # the turn's retrieval found this table
+SOURCE_DOCUMENT_BOOST = 6  # the table is in a document the turn's sources come from (strongly preferred)
+
+
+def score_candidates(
+    question: str,
+    datasets: Sequence[TypedDataset],
+    *,
+    query_en: str | None = None,
+    source_chunks: Collection[str] = (),
+    documents: Collection[str] | None = None,
+    source_documents: Collection[str] = (),
+    names: Collection[str] = (),
+) -> list[tuple[float, TypedDataset]]:
+    """Every chartable dataset with its score, best first (see ``rank_candidates``). ``names``: the company names the
+    question was matched to its documents by; they choose the documents, so they don't count as words ("Zephyra" in
+    the title "Zephyra at a glance" says nothing about which of Zephyra's tables is meant)."""
+    words = _words(question) | (_words(query_en) if query_en else set())
+    words -= {_stem(n.casefold()) for n in names}
+    text = f"{question} {query_en or ''}"
+    chartable = [ds for ds in datasets if ds.chartability.kind != "none"]
+    if documents:  # the question names a company: only its documents' tables (when it has chartable ones)
+        chartable = [ds for ds in chartable if ds.document_id in documents] or chartable
+    scored = []
+    for ds in chartable:
+        overlap = len(words & _dataset_words(ds))
+        title_words = words & _words(ds.title)
+        # a period in the title ("Quarterly performance: FY24") tells the year apart, its words say what the table is
+        title_hit = sum(0.5 if _PERIOD_TOKEN.fullmatch(w) else 1 for w in title_words)
+        shape = sum(1.5 for pattern, fits in _WANTS if pattern.search(text) and fits(ds))
+        boost = RETRIEVED_TABLE_BOOST if ds.chunk_id and ds.chunk_id in source_chunks else 0
+        boost += SOURCE_DOCUMENT_BOOST if ds.document_id in source_documents else 0
+        score = overlap + 2 * title_hit + shape + boost + ds.chartability.confidence  # the title says most
+        scored.append((score, -(ds.page_start or 0), ds))
+    scored.sort(key=lambda t: (-t[0], -t[1]))
+    return [(score, ds) for score, _, ds in scored]
+
+
 def rank_candidates(
     question: str,
     datasets: Sequence[TypedDataset],
     *,
     query_en: str | None = None,
-    source_chunks: Sequence[str] = (),
+    source_chunks: Collection[str] = (),
+    documents: Collection[str] | None = None,
+    source_documents: Collection[str] = (),
+    names: Collection[str] = (),
     limit: int = 4,
 ) -> list[TypedDataset]:
     """Chartable datasets most related to the question: word overlap with the title, labels and periods, the shape
     the question asks for (quarterly, a trend, a breakdown, headline numbers, dates), a boost for the tables the
-    turn's retrieval found; the chartability confidence breaks ties."""
-    words = _words(question) | (_words(query_en) if query_en else set())
-    text = f"{question} {query_en or ''}"
-    scored = []
-    for ds in datasets:
-        if ds.chartability.kind == "none":
-            continue
-        overlap = len(words & _dataset_words(ds))
-        title_hit = len(words & _words(ds.title))
-        shape = sum(1.5 for pattern, fits in _WANTS if pattern.search(text) and fits(ds))
-        boost = 3 if ds.chunk_id and ds.chunk_id in source_chunks else 0
-        score = overlap + 2 * title_hit + shape + boost + ds.chartability.confidence  # the title says most
-        scored.append((score, -(ds.page_start or 0), ds))
-    scored.sort(key=lambda t: (-t[0], -t[1]))
-    return [ds for _, _, ds in scored[:limit]]
+    turn's retrieval found and for the documents its sources come from; the chartability confidence breaks ties.
+
+    Company-aware (§12.1): ``documents`` are the documents the question names (``subjects.named_documents``: "Valmora's
+    segments" names the Valmora documents); when they have chartable tables, only those are candidates, so neither
+    the draft nor the planner can pick the other company's lookalike table, however many words it shares with the
+    question. ``source_documents``: the documents of the turn's retrieved sources (which since #37 keep to a named
+    company's passages), strongly preferred. ``names``: the names that matched ``documents``."""
+    scored = score_candidates(
+        question,
+        datasets,
+        query_en=query_en,
+        source_chunks=source_chunks,
+        documents=documents,
+        source_documents=source_documents,
+        names=names,
+    )
+    return [ds for _, ds in scored[:limit]]
 
 
 # ------------------------------------------------------------------ the model-facing schema
@@ -573,6 +667,9 @@ def default_spec(ds: TypedDataset, pool: Sequence[TypedDataset], language: str) 
     return first_valid(VisualSpec(kind="bar", datasets=[ds.id], series=series, language=language), by_id, check)  # type: ignore[arg-type]
 
 
+NO_VISUAL = "the model chose no visual"  # PlanResult.reason when the model answered kind "none"
+
+
 class VisualPlanner:
     """Chooses a visual for a question with the router model. Long-lived; stateless between calls."""
 
@@ -600,12 +697,15 @@ class VisualPlanner:
         answer: str | None = None,
         filenames: Mapping[str, str] | None = None,
         query_en: str | None = None,
-        source_chunks: Sequence[str] = (),
+        source_chunks: Collection[str] = (),
+        documents: Collection[str] | None = None,
+        source_documents: Collection[str] = (),
+        names: Collection[str] = (),
         force: bool = False,
     ) -> VisualSpec | None:
         """The visual for ``question`` (None: not worth one, or nothing fits). ``candidates``: the datasets the
         question may draw on (the chat's documents); ``force``: plan even when the question doesn't call for a
-        visual."""
+        visual; ``documents`` / ``source_documents`` / ``names``: the company-aware ranking (``rank_candidates``)."""
         return (
             await self.plan_detailed(
                 question,
@@ -615,6 +715,9 @@ class VisualPlanner:
                 filenames=filenames,
                 query_en=query_en,
                 source_chunks=source_chunks,
+                documents=documents,
+                source_documents=source_documents,
+                names=names,
                 force=force,
             )
         ).spec
@@ -628,16 +731,33 @@ class VisualPlanner:
         answer: str | None = None,
         filenames: Mapping[str, str] | None = None,
         query_en: str | None = None,
-        source_chunks: Sequence[str] = (),
+        source_chunks: Collection[str] = (),
+        documents: Collection[str] | None = None,
+        source_documents: Collection[str] = (),
+        names: Collection[str] = (),
+        ranked: Sequence[TypedDataset] | None = None,
         force: bool = False,
+        fallback: bool = True,
     ) -> PlanResult:
+        """``ranked``: the candidates to offer, already ranked (the draft's: the same tables, in the same order);
+        otherwise ``rank_candidates``. ``fallback``: a requested visual the model can't place gets the best
+        candidate's default chart (off when a draft is already on screen: it stays instead)."""
         started = time.perf_counter()
         intent = visual_intent(question, answer)
         if intent == "none" and not force:
             return PlanResult(None, intent, "none", "the question doesn't call for a visual")
-        ranked = rank_candidates(
-            question, candidates, query_en=query_en, source_chunks=source_chunks, limit=self.max_candidates
-        )
+        if ranked is None:
+            ranked = rank_candidates(
+                question,
+                candidates,
+                query_en=query_en,
+                source_chunks=source_chunks,
+                documents=documents,
+                source_documents=source_documents,
+                names=names,
+                limit=self.max_candidates,
+            )
+        ranked = list(ranked)[: self.max_candidates]
         if not ranked:
             return PlanResult(None, intent, "none", "no chartable table")
         pool = {d.id: d for d in candidates}
@@ -659,7 +779,7 @@ class VisualPlanner:
             result.raw = raw
             spec = to_spec(raw, cat, language)
             if spec is None:
-                result.reason = "the model chose no visual"
+                result.reason = NO_VISUAL
             else:
                 valid = first_valid(spec, pool, builds(pool, filenames))
                 if valid is not None:
@@ -670,11 +790,11 @@ class VisualPlanner:
             result.reason = f"planner timed out after {self.timeout_s:.1f}s"
         except (LLMError, ValueError) as e:
             result.reason = f"planner failed: {e}"
-        if result.spec is None and result.reason != "the model chose no visual" and (intent == "requested" or force):
+        if result.spec is None and result.reason != NO_VISUAL and (intent == "requested" or force) and fallback:
             # asked to see something and the model couldn't place it: the best candidate's default chart
-            fallback = default_spec(ranked[0], list(candidates), language)
-            if fallback is not None:
-                result.spec, result.source = fallback, "heuristic"
+            default = default_spec(ranked[0], list(candidates), language)
+            if default is not None:
+                result.spec, result.source = default, "heuristic"
         result.latency_ms = round((time.perf_counter() - started) * 1000)
         log.info(
             "visual plan: intent=%s source=%s kind=%s %sms%s",

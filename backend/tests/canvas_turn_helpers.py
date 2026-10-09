@@ -52,6 +52,28 @@ def choose(kind: str, *words: str, **extra: Any) -> Callable[[list[LLMMessage]],
     return pick
 
 
+def choose_table(kind: str, row: str, *series: str, **extra: Any) -> Callable[[list[LLMMessage]], Choice]:
+    """A planner that picks the offered table with a row labelled ``row`` (the quarterly table: "Q1 FY24"), plotting
+    its ``series`` (or, with none, the row itself)."""
+
+    def pick(messages: list[LLMMessage]) -> Choice:
+        lines = messages[-1].content.split("Tables:\n", 1)[1].splitlines()
+        alias = None
+        for line in lines:
+            if not line.startswith("  "):
+                alias = line.split(" ", 1)[0]
+            elif alias and line.strip().startswith("rows:") and row in line:
+                return {
+                    "kind": kind,
+                    "datasets": [alias],
+                    "series": [f"{alias} · {s}" for s in series] or [f"{alias} · {row}"],
+                    **extra,
+                }
+        return {"kind": "none", "datasets": ["D1"], "series": []}
+
+    return pick
+
+
 class Script:
     """The fake model's JSON calls: router proposals by utterance, the planner's choice, and when each call came."""
 
@@ -108,4 +130,13 @@ def donut_of_segments(api: TestClient, chat_id: str, ds: dict[str, dict[str, Any
     return add_visual(api, chat_id, kind="donut", datasets=[s], series=[f"{s}:revenue_fy24"], title="Segment revenue")
 
 
-__all__ = ["REPORT", "Script", "add_visual", "choose", "donut_of_segments", "line_of_revenue", "report_chat"]
+__all__ = [
+    "REPORT",
+    "Script",
+    "add_visual",
+    "choose",
+    "choose_table",
+    "donut_of_segments",
+    "line_of_revenue",
+    "report_chat",
+]

@@ -3,7 +3,8 @@ router and the answer, edits of the canvas said in words (English, Hindi, Hingli
 beside its answer. Pure functions, except ``TurnVisual`` (a task) and the per-chat registry of visuals in progress.
 
     visual_want(utterance, rewritten)  "requested" ("show me", "chart", "dikhao", "दिखाओ") / "suggest" (trends,
-                                       comparisons, breakdowns, two or more periods) / "none": ``route.visual``
+                                       comparisons, breakdowns, rankings, bridges, headline numbers, dates, two or
+                                       more periods) / "none": ``route.visual``
     screen_lines(panels, utterance)    the canvas as a few short lines (kind, title, x and series labels, highlight;
                                        no numbers) for the router, plus what an utterance points at ("the second bar":
                                        Engineered Plastics; "the dip": Q2 FY23)
@@ -15,8 +16,12 @@ beside its answer. Pure functions, except ``TurnVisual`` (a task) and the per-ch
     resolve_target(utterance, panels)  which visual "that / it / the pie / the second chart / the revenue chart"
                                        means: a named kind, an ordinal, title words, else the one the conversation
                                        touched last (the most recently added or edited)
-    TurnVisual                         ``CanvasService.prepare_visual`` as its own task, its events queued for the
-                                       turn's transport; cancellable; the outcome written onto the turn's message
+    TurnVisual                         ``CanvasService.prepare_visual`` as its own task, started with the turn's
+                                       retrieval: its draft at once, the planner once the answer's text is given
+                                       (``answered``; a cut answer keeps the draft, an abstaining one withdraws it);
+                                       its events queued for the turn's transport; cancellable (a shown draft stays);
+                                       ``withdraw`` for a draft nobody saw; the outcome and ``VisualTrace`` written
+                                       onto the turn's message (``route.visual_plan``)
 
 "Focused" means most recently added or edited: the frontend doesn't tell the backend which panel the user looks at.
 """
@@ -27,6 +32,7 @@ import asyncio
 import contextlib
 import logging
 import re
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
@@ -488,15 +494,67 @@ def edit_reply(outcome: EditOutcome, language: str) -> str:
 
 VisualStatus = Literal["preparing", "ready", "failed", "cancelled", "none"]
 CanvasEvents = VisualEvent | CanvasEvent
+PlannerOutcome = Literal["skipped", "same", "changed", "planned", "none", "failed", "not_run", "cancelled"]
+
+
+class _Withdraw:
+    """The answer turned out to be an abstention: the draft goes (``TurnVisual.answer_abstained``)."""
+
+
+WITHDRAW = _Withdraw()
+AnswerText = str | None | _Withdraw
+
+
+@dataclass(slots=True)
+class VisualTrace:
+    """How a turn's visual was made (``route.visual_plan``, §12.1): the instant draft (code) and the planner (model).
+
+    ``draft``: "confident" (the visual, no planner), "refine" (shown, the planner asked to improve it) or "none" (no
+    draft could be built: the planner alone, as before). ``planner``: "skipped" (confident draft), "same" (it chose
+    what the draft shows), "changed" (it replaced the draft in place), "planned" (no draft: its visual is the turn's),
+    "none" (it found no table fits: the draft was withdrawn), "failed" (timeout or invalid output: the draft stands),
+    "not_run" (the answer was cut or abstained),
+    "cancelled" (the next turn needed the model)."""
+
+    started: float = field(default_factory=time.perf_counter)
+    draft: Literal["confident", "refine", "none"] | None = None
+    draft_ms: float | None = None  # the draft built and stored, from the visual's start
+    reasons: list[str] = field(default_factory=list)
+    planner: PlannerOutcome | None = None
+    planner_ms: float | None = None  # the planner's own call
+    draft_at: float | None = None  # perf_counter: the draft's ready event
+    refined_at: float | None = None  # perf_counter: the planner's visual replaced it (or was added)
+
+    def ms(self) -> float:
+        return round((time.perf_counter() - self.started) * 1000, 1)
+
+    def record(self) -> dict[str, object]:
+        out: dict[str, object] = {"draft": self.draft, "planner": self.planner}
+        if self.draft_ms is not None:
+            out["draft_ms"] = self.draft_ms
+        if self.planner_ms is not None:
+            out["planner_ms"] = self.planner_ms
+        if self.reasons:
+            out["reasons"] = self.reasons[:4]
+        return out
 
 
 @dataclass(eq=False)
 class TurnVisual:
-    """A turn's visual, prepared beside its answer: ``events`` (``CanvasService.prepare_visual``) consumed by its own
-    task, every event queued for the turn's transport. ``announce``: send ``preparing`` (a skeleton) and ``failed``
-    (a quiet note); off for a suggested visual, which appears only if it works. Cancelling it (a newer turn that
-    needs the model, the stop button, the session ending, a stream that can't wait any longer) ends the queue with
-    ``failed {detail}`` when a skeleton was shown, so the client drops it."""
+    """A turn's visual, prepared beside its answer (§12.1, "Instant draft, then refine"): ``events``
+    (``CanvasService.prepare_visual``) consumed by its own task, every event queued for the turn's transport.
+
+    It starts as soon as the turn's retrieval returns: the draft (code, milliseconds) is ready long before the
+    answer's first words; the transport holds it until the answer has started (voice: its first audio; SSE: its first
+    delta) and marks it ``delivered``. The planner then waits for the answer's text (``answered``), unless the draft
+    is confident; an answer that is cut (``answer_cut``) keeps the draft as it is, one that abstains
+    (``answer_abstained``) withdraws it. ``withdraw`` removes a draft the client never got (a turn cut before its
+    first audio).
+
+    ``announce``: send ``preparing`` (a skeleton) and ``failed`` (a quiet note); off for a suggested visual, which
+    appears only if it works. Cancelling it (a newer turn that needs the model, the stop button, the session ending, a
+    stream that can't wait any longer) stops the planner: a draft already shown stays the turn's visual; without one,
+    the queue ends with ``failed {detail}`` when a skeleton was shown, so the client drops it."""
 
     chat_id: str
     visual_id: str
@@ -506,12 +564,20 @@ class TurnVisual:
     detail: str | None = None
     queue: asyncio.Queue[CanvasEvents | None] = field(default_factory=asyncio.Queue)
     task: asyncio.Task[None] | None = None
+    trace: VisualTrace = field(default_factory=VisualTrace)
+    delivered: bool = False  # the client got a ready visual (set by the transport)
+    remove: Callable[[], Awaitable[None]] | None = None  # takes the visual off the canvas (``withdraw``)
+    _answer: asyncio.Future[AnswerText] | None = None
     _callbacks: list[Callable[[TurnVisual], Awaitable[None]]] = field(default_factory=list)
     _settled: bool = False
     _cancel_detail: str = "cancelled"
     _ended: bool = False
+    _withdrawn: bool = False
+    _stored: bool = False  # a ready visual is on the canvas
 
     def start(self, events: AsyncIterator[CanvasEvents]) -> TurnVisual:
+        if self._answer is None:
+            self._answer = asyncio.get_running_loop().create_future()
         if self.announce:
             self.queue.put_nowait(VisualEvent(phase="preparing", visual_id=self.visual_id))
         self.task = asyncio.ensure_future(self._run(events))
@@ -524,14 +590,53 @@ class TurnVisual:
     def done(self) -> bool:
         return self.task is not None and self.task.done()
 
+    # -------------------------------------------------------------- the answer
+
+    def _settle_answer(self, value: AnswerText) -> None:
+        if self._answer is None:
+            self._answer = asyncio.get_running_loop().create_future()
+        if not self._answer.done():
+            self._answer.set_result(value)
+
+    def answered(self, text: str) -> None:
+        """The answer's text is complete: the planner may refine the draft with it."""
+        self._settle_answer(text)
+
+    def answer_cut(self) -> None:
+        """The answer was cut (or failed) before its text was complete: the draft stays as it is, no planner."""
+        self._settle_answer(None)
+
+    def answer_abstained(self) -> None:
+        """The answer says the documents don't cover the question: no visual (the draft is withdrawn)."""
+        self._settle_answer(WITHDRAW)
+
+    @property
+    def answer_known(self) -> bool:
+        """It was given the answer's text, or told there is none (cut, abstained)."""
+        return self._answer is not None and self._answer.done()
+
+    async def answer(self) -> AnswerText:
+        if self._answer is None:
+            self._answer = asyncio.get_running_loop().create_future()
+        return await asyncio.shield(self._answer)
+
+    # -------------------------------------------------------------- the task
+
     async def _run(self, events: AsyncIterator[CanvasEvents]) -> None:
         try:
             async with contextlib.aclosing(events):  # type: ignore[type-var]
                 async for event in events:
+                    if self._withdrawn:
+                        continue
                     if isinstance(event, VisualEvent):
                         if event.phase == "preparing":
                             continue  # announced at the start
-                        self.status = event.phase
+                        if event.phase == "ready":
+                            self._stored = True
+                        elif self.status == "ready":  # a shown draft withdrawn (the planner: no table fits)
+                            self._stored = False
+                        cancelled = event.phase == "failed" and event.detail == "cancelled"
+                        self.status = "cancelled" if cancelled else event.phase
                         self.detail = event.detail
                         if event.phase == "failed" and not self.announce:
                             continue
@@ -544,15 +649,21 @@ class TurnVisual:
             raise
         except Exception as e:  # prepare_visual doesn't raise; a bug must not reach the answer
             log.exception("canvas: the visual of a turn in chat %s failed", self.chat_id)
-            self.status, self.detail = "failed", f"{type(e).__name__}: {e}"[:300]
-            if self.announce:
-                self.queue.put_nowait(VisualEvent(phase="failed", visual_id=self.visual_id, detail="failed"))
+            if self.status != "ready":
+                self.status, self.detail = "failed", f"{type(e).__name__}: {e}"[:300]
+                if self.announce:
+                    self.queue.put_nowait(VisualEvent(phase="failed", visual_id=self.visual_id, detail="failed"))
 
     def _finished(self, task: asyncio.Task[None]) -> None:
-        if task.cancelled() and self.status == "preparing":
-            self.status, self.detail = "cancelled", self._cancel_detail
-            if self.announce:
-                self.queue.put_nowait(VisualEvent(phase="failed", visual_id=self.visual_id, detail=self._cancel_detail))
+        if task.cancelled():
+            if self.trace.planner is None and self.trace.draft is not None:
+                self.trace.planner = "cancelled"
+            if self.status == "preparing":
+                self.status, self.detail = "cancelled", self._cancel_detail
+                if self.announce and not self._withdrawn:
+                    self.queue.put_nowait(
+                        VisualEvent(phase="failed", visual_id=self.visual_id, detail=self._cancel_detail)
+                    )
         self.queue.put_nowait(None)
         if _registry().get(self.chat_id) is self:
             del _registry()[self.chat_id]
@@ -561,17 +672,34 @@ class TurnVisual:
             _spawn(callback(self))
 
     def when_settled(self, callback: Callable[[TurnVisual], Awaitable[None]]) -> None:
-        """Run ``callback(self)`` (as its own task) once the visual is ready, failed or cancelled; at once if it is."""
+        """Run ``callback(self)`` (as its own task) once the visual is ready, failed or cancelled; at once if it is.
+        Run again if it is withdrawn afterwards."""
+        self._callbacks.append(callback)
         if self._settled:
             _spawn(callback(self))
-        else:
-            self._callbacks.append(callback)
 
     def cancel(self, detail: str = "cancelled") -> None:
-        """Stop preparing it (a no-op once it is done)."""
+        """Stop preparing it (a no-op once it is done). A draft already on screen stays."""
         if self.task is not None and not self.task.done():
             self._cancel_detail = detail
             self.task.cancel()
+
+    def withdraw(self) -> None:
+        """Take back a visual the client never got (a turn cut before its first audio, a stream gone before its first
+        delta): its preparation stops, nothing more is sent, and a draft already stored is taken off the canvas."""
+        if self._withdrawn or self.delivered:
+            return
+        self._withdrawn = True
+        self.trace.planner = self.trace.planner or "not_run"
+        self.status, self.detail = "cancelled", "withdrawn"
+        self._settle_answer(None)
+        self.cancel()
+        if self._stored and self.remove is not None:
+            self._stored = False
+            _spawn(self.remove())
+        if self._settled:  # settled before (a confident draft): what was recorded changes too
+            for callback in self._callbacks:
+                _spawn(callback(self))
 
     async def wait(self, timeout: float | None = None) -> bool:
         """Wait until it is done (True), at most ``timeout`` seconds (False)."""
@@ -592,11 +720,11 @@ class TurnVisual:
                 self._ended = True
                 break
             out.append(item)
-        return out
+        return [] if self._withdrawn else out
 
     async def events(self, timeout: float | None = None) -> AsyncIterator[CanvasEvents]:
         """The events still to come, until it is done; past ``timeout`` seconds it is cancelled (``failed`` "timed
-        out") and what that leaves is yielded."""
+        out" when nothing was shown) and what that leaves is yielded."""
         loop = asyncio.get_running_loop()
         deadline = None if timeout is None else loop.time() + timeout
         while not self._ended:
@@ -610,14 +738,16 @@ class TurnVisual:
             if item is None:
                 self._ended = True
                 return
-            yield item
+            if not self._withdrawn:
+                yield item
 
     def record(self) -> dict[str, object]:
-        """``route`` fields of the turn's message, for what the user saw: the visual (``visual_id``, ready), or the
-        failure note of a requested one (``visual_status`` failed / cancelled / none, ``visual_detail``). Nothing
-        while it is being prepared, nor for a suggested one that didn't work out (nothing was shown)."""
+        """``route`` fields of the turn's message, for what the user saw: the visual (``visual_id``, ready, with how it
+        was made: ``visual_plan``), or the failure note of a requested one (``visual_status`` failed / cancelled /
+        none, ``visual_detail``). Nothing while it is being prepared, nor for a suggested one that didn't work out
+        (nothing was shown)."""
         if self.status == "ready":
-            return {"visual_status": "ready", "visual_id": self.visual_id}
+            return {"visual_status": "ready", "visual_id": self.visual_id, "visual_plan": self.trace.record()}
         if self.status == "preparing" or not self.announce:
             return {}
         return {"visual_status": self.status, "visual_detail": self.detail}

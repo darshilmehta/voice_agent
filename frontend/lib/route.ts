@@ -198,6 +198,13 @@ export function withVisual(m: Message, visualId: string): Message {
   return { ...m, route: { ...(m.route ?? {}), visual_id: visualId, visual_status: "ready" } };
 }
 
+/** The answer's visual was withdrawn after it was shown (a draft the planner found no table for, §12.1): no "Chart
+ * added" any more. Other messages are returned as they are. */
+export function withoutVisual(m: Message, visualId: string): Message {
+  if (m.route?.visual_id !== visualId) return m;
+  return { ...m, route: { ...m.route, visual_id: null, visual_status: "failed" } };
+}
+
 /**
  * For each user message that the router understood differently ("no, I meant FY25" became "What was revenue in
  * FY25?"; Whisper heard the wrong word), the question it worked from, by user message id. A user message belongs to
