@@ -8,7 +8,10 @@ dependencies = [
   "fastapi>=0.140",
   "uvicorn[standard]>=0.50",
   "pydantic>=2.10",
-  "httpx>=0.28",
+  # The page-fetch guard (providers/web_search.py GuardedNetwork) sets httpx's pool's private _network_backend: stay on
+  # the releases it was written and tested against; moving up means re-running tests/test_web_search_provider.py.
+  "httpx>=0.28,<0.29",
+  "httpcore>=1.0.9,<1.1",  # imported directly (the guard is an httpcore network backend); installed with httpx
   "aiosqlite>=0.22.1",
   "alembic>=1.20.0",
   "qdrant-client>=1.12",
