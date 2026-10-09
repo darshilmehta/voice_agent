@@ -20,6 +20,7 @@ from ..db import models as orm
 from ..domain.projects import Document, DocumentTable
 from ..providers.ingestion import ParsedTable
 from .base import NotFound, Service, get_or_404
+from .canvas.store import delete_document_visuals
 
 # Document statuses
 PENDING, PROCESSING, READY, FAILED = "PENDING", "PROCESSING", "READY", "FAILED"
@@ -228,8 +229,9 @@ class DocumentService(Service):
             return DocumentFiles(doc.id, doc.project_id, list((await s.scalars(keys)).all()))
 
     async def delete(self, document_id: str) -> None:
-        """Delete the document's rows (versions, jobs and tables cascade) and remove it from every chat's
-        ``document_scope``; a scope left empty becomes null (all documents), the only valid empty value."""
+        """Delete the document's rows (versions, jobs, tables and their datasets cascade), the canvas visuals built
+        from it, and remove it from every chat's ``document_scope``; a scope left empty becomes null (all documents),
+        the only valid empty value."""
         async with self.db.session() as s:
             doc = await get_or_404(s, orm.Document, document_id, "document")
             chats = (
@@ -243,6 +245,7 @@ class DocumentService(Service):
                 if document_id in scope:
                     chat.document_scope = [d for d in scope if d != document_id] or None
                     chat.updated_at = now
+            await delete_document_visuals(s, doc.project_id, document_id)  # canvas panels built from its tables
             result = await s.execute(delete(orm.Document).where(orm.Document.id == document_id))
             if result.rowcount == 0:  # type: ignore[attr-defined]
                 raise NotFound("document", document_id)

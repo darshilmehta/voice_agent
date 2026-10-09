@@ -112,3 +112,22 @@ def test_relative_paths_resolve_against_project_root(load_local, tmp_path: Path)
 def test_missing_config_file(tmp_path):
     with pytest.raises(ConfigError, match="not found"):
         load_settings(tmp_path / "nope.json", {})
+
+
+def test_canvas_section(load_local):
+    s = load_local()
+    c = s.canvas
+    assert (c.planner_timeout_ms, c.planner_max_tokens, c.planner_candidates, c.max_panels, c.overview_panels) == (
+        6000,
+        200,
+        4,
+        12,
+        3,
+    )
+    assert load_local(CANVAS__OVERVIEW_PANELS="0").canvas.overview_panels == 0  # no overview
+    with pytest.raises(ConfigError, match=r"canvas\.planner_candidates"):
+        load_local(CANVAS__PLANNER_CANDIDATES="20")
+    with pytest.raises(ConfigError, match=r"canvas\.max_panels"):
+        load_local(CANVAS__MAX_PANELS="0")
+    with pytest.raises(ConfigError, match=r"canvas\.planner_timeout_ms"):
+        load_local(CANVAS__PLANNER_TIMEOUT_MS="-1")
