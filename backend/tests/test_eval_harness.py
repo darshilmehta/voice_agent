@@ -177,7 +177,8 @@ def docs(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def harness(load_local) -> Harness:
-    return Harness(load_local())
+    # The fake scores below are built around a 0.3 gate; pin it so a change to the shipped config doesn't move them.
+    return Harness(with_params(load_local(), threshold=0.3))
 
 
 async def run(h: Harness, docs: Path, options: EvalOptions | None = None, questions: list[Question] | None = None):
@@ -279,7 +280,7 @@ async def test_the_clean_variant_is_run_for_asr_questions_only(harness, docs):
 async def test_the_confusion_matrix_exposes_a_near_miss_answered_by_the_gate(harness, docs):
     results, _ = await run(harness, docs)
     conf = results["runs"][0]["variants"]["pipeline"]["abstention"]["overall"]
-    assert conf["threshold"] == pytest.approx(0.3)  # min_rerank_score from the config
+    assert conf["threshold"] == pytest.approx(0.3)  # min_rerank_score as the fixture pins it
     assert conf["answered_answerable"] == 5 and conf["abstained_answerable"] == 0
     # the weather question scores 0 and is refused; "Alpha's FY25 margin" shares words with the FY24 page
     # and slips through
