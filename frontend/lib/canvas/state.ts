@@ -81,7 +81,32 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
   }
 }
 
-/** Something to show: a panel, or a visual on its way (a skeleton). A lone failure note alone shows nothing. */
-export function hasCanvasContent(state: CanvasState): boolean {
-  return state.panels.length > 0 || state.pending.length > 0;
+/**
+ * A skeleton ("preparing", or "Updating…" on a panel) shows only when `ready` hasn't arrived this long after it. The
+ * backend's instant draft sends `preparing` and `ready` in the same millisecond, and a skeleton that lives for a frame
+ * is a flash: the canvas would open, dock the presence field and swap a placeholder for the chart in one jolt. A failure
+ * note is not held back.
+ */
+export const SKELETON_DELAY_MS = 150;
+
+/** `p` is something to show at `now` (ms clock of `since`): a failure note at once, a skeleton once it has waited. */
+export const isPendingShown = (p: Pending, now: number): boolean => p.phase === "failed" || now - p.since >= SKELETON_DELAY_MS;
+
+/** The pending visuals worth showing at `now`. */
+export function visiblePending(pending: readonly Pending[], now: number): Pending[] {
+  return pending.filter((p) => isPendingShown(p, now));
+}
+
+/** How long until the next skeleton that isn't shown yet is (ms from `now`), or null when none is waiting. */
+export function nextSkeletonIn(pending: readonly Pending[], now: number): number | null {
+  const waits = pending.filter((p) => !isPendingShown(p, now)).map((p) => p.since + SKELETON_DELAY_MS - now);
+  return waits.length === 0 ? null : Math.max(0, Math.min(...waits));
+}
+
+/**
+ * Something to show: a panel, or a visual that has been on its way long enough to show a skeleton (`now`: the clock the
+ * skeletons are judged by; leave it out to count every pending visual). A lone failure note alone shows nothing.
+ */
+export function hasCanvasContent(state: CanvasState, now: number = Number.POSITIVE_INFINITY): boolean {
+  return state.panels.length > 0 || visiblePending(state.pending, now).length > 0;
 }

@@ -102,6 +102,10 @@ class XItem:
     period: PeriodInfo | None
     order: tuple[int, ...]
     refs: set[str] = field(default_factory=set)  # "<dataset>:<key>" of what it stands for
+    # The period of the row or column itself, also for a total row ("Full year FY24"): what ``spec.periods`` filters a
+    # table by, since ``period`` is None for a total (a total row isn't a point of a time series).
+    own_period: PeriodInfo | None = None
+    is_total: bool = False  # a table's total row ("Full year FY24", "Total"): only a table shows it
 
 
 @dataclass(slots=True)
@@ -158,6 +162,14 @@ class Resolved:
     @property
     def dataset_list(self) -> list[TypedDataset]:
         return list(self.datasets.values())
+
+    @property
+    def used_datasets(self) -> list[TypedDataset]:
+        """The datasets that gave the visual at least one number: a spec may name a table whose series have nothing left
+        after a filter ("only FY24" on a chart of both years' tables), which the visual must not cite or be named
+        by."""
+        used = {p.dataset.id for s in self.series for p in s.points.values()}
+        return [d for d in self.datasets.values() if d.id in used] or self.dataset_list
 
 
 # ------------------------------------------------------------------ helpers
@@ -230,6 +242,7 @@ class _Candidate:
     period: PeriodInfo | None
     order: int
     is_total: bool = False
+    own_period: PeriodInfo | None = None
 
 
 def _x_candidates(
@@ -250,7 +263,11 @@ def _x_candidates(
         labels = [c.period.label if c.period is not None else c.label for c in cols]
         if len(set(labels)) < len(labels):
             labels = [c.label for c in cols]
-        return [_Candidate(label, c.key, c.period, c.index) for label, c in zip(labels, cols, strict=True)], measure
+        out = [
+            _Candidate(label, c.key, c.period, c.index, own_period=c.period)
+            for label, c in zip(labels, cols, strict=True)
+        ]
+        return out, measure
     rows = [
         r
         for r in ds.rows
@@ -261,7 +278,9 @@ def _x_candidates(
     out = []
     for r in rows:
         label = r.period.label if r.period is not None and r.type == "data" else row_display(ds, r)
-        out.append(_Candidate(label, r.key, r.period if r.type == "data" else None, r.index, r.type == "total"))
+        out.append(
+            _Candidate(label, r.key, r.period if r.type == "data" else None, r.index, r.type == "total", r.period)
+        )
     labels = [c.label for c in out]
     if len(set(labels)) < len(labels):  # "FY24 (recommended)" and a "Full year FY24" row: keep the printed labels
         for c in out:
@@ -422,7 +441,9 @@ def resolve(
                 (*cand.period.sort_key, 0) if cand.period is not None else (0, 0, len(x_items) if item is None else 0)
             )
             if item is None:
-                item = x_items[cand.label] = XItem(cand.label, cand.period, order)
+                item = x_items[cand.label] = XItem(
+                    cand.label, cand.period, order, own_period=cand.own_period, is_total=cand.is_total
+                )
             item.refs.add(ref(ds_id, cand.key))
     periodic = bool(x_items) and all(i.period is not None for i in x_items.values())
     # explicit order for picked categories (waterfalls run in the order asked)
@@ -447,8 +468,13 @@ def resolve(
     if problems:
         raise SpecError(problems)
     items = list(x_items.values())
+    # A table has total rows ("Full year FY24") among its x items, so it isn't "periodic"; its periods still filter it
+    # (by each row's own period), unless nothing on its x axis has one.
+    dated = [i for i in items if i.own_period is not None]
     if spec.periods and periodic:
         items = [i for i in items if i.period is not None and i.period.label in spec.periods]
+    elif spec.periods and spec.kind == "table" and dated:
+        items = [i for i in dated if i.own_period.label in spec.periods]  # type: ignore[union-attr]
     elif periodic and not spec.categories and spec.kind not in ("table",):
         # the dominant granularity only (quarters, not the "Full year" row; years, not a stray quarter)
         grans: dict[str, int] = {}

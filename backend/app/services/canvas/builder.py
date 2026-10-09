@@ -39,7 +39,7 @@ from ..sources import snippet
 from . import calculator as calc
 from .calculator import CalculationError, Operand, format_value
 from .parsing import Quantity, localized_label, parse_period, parse_quantity
-from .spec import Point, Resolved, ResolvedSeries, SpecError, document_name, same_unit
+from .spec import MAX_TITLE, Point, Resolved, ResolvedSeries, SpecError, document_name, same_unit
 
 _SOURCE_ID = re.compile(r"^S(\d+)$")
 
@@ -335,7 +335,7 @@ def build_visual(
             summary, shares = _donut(book, r, language)
             calculations += shares
         elif r.kind == "table":
-            summary = _t(language, "table", title=r.dataset_list[0].title)
+            summary = _t(language, "table", title=_source_titles(r, language))
         elif r.x_type in ("period", "date"):
             summary, implied = _trend_summary(book, r, language)
             calculations += implied
@@ -430,7 +430,7 @@ def _visual_unit(r: Resolved) -> Unit | None:
 def _subtitle(r: Resolved, filenames: Mapping[str, str], unit: Unit | None, language: str) -> str | None:
     """ "valmora_annual_report_fy24.pdf p. 19, 20 · ₹ crore": each document once, with the pages of its tables."""
     pages_of: dict[str, list[str]] = {}
-    for ds in r.dataset_list:
+    for ds in r.used_datasets:
         pages = pages_of.setdefault(filenames.get(ds.document_id, ""), [])
         if ds.page_start is not None:
             page = str(ds.page_start) if ds.page_end in (None, ds.page_start) else f"{ds.page_start}–{ds.page_end}"
@@ -459,7 +459,9 @@ def _title(r: Resolved, language: str) -> str:
         title = r.spec.title.strip()
         if title and all(_num(t) in allowed for t in _NUMBER.findall(title)):
             return title
-    table_title = r.dataset_list[0].title
+    table_title = r.used_datasets[0].title
+    if r.kind == "table" and len(r.used_datasets) > 1:  # figures of several tables (the FY23 and FY24 quarters)
+        return _joint_title(r)
     if r.kind in ("timeline", "table", "kpi"):
         return table_title
     names = [s.label for s in r.series]
@@ -475,6 +477,24 @@ def _title(r: Resolved, language: str) -> str:
     if r.kind == "comparison" and len(names) == 1 and len(xs) == 2:
         return f"{base}: {xs[0]} vs {xs[1]}" if language != "hi" else f"{base}: {xs[0]} बनाम {xs[1]}"
     return base
+
+
+def _joint_title(r: Resolved) -> str:
+    """The title of a table that holds the figures of several tables (a chart of FY23's and FY24's quarterly tables,
+    shown as a table): what it shows, as a chart of the same data is titled, not the first table's own title, which
+    would say FY23 only."""
+    names = list(dict.fromkeys(s.metric or s.label for s in r.series))
+    if not 0 < len(names) <= 2:
+        return _source_titles(r, r.spec.language)[:MAX_TITLE]
+    base = " · ".join(names)
+    xs = [i.label for i in r.x_items if i.period is not None]  # the periods themselves, not the total rows
+    return f"{base}, {xs[0]}–{xs[-1]}" if len(xs) >= 2 else base
+
+
+def _source_titles(r: Resolved, language: str) -> str:
+    """The printed titles of the tables a visual draws on, once each."""
+    joiner = " और " if language == "hi" else " and "
+    return joiner.join(dict.fromkeys(ds.title for ds in r.used_datasets))
 
 
 def _num(token: str) -> str:

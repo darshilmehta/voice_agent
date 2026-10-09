@@ -18,7 +18,7 @@ import { shellLabelsFor } from "@/lib/canvas/labels";
 import { useOverview } from "@/lib/canvas/use-canvas";
 
 import { CanvasBoundary } from "./Boundary";
-import { PanelSkeleton } from "./CanvasPanel";
+import { DelayedSkeleton, PanelSkeleton } from "./CanvasPanel";
 
 const LazyBoard = lazy(() => import("./CanvasBoard"));
 const NONE: ReadonlySet<string> = new Set();
@@ -46,7 +46,7 @@ export function ProjectOverview({ projectId, docsById }: { projectId: string; do
             <CanvasBoundary
               fallback={() => <p className="cv-note">{labels.failed}</p>}
             >
-              <Suspense fallback={overview.panels.map((p) => <PanelSkeleton key={p.id} text={labels.preparing} />)}>
+              <Suspense fallback={overview.panels.map((p) => <DelayedSkeleton key={p.id} text={labels.preparing} />)}>
                 <LazyBoard panels={overview.panels} updating={NONE} busy={NONE} docsById={docsById} readOnly />
               </Suspense>
             </CanvasBoundary>

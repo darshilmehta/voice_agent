@@ -378,6 +378,7 @@ _EDIT_WORDS = wordset(
     दिखाओ दिखाइए दिखाएं दिखाएँ दिखा दो दीजिए बनाओ बनाइए बना बदलो बदल करो कर कीजिए करें चाहिए चार्ट ग्राफ़ ग्राफ
     add include compare next alongside beside too also well with against bhi saath jodo jod daalo sirf keval
     भी साथ जोड़ो जोड़ जोड़ें डालो सिर्फ़ सिर्फ केवल
+    na toh yaar bhai plz pls jara thora jaldi ना तो यार भाई जरा थोड़ा जल्दी
     """
 )
 # Question words: a question is never an edit ("what caused that drop", spoken without a question mark).
@@ -494,7 +495,7 @@ def edit_reply(outcome: EditOutcome, language: str) -> str:
 
 VisualStatus = Literal["preparing", "ready", "failed", "cancelled", "none"]
 CanvasEvents = VisualEvent | CanvasEvent
-PlannerOutcome = Literal["skipped", "same", "changed", "planned", "none", "failed", "not_run", "cancelled"]
+PlannerOutcome = Literal["skipped", "same", "changed", "kept", "planned", "none", "failed", "not_run", "cancelled"]
 
 
 class _Withdraw:
@@ -511,10 +512,10 @@ class VisualTrace:
 
     ``draft``: "confident" (the visual, no planner), "refine" (shown, the planner asked to improve it) or "none" (no
     draft could be built: the planner alone, as before). ``planner``: "skipped" (confident draft), "same" (it chose
-    what the draft shows), "changed" (it replaced the draft in place), "planned" (no draft: its visual is the turn's),
-    "none" (it found no table fits: the draft was withdrawn), "failed" (timeout or invalid output: the draft stands),
-    "not_run" (the answer was cut or abstained),
-    "cancelled" (the next turn needed the model)."""
+    what the draft shows), "changed" (it replaced the draft in place), "kept" (it chose another chart that covers the
+    question less well than the draft: the draft stays, ``reasons`` says why), "planned" (no draft: its visual is the
+    turn's), "none" (it found no table fits: the draft was withdrawn), "failed" (timeout or invalid output: the draft
+    stands), "not_run" (the answer was cut or abstained), "cancelled" (the next turn needed the model)."""
 
     started: float = field(default_factory=time.perf_counter)
     draft: Literal["confident", "refine", "none"] | None = None

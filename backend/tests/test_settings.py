@@ -122,7 +122,7 @@ def test_canvas_section(load_local):
         200,
         4,
         12,
-        3,
+        4,
     )
     assert load_local(CANVAS__OVERVIEW_PANELS="0").canvas.overview_panels == 0  # no overview
     with pytest.raises(ConfigError, match=r"canvas\.planner_candidates"):
