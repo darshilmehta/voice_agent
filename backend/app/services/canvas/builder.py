@@ -428,15 +428,20 @@ def _visual_unit(r: Resolved) -> Unit | None:
 
 
 def _subtitle(r: Resolved, filenames: Mapping[str, str], unit: Unit | None, language: str) -> str | None:
-    parts: list[str] = []
+    """ "valmora_annual_report_fy24.pdf p. 19, 20 · ₹ crore": each document once, with the pages of its tables."""
+    pages_of: dict[str, list[str]] = {}
     for ds in r.dataset_list:
-        name = filenames.get(ds.document_id, "")
-        page = ""
+        pages = pages_of.setdefault(filenames.get(ds.document_id, ""), [])
         if ds.page_start is not None:
-            pages = str(ds.page_start) if ds.page_end in (None, ds.page_start) else f"{ds.page_start}–{ds.page_end}"
-            page = f"{_t(language, 'page')} {pages}"
-        parts.append(" ".join(p for p in (name, page) if p))
-    text = "; ".join(dict.fromkeys(p for p in parts if p))
+            page = str(ds.page_start) if ds.page_end in (None, ds.page_start) else f"{ds.page_start}–{ds.page_end}"
+            if page not in pages:
+                pages.append(page)
+    parts = []
+    for name, pages in pages_of.items():
+        ordered = sorted(pages, key=lambda p: int(p.split("–")[0]))
+        page_text = f"{_t(language, 'page')} {', '.join(ordered)}" if ordered else ""
+        parts.append(" ".join(p for p in (name, page_text) if p))
+    text = "; ".join(p for p in parts if p)
     label = localized_label(unit, language)
     if label and unit is not None and unit.kind not in ("percent", "ratio"):
         text = f"{text} · {label}" if text else label
