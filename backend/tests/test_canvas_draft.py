@@ -30,8 +30,10 @@ from .canvas_helpers import (
     Z,
     report_datasets,
     two_companies,
+    two_companies_quarterly,
     typed,
 )
+from .test_canvas_refine import sources
 
 DS = report_datasets()
 DS["dates_hi"] = typed(DATES_HI, heading=("5. महत्वपूर्ण तिथियाँ",), page=None, dataset_id="ds_dates_hi")
@@ -203,3 +205,88 @@ def test_two_companies_side_by_side():
 
 def test_labels_from_file_names():
     assert filename_labels(FILES) == {V: document_label(FILES[V], None), Z: document_label(FILES[Z], None)}
+
+
+# ------------------------------------------------------------------ one document's tables, unless the question compares
+
+QUARTERLY = two_companies_quarterly()
+COMPANY = "Show the company's quarterly revenue"  # names no company: both companies' quarterly tables fit
+
+
+def documents_of(spec: VisualSpec, pool=QUARTERLY) -> set[str]:
+    return {d.document_id for d in pool if d.id in spec.datasets}
+
+
+@pytest.mark.parametrize(
+    ("top", "tables"),
+    [(V, {"ds_q_fy23", "ds_q_fy24"}), (Z, {"ds_z_q23", "ds_z_q24"})],
+    ids=["valmora", "zephyra"],
+)
+def test_a_question_naming_no_company_draws_from_the_document_of_the_turns_top_source(top, tables):
+    """Found in the final real run: "the company's quarterly revenue" in a chat of both companies' documents drew the
+    deck's Q4 table next to Valmora's FY23 table. The answer comes from the top source's document: so does the chart."""
+    other = Z if top == V else V
+    ctx = turn_context(COMPANY, None, sources(top, other), TWO_LABELS)
+    assert ctx.documents is None and not ctx.compare and ctx.scope == {top}
+    d = draft_visual(
+        COMPANY,
+        "en",
+        QUARTERLY,
+        documents=ctx.scope,
+        source_documents=ctx.source_documents,
+        filenames=TWO_FILES,
+    )
+    assert d.spec is not None and set(d.spec.datasets) == tables and documents_of(d.spec) == {top}
+    assert d.confident  # (the other document's tables fit as well by words: without it, the draft was not sure)
+    # the same pool without the top source's say: by words and pages alone Zephyra's tables win, Valmora's source or not
+    unscoped = draft_visual(COMPANY, "en", QUARTERLY, source_documents=ctx.source_documents, filenames=TWO_FILES)
+    assert unscoped.spec is not None and documents_of(unscoped.spec) == {Z}
+
+
+def test_a_draft_without_a_top_source_still_comes_from_one_documents_tables():
+    ctx = turn_context(COMPANY, None, [], TWO_LABELS)
+    assert ctx.scope is None
+    d = draft_visual(COMPANY, "en", QUARTERLY, documents=ctx.scope, filenames=TWO_FILES)
+    assert d.spec is not None and len(documents_of(d.spec)) == 1
+
+
+def test_a_web_source_has_no_document_and_is_not_the_top_one():
+    web = sources(V)[0].model_copy(update={"document_id": "", "chunk_id": "", "source_id": "W1"})
+    ctx = turn_context(COMPANY, None, [web, *sources(Z)], TWO_LABELS)
+    assert ctx.top_document == Z and ctx.scope == {Z}
+
+
+@pytest.mark.parametrize(
+    ("question", "query_en", "order", "compare", "scope"),
+    [
+        (COMPANY, None, (Z, V), False, {Z}),
+        ("Show Valmora's quarterly revenue", None, (Z, V), False, {V}),  # a name beats the top source
+        ("Compare Valmora and Zephyra revenue", None, (V, Z), True, {V, Z}),
+        ("Valmora vs Zephyra: whose EBITDA margin is better?", None, (V, Z), True, {V, Z}),
+        ("Show both companies' quarterly revenue", None, (Z, V), True, None),
+        ("What was each company's revenue in FY24?", None, (Z, V), True, None),
+        ("दोनों कंपनियों का तिमाही राजस्व दिखाओ", "Show both companies' quarterly revenue", (Z, V), True, None),
+        ("Compare FY23 and FY24 revenue", None, (Z, V), False, {Z}),  # periods, not companies
+        (COMPANY, None, (), False, None),
+    ],
+)
+def test_which_documents_a_visual_may_draw_from(question, query_en, order, compare, scope):
+    ctx = turn_context(question, query_en, sources(*order), TWO_LABELS)
+    assert ctx.compare is compare and ctx.scope == (frozenset(scope) if scope else None)
+
+
+def test_naming_both_companies_still_merges_them_beside_each_other():
+    q = "Compare Valmora and Zephyra revenue"
+    ctx = turn_context(q, None, sources(V, Z), TWO_LABELS)  # Valmora's passage is the top source
+    d = draft_visual(
+        q,
+        "en",
+        TWO,
+        documents=ctx.scope,
+        names=ctx.names,
+        companies=ctx.companies,
+        source_documents=ctx.source_documents,
+        filenames=FILES,
+    )
+    assert d.spec is not None and set(d.spec.datasets) == {"ds_v_hl", "ds_z_glance"}
+    assert d.spec.kind == "grouped_bar" and d.confident

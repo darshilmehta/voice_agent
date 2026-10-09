@@ -5,7 +5,8 @@ by code, without the model, in a few milliseconds, as soon as the turn's retriev
         shapes wanted (a trend, a breakdown, a comparison, headline numbers, dates, a ranking), the periods named
         ("FY24", "Q3 FY24") and the words that may name a series ("EBITDA margin", "बजट")
     candidates: ``planner.score_candidates`` (word overlap with the tables' titles and labels, the shape, the turn's
-        retrieved tables, only the named company's documents, the turn's sources' documents first)
+        retrieved tables, only the named company's documents, or when none is named the document of the turn's top
+        source, unless the question compares documents or companies: ``TurnContext.scope``)
     the best candidate → its default chartable shape: periods → a line (two periods: bars), parts of a whole → a donut
         (two periods: stacked or grouped bars), categories → bars, headline metrics → KPI tiles, dates → a timeline;
         its series and periods narrowed to the question's words
@@ -34,7 +35,7 @@ from ...domain.datasets import DatasetColumn, DatasetRow, TypedDataset
 from ...domain.projects import Citation
 from ...providers.ingestion import document_label
 from ..language import wordset
-from ..subjects import documents_by_name, named_documents
+from ..subjects import compares_documents, documents_by_name, named_documents
 from .chartability import series_columns
 from .overview import composition_spec, continuations
 from .parsing import find_period
@@ -614,7 +615,8 @@ def draft_visual(
     limit: int = 4,
 ) -> Draft:
     """The draft visual for ``question`` from ``datasets`` (the chat's), and whether it is confident. ``documents``:
-    the documents the question names (``subjects.named_documents``), ``names`` the names that matched them and
+    the documents the visual may draw from (``TurnContext.scope``: the company the question names, else the document
+    of the turn's top source), ``names`` the names that matched them and
     ``companies`` the documents of each name (``subjects.documents_by_name``); ``source_chunks`` /
     ``source_documents``: the turn's retrieved passages and their documents. Never raises."""
     started = time.perf_counter()
@@ -712,26 +714,49 @@ def _single(
 @dataclass(frozen=True, slots=True)
 class TurnContext:
     """What a turn knows about where its visual should come from: its retrieved passages and their documents, and
-    the documents (companies) its question names."""
+    the documents (companies) its question names.
+
+    A visual draws from **one document's** tables unless the question compares documents or companies (``compare``:
+    it names two companies, or says "both companies" / "दोनों कंपनियों"). ``scope`` is that document: the named
+    company's, else the one the turn's top retrieved source is from (``top_document``: the passage the answer is
+    drawn from), else none yet (the best table's own document then decides). A question that says just "the company's
+    quarterly revenue" in a chat of two companies' documents once drew the deck's Q4 table beside the other company's
+    FY23 table."""
 
     source_chunks: tuple[str, ...] = ()
     source_documents: frozenset[str] = frozenset()
     documents: frozenset[str] | None = None
     names: tuple[str, ...] = ()
     companies: dict[str, frozenset[str]] | None = None
+    top_document: str | None = None
+    compare: bool = False
+
+    @property
+    def scope(self) -> frozenset[str] | None:
+        """The documents the visual's tables come from (``rank_candidates``'s ``documents``): the named company's,
+        else the top source's document, else (a comparison, or no source) unrestricted."""
+        if self.documents:
+            return self.documents
+        if self.compare or self.top_document is None:
+            return None
+        return frozenset({self.top_document})
 
 
 def turn_context(
     question: str, query_en: str | None, sources: Sequence[Citation], labels: Mapping[str, str]
 ) -> TurnContext:
-    """``labels``: document id → document label (file name and title), as retrieval labels its chunks."""
+    """``labels``: document id → document label (file name and title), as retrieval labels its chunks. ``sources``:
+    the turn's citations, best first."""
     named = named_documents((question, query_en), labels)
+    companies = documents_by_name(named, labels) if named else None
     return TurnContext(
         source_chunks=tuple(c.chunk_id for c in sources if c.chunk_id),
         source_documents=frozenset(c.document_id for c in sources if c.document_id),
         documents=named.document_ids if named else None,
         names=named.names if named else (),
-        companies=documents_by_name(named, labels) if named else None,
+        companies=companies,
+        top_document=next((c.document_id for c in sources if c.document_id), None),
+        compare=len(set((companies or {}).values())) >= 2 or compares_documents((question, query_en)),
     )
 
 
@@ -758,6 +783,7 @@ def refinement_loses(
 
     - from the company's documents when the question names one and the draft is, and from the answer's own documents
       when the draft is (a misheard company name had the planner draw another company's table);
+    - from one document's tables, unless the question compares documents or companies (``TurnContext.compare``);
     - from a table that matches the question as well (``Draft.scores``, within ``TABLE_SLACK``: an unsure draft is one
       whose runner-up is that close);
     - showing no fewer of the periods the question names, nor, when it names none, fewer points of a time series (a
@@ -781,6 +807,8 @@ def refinement_loses(
         and any(d.document_id not in ctx.documents for d in chosen)
     ):
         return "the planner's table is not from the company's documents"
+    if not ctx.compare and len({d.document_id for d in chosen}) > 1:
+        return "the planner's chart mixes tables of different documents"
     if (
         ctx.source_documents
         and all(d.document_id in ctx.source_documents for d in drawn)

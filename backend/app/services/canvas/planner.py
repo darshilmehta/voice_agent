@@ -545,6 +545,36 @@ def bridges(spec: VisualSpec, datasets: Mapping[str, TypedDataset]) -> list[Visu
     ]
 
 
+def one_document(spec: VisualSpec, datasets: Mapping[str, TypedDataset]) -> VisualSpec | None:
+    """The spec cut down to the tables of one document: a chart draws from one document's tables unless the question
+    compares documents or companies (the model, offered the tables of two companies for "the company's quarterly
+    revenue", chose the deck's Q4 table and the other company's FY23 table for one chart). The document is the one
+    of its first series (else of its first table); the other documents' tables, their series, categories,
+    highlights and calculations are let go. None when nothing of the chart is left."""
+    docs = {datasets[i].document_id for i in spec.datasets if i in datasets}
+    if len(docs) <= 1:
+        return spec
+    lead = next((split_ref(r)[0] for r in spec.series if split_ref(r)[0] in datasets), spec.datasets[0])
+    document = datasets[lead].document_id
+    keep = [i for i in spec.datasets if i in datasets and datasets[i].document_id == document]
+
+    def kept(ref_: str) -> bool:
+        return ":" not in ref_ or split_ref(ref_)[0] in keep
+
+    series = [r for r in spec.series if split_ref(r)[0] in keep]
+    if spec.kind != "timeline" and not series:
+        return None
+    return spec.model_copy(
+        update={
+            "datasets": keep,
+            "series": series,
+            "categories": [r for r in spec.categories if kept(r)],
+            "highlight": [h for h in spec.highlight if kept(h)],
+            "calculations": [c for c in spec.calculations if c.series in series],
+        }
+    )
+
+
 def variants(spec: VisualSpec, datasets: Mapping[str, TypedDataset] | None = None) -> list[VisualSpec]:
     """The spec, then forms of the same choice the model may have meant, tried in order when it doesn't build: its
     rows as categories (``transposed``), waterfalls that add up (``bridges``), no highlight or calculations, no
@@ -704,10 +734,13 @@ class VisualPlanner:
         source_documents: Collection[str] = (),
         names: Collection[str] = (),
         force: bool = False,
+        compare: bool | None = None,
     ) -> VisualSpec | None:
         """The visual for ``question`` (None: not worth one, or nothing fits). ``candidates``: the datasets the
         question may draw on (the chat's documents); ``force``: plan even when the question doesn't call for a
-        visual; ``documents`` / ``source_documents`` / ``names``: the company-aware ranking (``rank_candidates``)."""
+        visual; ``documents`` / ``source_documents`` / ``names``: the company-aware ranking (``rank_candidates``);
+        ``compare``: False cuts the model's choice down to one document's tables, True lets it draw from several (None:
+        as the model chose)."""
         return (
             await self.plan_detailed(
                 question,
@@ -721,6 +754,7 @@ class VisualPlanner:
                 source_documents=source_documents,
                 names=names,
                 force=force,
+                compare=compare,
             )
         ).spec
 
@@ -740,10 +774,13 @@ class VisualPlanner:
         ranked: Sequence[TypedDataset] | None = None,
         force: bool = False,
         fallback: bool = True,
+        compare: bool | None = None,
     ) -> PlanResult:
         """``ranked``: the candidates to offer, already ranked (the draft's: the same tables, in the same order);
         otherwise ``rank_candidates``. ``fallback``: a requested visual the model can't place gets the best
-        candidate's default chart (off when a draft is already on screen: it stays instead)."""
+        candidate's default chart (off when a draft is already on screen: it stays instead). ``compare``: the
+        question compares documents or companies; False cuts the model's choice down to one document's tables
+        (``one_document``), None leaves it as chosen."""
         started = time.perf_counter()
         intent = visual_intent(question, answer)
         if intent == "none" and not force:
@@ -780,8 +817,12 @@ class VisualPlanner:
             raw = choice.model_dump()
             result.raw = raw
             spec = to_spec(raw, cat, language)
+            if spec is not None and compare is False:
+                spec = one_document(spec, pool)
+                if spec is None:
+                    result.reason = "the model's choice mixes documents"
             if spec is None:
-                result.reason = NO_VISUAL
+                result.reason = result.reason or NO_VISUAL
             else:
                 valid = first_valid(spec, pool, builds(pool, filenames))
                 if valid is not None:

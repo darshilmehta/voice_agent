@@ -17,6 +17,7 @@ from app.services.retrieval import (
 )
 from app.services.subjects import (
     asked_names,
+    compares_documents,
     documents_by_name,
     label_words,
     mentions,
@@ -345,3 +346,27 @@ def test_respelling_keeps_the_rest_of_the_question():
         "What was Valmora's revenue? Valmora grew."
     )
     assert sound_key("Valmora") == sound_key("Wall Mora") == sound_key("Wilmura") == "vlmr"
+
+
+@pytest.mark.parametrize(
+    ("question", "compares"),
+    [
+        ("Show both companies' quarterly revenue", True),
+        ("Compare the two companies' margins", True),
+        ("What was each company's revenue?", True),
+        ("How do all the reports differ on debt?", True),
+        ("Compare the documents", True),
+        ("दोनों कंपनियों का राजस्व दिखाओ", True),
+        ("सभी कंपनियों का राजस्व", True),
+        ("dono companies ka revenue dikhao", True),
+        ("Show the company's quarterly revenue", False),
+        ("Compare FY23 and FY24 revenue", False),  # periods, not companies
+        ("Compare the company with last year", False),
+        ("Valmora vs last year", False),
+        ("Show the report's two segments", False),
+        ("कंपनी का तिमाही राजस्व दिखाओ", False),
+    ],
+)
+def test_a_question_that_puts_the_documents_side_by_side_without_naming_them(question, compares):
+    assert compares_documents([question]) is compares
+    assert compares_documents([None, question]) is compares  # (the English query may be missing)
