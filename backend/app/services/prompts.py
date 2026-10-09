@@ -126,11 +126,23 @@ def _without_live_data(source: str) -> str:
     )
 
 
+LIVE_HINT = (
+    "\nIf the question also asks for current prices, rates or news, say briefly that you can't look them up, and "
+    "never guess them."
+)
+
+
 def answer_system_prompt(
-    language: Language, length: AnswerLength = "short", *, mixed: bool = False, live_note: LiveNote | None = None
+    language: Language,
+    length: AnswerLength = "short",
+    *,
+    mixed: bool = False,
+    live_note: LiveNote | None = None,
+    live_hint: bool = False,
 ) -> str:
     """The grounded prompt; ``mixed`` adds that general knowledge may put the document facts in context;
-    ``live_note``: live data was asked for and isn't there (the answer starts with ``live_notice``)."""
+    ``live_note``: live data was asked for and isn't there, and the answer starts with ``live_notice``;
+    ``live_hint``: live data was asked for and there will be none, with no notice (one line: never guess it)."""
     name = LANGUAGE_NAMES[language]
     keep = " Keep figures, source ids and terms such as EBITDA or FY24 exactly as written." if language == "hi" else ""
     general = (
@@ -140,7 +152,10 @@ def answer_system_prompt(
         if mixed
         else ""
     )
-    live = _without_live_data('from the documents, beginning with "From the documents,"') if live_note else ""
+    if live_note:
+        live = _without_live_data('from the documents, beginning with "From the documents,"')
+    else:
+        live = LIVE_HINT if live_hint else ""
     return (
         "You answer questions about the user's documents in a voice and text assistant.\n"
         "Rules:\n"
@@ -288,7 +303,7 @@ def continuation_user_prompt(new: Sequence[WebSource], pages: Sequence[WebSource
     if new:
         parts.append(f"More web results arrived after you answered:\n\n{format_web_sources(new)}")
     if pages:
-        texts = "\n\n".join(f"[{s.source_id}] {s.result.title}\nPage text: {s.content}" for s in pages)
+        texts = "\n\n".join(f"{s.header()}\nPage text: {s.page_text()}" for s in pages)
         parts.append(f"The full text of results you already saw:\n\n{texts}")
     parts.append(
         "If this adds or corrects something important, continue your answer with exactly one short sentence that "

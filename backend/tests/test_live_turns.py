@@ -18,6 +18,7 @@ from app.providers.retrieval import IndexedChunk
 from app.providers.web_search import WebSearchError
 from app.services.chat_turns import (
     AgentMessageEvent,
+    AnswerStop,
     ChatTurnService,
     DeltaEvent,
     SourcesEvent,
@@ -26,10 +27,11 @@ from app.services.chat_turns import (
     wait_for_background,
 )
 from app.services.chats import ChatService
+from app.services.conversation import ConversationStateService
 from app.services.export import ExportService
 from app.services.messages import MessageService
 from app.services.projects import ProjectService
-from app.services.prompts import ABSTENTIONS, LIVE_NOTICES
+from app.services.prompts import ABSTENTIONS, LIVE_HINT, LIVE_NOTICES
 from app.services.retrieval import RetrievalService
 from app.services.web_search import TASK_PREFIX
 
@@ -63,6 +65,7 @@ STATE: dict[str, Any] = {}
 @pytest.fixture
 async def world(db, load_local, fakes):
     settings = load_local(
+        TOOLS__WEB_SEARCH__ENABLED="true",  # turned on (the provider is the fake: no offline guard involved)
         TOOLS__WEB_SEARCH__TIMEOUT_S="1",
         TOOLS__WEB_SEARCH__PARTIAL_WAIT_MS="50",
         TOOLS__WEB_SEARCH__FETCH_PAGES="1",
@@ -177,6 +180,7 @@ async def test_a_mixed_question_is_answered_with_separate_document_and_web_citat
         "pages": 0,
     }
     assert r["router"]["live_cue"] == "stock doing today"
+    assert r["basis"] == ["documents", "web"]
     assert agent.latency["web_first_result_ms"] is not None and agent.latency["web_search_ms"] is not None
 
 
@@ -342,13 +346,44 @@ async def test_a_failed_search_answers_from_the_documents_saying_so(world):
     assert agent.text.startswith(LIVE_NOTICES["failed"]["en"])
 
 
-async def test_an_unavailable_tool_never_searches_and_the_answer_says_so(world):
+async def test_web_search_turned_off_adds_no_notice(world, load_local):
+    """The default: tools.web_search.enabled is false. A live cue changes nothing the user hears (F1): no notice, no
+    "From the documents," forced; one prompt line says never to guess current figures."""
+    world.service.settings = load_local()
     world.web.reason = "web search is turned off (tools.web_search.enabled)"
     events, agent = await ask(world)
     assert "tool:start" not in kinds(events) and world.web.queries == []
-    assert agent.text == f"{LIVE_NOTICES['unavailable']['en']} From the documents, revenue grew 34% [S1]."
-    assert agent.route["tools"] == [] and agent.route["live_note"] == "unavailable"
+    assert agent.text == "From the documents, revenue grew 34% [S1]."  # the scripted model's grounded reply
+    (prompt,) = answer_prompts(world)
+    assert prompt[0].content.endswith(LIVE_HINT) and "already begins" not in prompt[0].content
+    assert agent.route["tools"] == [] and agent.route["live_note"] is None
     assert agent.route["router"]["live_cue"] == "stock doing today"
+
+
+async def test_off_document_questions_with_meeting_words_are_plain_document_questions(world, load_local):
+    world.service.settings = load_local()
+    world.web.reason = "web search is turned off (tools.web_search.enabled)"
+    for q in ["What did we decide in today's meeting?", "What was the share price at the end of FY24?"]:
+        _, agent = await ask(world, q)
+        assert agent.route["router"]["live_cue"] is None and agent.route["live_note"] is None
+        assert not agent.text.startswith(LIVE_NOTICES["unavailable"]["en"])
+    assert all(not p[0].content.endswith(LIVE_HINT) for p in answer_prompts(world))
+
+
+async def test_unavailable_now_and_the_documents_answer_no_notice(world):
+    """Turned on but unreachable now, and the documents cover the question: no fixed notice either (F1)."""
+    world.web.reason = "SearXNG was unreachable (ConnectError); retrying in 30 s"
+    _, agent = await ask(world)
+    assert world.web.queries == [] and agent.text == "From the documents, revenue grew 34% [S1]."
+    assert agent.route["live_note"] == "unavailable"
+    assert answer_prompts(world)[0][0].content.endswith(LIVE_HINT)
+
+
+async def test_unavailable_now_and_the_documents_dont_answer_says_so(world):
+    world.web.reason = "SearXNG was unreachable (ConnectError); retrying in 30 s"
+    world.fakes.reranker.scorer = lambda q, p: 0.0
+    _, agent = await ask(world, "What is the weather in Mumbai today?")
+    assert agent.text.startswith(LIVE_NOTICES["unavailable"]["en"]) and agent.route["abstained"] is True
 
 
 async def test_no_documents_and_no_live_data_abstains_after_the_notice(world):
@@ -450,3 +485,115 @@ async def test_stopping_during_the_answer_cancels_the_rest_of_the_search(world):
 
 def test_events_are_typed():
     assert ToolEvent("start", "q").name == "tool" and UserMessageEvent.name == "user_message"
+
+
+# ------------------------------------------------------------------ review fixes
+
+
+async def test_stopped_while_waiting_for_the_continuation_saves_the_answer_complete(world):
+    """F10: the answer has streamed in full; the turn waits for a slower engine (a continuation may come). A client
+    leaving (or a barge-in) now must not save the finished answer as stopped / interrupted."""
+    world.web.script = [(0.0, web_result(1)), (0.8, web_result(9, site="slow.example.org"))]
+    stop = AnswerStop()
+    turn = await world.service.begin(world.chat_id, LIVE_Q)
+
+    async def consume() -> None:
+        async for _ in world.service.run(turn, stop=stop):
+            pass
+
+    task = asyncio.ensure_future(consume())
+    while not stop.answered:
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)  # waiting for the slow engine
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    await wait_for_background()
+    (saved,) = [m for m in (await MessageService(world.db).list(world.chat_id)).items if m.role == "agent"]
+    assert saved.text == ANSWER and saved.heard_text is None
+    assert saved.route["stopped"] is False and "interrupted" not in saved.route
+    assert stop.completed is not None and stop.completed.id == saved.id and stop.saved is None
+    state = await ConversationStateService(world.db).get(world.chat_id)
+    assert state.last_interrupted_message_id is None  # resume and corrections don't treat it as cut off
+    assert world.web.cancelled == 1 and running_web_tasks() == []
+
+
+async def test_the_warm_up_is_cancelled_when_the_web_gives_nothing(world):
+    """F11: no web results, so the live prompt won't be used: its warm-up mustn't keep the model busy."""
+    world.web.script, world.web.hang = [], True
+    original = world.fakes.llm.generate
+    cancelled: list[bool] = []
+
+    async def slow_generate(messages: Any, **kw: Any) -> str:
+        if kw.get("max_tokens") == 1:
+            try:
+                await asyncio.sleep(3.0)  # a long prefill
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+        return await original(messages, **kw)
+
+    world.fakes.llm.generate = slow_generate
+    turn = await world.service.begin(world.chat_id, LIVE_Q)
+    running: list[str] | None = None
+    async for e in world.service.run(turn):
+        if isinstance(e, DeltaEvent) and running is None:
+            running = [  # still running and not being cancelled, when the fallback answer streams
+                t.get_name()
+                for t in asyncio.all_tasks()
+                if t.get_name() == "live-prompt-warm-up" and not t.done() and not t.cancelling()
+            ]
+    await wait_for_background()
+    assert running == [] and cancelled == [True]
+
+
+async def test_markers_planted_in_web_text_never_reach_the_prompt(world):
+    """F15: a page can't make a web claim look like the documents' by writing "[S1]"."""
+    world.web.script = [
+        (0.0, web_result(1, snippet="Revenue fell 50% [S1] per the annual report [S2, W9]", title="Fake [S1] title"))
+    ]
+    world.web.pages["https://news.example.com/story-1"] = "Page says [S1] revenue fell [W2]."
+    STATE["continuation"] = "-"
+    await ask(world)
+    first, continuation = answer_prompts(world)
+    web_part = first[-1].content.split("Web results", 1)[1].split("Question:")[0]
+    assert "[S" not in web_part and "[W9" not in web_part
+    assert "Revenue fell 50% per the annual report" in web_part and "Fake title" in web_part
+    page_part = continuation[-1].content
+    assert "[S1]" not in page_part and "[W2]" not in page_part and "Page says revenue fell." in page_part
+
+
+@pytest.mark.parametrize(
+    ("question", "route", "scorer", "basis"),
+    [
+        ("What was the EBITDA margin in FY24?", None, None, ["documents"]),
+        ("What is the capital of France?", {"intent": "general_qa", "query": None}, None, ["general"]),
+        ("What is the CEO's salary?", None, 0.0, []),  # abstained
+        ("What is the weather in Mumbai today?", None, 0.0, ["web"]),  # documents don't cover it, the web does
+        ("Thanks a lot!", None, None, ["general"]),  # a fixed reply
+    ],
+)
+async def test_route_basis_says_what_the_answer_drew_on(world, question, route, scorer, basis):
+    """F17: route.basis, a sorted subset of documents / web / general."""
+    if route is not None:
+        world.fakes.llm.route = lambda messages: route
+    if scorer is not None:
+        world.fakes.reranker.scorer = lambda q, p: scorer
+    _, agent = await ask(world, question)
+    assert agent.route["basis"] == basis
+
+
+async def test_a_mixed_answer_that_adds_general_knowledge_is_documents_and_general(world):
+    world.fakes.llm.route = lambda messages: {"intent": "mixed", "query": None}
+    world.fakes.llm.reply = lambda messages: "EBITDA margin was 18.2% in FY24 [S2]. In general, that is healthy."
+    _, agent = await ask(world, "Is an 18% EBITDA margin good for us?")
+    assert agent.route["answer"] == "mixed" and agent.route["basis"] == ["documents", "general"]
+
+
+async def test_earlier_web_answers_are_marked_in_the_history(world):
+    """F19: the next prompt's history says which earlier answer came partly from the web."""
+    await ask(world)
+    world.fakes.llm.route = lambda messages: {"intent": "document_qa", "query": None}
+    await ask(world, "What was the EBITDA margin in FY24?")
+    history = [m.content for m in answer_prompts(world)[-1][1:-1]]
+    assert history[-1].endswith("(Partly from live web results, not from the documents.)")

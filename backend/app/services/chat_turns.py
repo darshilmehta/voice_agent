@@ -19,9 +19,14 @@ planning, so it runs beside document retrieval                   → ToolEvent s
     the answer from both (live prompt: each fact cited and said as from the report or from the web) → DeltaEvent …
     results that arrived meanwhile: at most ``max_continuations`` short continuations → ToolEvent results, DeltaEvent
     the search ends                                              → ToolEvent done | timeout | failed
-    no web results (timeout, failure) or the tool unavailable: the answer starts with a fixed notice ("I couldn't get
-    live data just now.") and answers from the documents (or abstains, or answers from general knowledge) as before.
-Stopping the turn cancels the search and its page fetches with it.
+    no web results (timeout, failure): the answer starts with a fixed notice ("I couldn't get live data just now.")
+    and answers from the documents (or abstains, or answers from general knowledge) as before; the tool unavailable
+    now: the notice ("I can't look up live data right now.") only when the documents don't answer it; turned off:
+    nothing is said, the prompt only says never to guess current figures.
+Stopping the turn cancels the search, its page fetches and the warm-up with it. Once the answer's own text is
+complete (``AnswerStop.answered``), a stop saves it complete: only its continuation was still to come.
+
+Every saved agent message has ``route.basis`` (``answer_basis``): what it drew on, documents / web / general.
 
 Every turn that doesn't fail ends with ``AgentMessageEvent``. A "stop" turn says nothing: no ``DeltaEvent``, and the
 message it ends with has role ``event`` (a short notice for the transcript, carrying the route).
@@ -55,7 +60,7 @@ import functools
 import logging
 import re
 import time
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal
 
@@ -72,6 +77,7 @@ from .chats import ChatService
 from .conversation import ConversationStateService, TurnOutcome, state_writes
 from .documents import DocumentService
 from .language import asked_language, decide_language, message_language
+from .live_data import LiveNote
 from .memory import MemoryKeeper, chat_activity
 from .messages import MessageService
 from .planning import DocumentQARouter, TurnPlan, TurnPlanner, interrupted_answer
@@ -79,6 +85,7 @@ from .prompts import (
     ANSWER_LENGTHS,
     CONTINUATION_NOTHING,
     CONTINUATION_PROMPT_VERSION,
+    LIVE_NOTICES,
     LIVE_PROMPT_VERSION,
     PROMPT_IDS,
     SILENT_NOTICES,
@@ -271,8 +278,13 @@ class AnswerStop:
     voice turn always ends with an agent message), and once the cancelled consumer has finished:
 
     - ``saved`` is that message (None if the save failed or the answer had already been saved complete);
-    - ``completed`` is the complete answer when it was saved (or its save had already started) before the stop;
+    - ``completed`` is the complete answer when it was saved (or its save had already started) before the stop, or
+      when the answer itself was complete and only its live-data continuation was still to come (§3.7): it is then
+      saved complete, without the continuation;
     - ``user`` is the turn's user message (set as soon as it is saved, or passed to ``run``).
+
+    ``answered`` is True once the answer's text is complete (a continuation may still follow), and ``on_answered``,
+    if set, is called at that moment (voice: speak the last sentence now, not after the continuation).
     """
 
     heard_text: str | None = None
@@ -280,6 +292,8 @@ class AnswerStop:
     saved: Message | None = None
     completed: Message | None = None
     user: Message | None = None
+    answered: bool = False
+    on_answered: Callable[[], None] | None = None
 
 
 @dataclass
@@ -288,6 +302,7 @@ class _Progress:
     planning (for the route and the conversation state)."""
 
     plan: TurnPlan
+    stop: AnswerStop | None = None
     result: RetrievalResult | None = None
     sources: list[Source] = field(default_factory=list)
     parts: list[str] = field(default_factory=list)  # answer text so far
@@ -308,6 +323,9 @@ class _Progress:
     documents_part: DocumentsPart = "none"  # what the live prompt says about the documents
     continuations: int = 0  # continuation sentences added after the answer
     warm: asyncio.Task[Any] | None = None  # the live prompt's prefix, read by the model while the web is searched
+    answered: bool = False  # the answer's text is complete (a live-data continuation may still follow)
+    llm_ms: float | None = None  # the answer's generation time, once complete
+    notice: LiveNote | None = None  # the live-data notice the answer started with
 
     @property
     def citable(self) -> list[Source | WebSource]:
@@ -325,6 +343,44 @@ class _Clock:
 def _describe(e: BaseException) -> str:
     text = str(e)
     return f"{type(e).__name__}: {text}" if text else type(e).__name__
+
+
+Basis = Literal["documents", "web", "general"]
+_SENTENCE_END = re.compile("(?<=[.!?।])\\s+")
+_CITED = re.compile(r"\[\s*[SW]\d+", re.IGNORECASE)
+_NOTICES = tuple(text for texts in LIVE_NOTICES.values() for text in texts.values())
+
+
+def answer_basis(p: _Progress, text: str, citations: Sequence[Citation]) -> list[Basis]:
+    """``route.basis``: what an answer drew on, a sorted subset of ``["documents", "web", "general"]``.
+
+    - "documents": it cites a document passage ([S#]); "web": it cites a web result ([W#]);
+    - "general": a general-knowledge answer; a mixed answer with a sentence that cites nothing (the general
+      knowledge it adds; the live-data notice doesn't count); or an answer without citations in a mode that isn't
+      about the documents (conversation, clarification, the fixed "back to the report" and "Anything else?").
+
+    An answer from web results counts only what it cites; an abstention, a grounded answer citing nothing and a
+    "stop" are []."""
+    mode = p.plan.mode
+    kinds = {c.kind for c in citations}
+    basis: set[Basis] = set()
+    if "document" in kinds:
+        basis.add("documents")
+    if "web" in kinds:
+        basis.add("web")
+    if p.web_sources or p.abstained or mode == "silent":
+        return sorted(basis)
+    if mode == "general":
+        basis.add("general")
+    elif mode == "mixed":
+        body = text
+        for notice in _NOTICES:
+            body = body.replace(notice, " ")
+        if any(s.strip() and not _CITED.search(s) for s in _SENTENCE_END.split(body)):
+            basis.add("general")
+    elif mode in ("conversation", "clarification", "resume", "ack") and not citations:
+        basis.add("general")
+    return sorted(basis)
 
 
 # ------------------------------------------------------------------ service
@@ -380,6 +436,12 @@ class ChatTurnService:
     def available_tools(self) -> frozenset[str]:
         """The live-data tools that can run now (§3.7): web search when configured, allowed and reachable."""
         if self.web_search is None or self.web_search.unavailable_reason() is not None:
+            return frozenset()
+        return frozenset({"web_search"})
+
+    def enabled_tools(self) -> frozenset[str]:
+        """The live-data tools turned on in the config (``tools.web_search.enabled``), reachable or not."""
+        if self.web_search is None or not self.settings.tools.web_search.enabled:
             return frozenset()
         return frozenset({"web_search"})
 
@@ -442,6 +504,7 @@ class ChatTurnService:
         p = _Progress(TurnPlan(query=turn.text, language=turn.language))
         route = self._route(turn, p, abstained=False, reason=None, stopped=True)
         route["interrupted"] = reason
+        route["basis"] = []
         return await self.messages.append(
             turn.chat.id,
             role="agent",
@@ -486,7 +549,7 @@ class ChatTurnService:
             log.exception("chat %s: reading the chat history failed", chat.id)
             yield ErrorEvent("storage", f"could not read the chat history: {_describe(e)}")
             return
-        p = _Progress(TurnPlan(query=turn.text, language=turn.language))
+        p = _Progress(TurnPlan(query=turn.text, language=turn.language), stop=stop)
         try:
             yield UserMessageEvent(user)
             async with contextlib.aclosing(self._answer(turn, history, clock, p)) as answer:
@@ -504,6 +567,10 @@ class ChatTurnService:
             if p.final is not None:
                 if stop is not None:
                     stop.completed = p.final
+            elif p.answered and not p.saving:  # complete; only the live-data continuation was still to come
+                save = detach(self._save_complete(turn, p, clock, stop))
+                with contextlib.suppress(BaseException):
+                    await asyncio.shield(save)
             elif not p.saving and (p.parts or stop is not None):
                 save = detach(self._save_stopped(turn, p, clock, stop))
                 with contextlib.suppress(BaseException):
@@ -539,6 +606,7 @@ class ChatTurnService:
             list(ready.values()),
             interrupted_answer(history),
             available_tools=self.available_tools(),
+            enabled_tools=self.enabled_tools(),
         )
         plan = p.plan = await self.planner.plan(
             request, project_id=chat.project_id, ready=ready, retrieval_enabled=state.retrieval_enabled
@@ -612,6 +680,8 @@ class ChatTurnService:
                 yield end
             if not p.web_sources:
                 plan = p.plan = plan.without_live_data("failed")
+                if p.warm is not None and not p.warm.done():  # the live prompt won't be used: free the model
+                    p.warm.cancel()
         web_citations = [w.citation() for w in p.web_sources]
 
         if plan.needs_retrieval and not covered:
@@ -624,6 +694,7 @@ class ChatTurnService:
                 reason: AbstainReason = "no_documents" if not ready else "not_covered"
                 p.abstained, p.reason = True, reason
                 yield SourcesEvent([], confidence, abstained=True)
+                p.notice = plan.live_note
                 notice = live_notice(plan.live_note, plan.language) + " " if plan.live_note else ""
                 answer = notice + abstention(plan.language, reason)
                 p.parts.append(answer)
@@ -638,7 +709,11 @@ class ChatTurnService:
         else:
             yield SourcesEvent(web_citations, None, abstained=False)
 
-        if plan.live_note is not None and not p.web_sources:  # live data asked for, none to give: say so first
+        # Live data asked for, none to give: say so first, after a failed search (the user heard the filler), or with
+        # the tool unavailable when the documents don't answer it. Otherwise the prompt only says never to guess
+        # current figures (live_hint), and web search turned off says nothing.
+        if plan.live_note == "failed" or (plan.live_note == "unavailable" and not p.sources):
+            p.notice = plan.live_note
             notice = live_notice(plan.live_note, plan.language) + " "
             p.first_delta_ms = clock.ms()
             p.parts.append(notice)
@@ -669,7 +744,14 @@ class ChatTurnService:
         if not "".join(model_parts).strip():
             yield ErrorEvent("llm", "the model returned an empty answer")
             return
-        llm_ms = clock.ms(p.llm_start)
+        llm_ms = p.llm_ms = clock.ms(p.llm_start)
+        # The answer is complete: stopped from here on (waiting for slower engines, or the continuation), it is saved
+        # complete, not as interrupted.
+        p.answered = True
+        if p.stop is not None:
+            p.stop.answered = True
+            if p.stop.on_answered is not None:
+                p.stop.on_answered()
         if web is not None:
             async for event in self._continue(turn, prompt, "".join(model_parts), p, web):
                 yield event
@@ -811,10 +893,18 @@ class ChatTurnService:
             for source in web:
                 source.content_given = source.content_given or (pages and bool(source.content))
         elif plan.mode in ("grounded", "mixed"):
-            system = answer_system_prompt(language, length, mixed=plan.mode == "mixed", live_note=plan.live_note)
+            notice = p.notice if p is not None else None
+            system = answer_system_prompt(
+                language,
+                length,
+                mixed=plan.mode == "mixed",
+                live_note=notice,
+                live_hint=plan.live_hint and notice is None,
+            )
             question = answer_user_prompt(plan.query, sources, language)
         elif plan.mode == "general":
-            system = general_system_prompt(language, length, plan.general_note, live_note=plan.live_note)
+            notice = p.notice if p is not None else None
+            system = general_system_prompt(language, length, plan.general_note, live_note=notice)
             question = general_user_prompt(plan.query, language)
         elif plan.mode == "clarification":
             system, question = clarification_system_prompt(language), turn.text
@@ -829,6 +919,8 @@ class ChatTurnService:
         for m in history:
             # Interrupted voice answers: only what was heard ("" when nothing was: the answer is left out).
             text = strip_markers(heard(m))[:HISTORY_CHARS]
+            if text and m.role == "agent" and any(c.kind == "web" for c in m.citations):
+                text += " (Partly from live web results, not from the documents.)"  # §3.7: never the report's
             if text:
                 messages.append(LLMMessage("user" if m.role == "user" else "assistant", text))
         return messages
@@ -968,6 +1060,7 @@ class ChatTurnService:
         *,
         role: Literal["agent", "event"] = "agent",
     ) -> AsyncGenerator[ChatEvent, None]:
+        route["basis"] = answer_basis(p, answer, citations) if role == "agent" else []
         # The state is written before the answer, so nothing of this turn is written after its agent_message (the voice
         # session's own saves, e.g. what was heard, then never wait on it). A stop arriving meanwhile saves the answer
         # as stopped (its state follows, chained after this one).
@@ -1014,6 +1107,7 @@ class ChatTurnService:
         if not text and stop is None:
             return
         route = self._route(turn, p, abstained=p.abstained, reason=p.reason, stopped=True)
+        route["basis"] = answer_basis(p, text, citations)
         if stop is not None and stop.reason is not None:
             route["interrupted"] = stop.reason
         llm_ms = clock.ms(p.llm_start) if p.llm_start is not None else None
@@ -1037,3 +1131,33 @@ class ChatTurnService:
             stop.saved = message
         self._advance_state(turn, p, message.citations, completed=False, message_id=message.id)
         log.info("chat %s: answer stopped after %d characters", turn.chat.id, len(text))
+
+    async def _save_complete(self, turn: Turn, p: _Progress, clock: _Clock, stop: AnswerStop | None) -> None:
+        """Save an answer whose text was complete when the turn was stopped, with only its live-data continuation
+        still to come (§3.7): complete, not interrupted (a voice session records a barge-in during its playback
+        itself, as for any complete answer), without the continuation."""
+        text, citations = finalize_answer("".join(p.parts), p.citable)
+        route = self._route(turn, p, abstained=False, reason=None)
+        route["basis"] = answer_basis(p, text, citations)
+        latency = self._latency(clock, p, first_delta_ms=p.first_delta_ms, llm_ms=p.llm_ms)
+        write = self._advance_state(turn, p, citations, completed=True)
+        if write is not None:
+            await asyncio.wait([write])
+        try:
+            message = await self.messages.append(
+                turn.chat.id,
+                role="agent",
+                text=text,
+                modality=turn.modality,
+                language=p.plan.language,
+                citations=citations,
+                route=route,
+                latency=latency,
+            )
+        except Exception:
+            log.exception("chat %s: saving the answer failed", turn.chat.id)
+            return
+        p.final = message
+        if stop is not None:
+            stop.completed = message
+        log.info("chat %s: answer saved complete, its live-data continuation dropped (stopped)", turn.chat.id)

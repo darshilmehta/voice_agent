@@ -258,6 +258,7 @@ class RouteRequest:
     documents: Sequence[str] = ()  # filenames of the chat's READY documents
     interrupted: InterruptedAnswer | None = None
     available_tools: frozenset[str] = frozenset()  # tools that can run now ("web_search", §3.7)
+    enabled_tools: frozenset[str] = frozenset()  # tools turned on in the config, whether they can run now or not
 
     def live_cue(self, *texts: str | None) -> str | None:
         """The live-data cue of the utterance, else of the given texts (its standalone question), or None."""

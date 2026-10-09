@@ -4,6 +4,7 @@ query that may leave the machine, and how the validated route gets ``tools=["web
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -218,10 +219,18 @@ def test_a_live_question_gets_the_tool_when_it_is_available():
 
 
 def test_unavailable_tool_records_the_cue_so_the_answer_can_say_so():
-    req = request("What's the latest news about Infosys?", tools=frozenset())
+    """Turned on but unreachable now: a note, so the answer can say so."""
+    req = replace(request("What's the latest news about Infosys?", tools=frozenset()), enabled_tools=WEB)
     d = with_live_tools(decision_for(req, "general_qa"), req)
     assert d.route.tools == [] and d.live == "latest news"
     assert live_search(d, req)[1:] == (None, "unavailable")
+
+
+def test_a_tool_turned_off_gives_no_note():
+    """Turned off (the default): no note at all, nothing to apologise for (F1)."""
+    req = request("What's the latest news about Infosys?", tools=frozenset())
+    d = with_live_tools(decision_for(req, "general_qa"), req)
+    assert d.live == "latest news" and live_search(d, req)[1:] == (None, None)
 
 
 @pytest.mark.parametrize("intent", ["conversation", "clarification", "stop", "backchannel"])

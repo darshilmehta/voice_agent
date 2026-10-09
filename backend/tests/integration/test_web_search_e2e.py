@@ -167,13 +167,17 @@ def test_live_question_end_to_end(stack, label):
     result = client.portal.call(run_turn, service, project_id, QUESTIONS[label])  # type: ignore[union-attr]
     report(label, result)
     events, agent = result["events"], result["agent"]
+    language = "hi" if label.startswith("HI") else "en"
     phases = [e.phase for e in events if isinstance(e, ToolEvent)]
+    if not phases:  # the router failed (timeout): a Hindi turn has no English query, and its words never leave
+        assert language == "hi" and agent.route["router"]["source"] == "fallback", agent.route["router"]
+        assert agent.route["live_note"] == "failed" and agent.text.startswith(LIVE_NOTICES["failed"]["hi"])
+        return
     assert phases[0] == "start" and phases[-1] in ("done", "timeout", "failed"), phases
     query = next(e for e in events if isinstance(e, ToolEvent)).query
     assert query and not any("ऀ" <= ch <= "ॿ" for ch in query)  # only an English query leaves
     assert PASSAGE not in query and "34%" not in query  # never document text
     web = [c for c in agent.citations if c.kind == "web"]
-    language = "hi" if label.startswith("HI") else "en"
     assert agent.language == language
     if web:
         assert all(c.url and c.url.startswith("http") for c in web)

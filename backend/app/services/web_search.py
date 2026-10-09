@@ -24,7 +24,7 @@ from typing import Any, ClassVar, Literal
 from ..domain.projects import Citation
 from ..providers.web_search import SearchResult, WebSearch, WebSearchRefused, WebSearchTimeout, describe
 from ..settings import WebSearchSection
-from .sources import snippet
+from .sources import snippet, strip_markers
 
 SearchStatus = Literal["running", "done", "timeout", "failed", "cancelled"]
 DEADLINE_GRACE_S = 0.25  # the provider enforces timeout_s itself; this only guards against one that doesn't
@@ -61,16 +61,25 @@ class WebSource:
 
     def header(self) -> str:
         r = self.result
-        parts = [f"[{self.source_id}] {r.title}", r.site, (r.published or "")[:10]]
+        parts = [f"[{self.source_id}] {web_text(r.title)}", web_text(r.site), (r.published or "")[:10]]
         return " · ".join(p for p in parts if p)
 
     def prompt_text(self, *, with_content: bool) -> str:
         lines = [self.header()]
         if self.result.snippet:
-            lines.append(snippet(self.result.snippet, WEB_SNIPPET_CHARS))
+            lines.append(snippet(web_text(self.result.snippet), WEB_SNIPPET_CHARS))
         if with_content and self.content:
-            lines.append(f"Page text: {self.content[:WEB_CONTENT_CHARS]}")
+            lines.append(f"Page text: {self.page_text()}")
         return "\n".join(lines)
+
+    def page_text(self) -> str:
+        return web_text(self.content or "")[:WEB_CONTENT_CHARS]
+
+
+def web_text(text: str) -> str:
+    """Web text as it may enter a prompt: no source markers and no square brackets at all, so a page can't plant a
+    "[S1]" that would make a web claim look like the documents' (answers cite with brackets only what we number)."""
+    return strip_markers(text).replace("[", "(").replace("]", ")")
 
 
 def format_web_sources(sources: Sequence[WebSource], *, with_content: bool = True) -> str:
@@ -164,7 +173,12 @@ class WebSearchRun:
             task = asyncio.ensure_future(self._fetch(source))
             task.set_name(TASK_PREFIX + "page")
             self._fetches.add(task)
-            task.add_done_callback(self._fetches.discard)
+            task.add_done_callback(self._fetch_done)
+        self._changed.set()
+
+    def _fetch_done(self, task: asyncio.Task[None]) -> None:
+        """A page fetch ended (with text or without): whoever waits for the pages is woken."""
+        self._fetches.discard(task)
         self._changed.set()
 
     async def _fetch(self, source: WebSource) -> None:
@@ -174,8 +188,6 @@ class WebSearchRun:
             raise
         except Exception:  # a page that can't be read is just not used
             return
-        if source.content:
-            self._changed.set()
 
     def _finish(self, status: SearchStatus, error: str | None = None) -> None:
         if self.status == "running":
