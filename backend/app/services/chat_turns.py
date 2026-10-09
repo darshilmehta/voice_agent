@@ -224,7 +224,12 @@ HISTORY_MIN = 4  # two exchanges
 HISTORY_STEP = 4
 HISTORY_MESSAGES = HISTORY_MIN + HISTORY_STEP - 1  # the most the window holds (7)
 HISTORY_CHARS = 1000  # per message
-SHORT_REPLY_TOKENS = 96  # conversation replies and clarifying questions: one sentence
+# Conversation replies and clarifying questions: a sentence or two. Devanagari takes about three times the tokens of
+# English for the same words (~0.9 a character), so a Hindi reply gets three times the cap: at 96 the last real run's
+# Hindi clarifications ended "क्या आप किसी विशिष्ट विषय" and "या इसक" (last round, item 5). A reply cut by the cap still
+# ends at its last whole sentence (``AnswerGuard.whole_sentences``).
+SHORT_REPLY_TOKENS: dict[Language, int] = {"en": 96, "hi": 288}
+CAP_SLACK = 2  # an answer that streamed this close to its token cap was cut by it
 VISUAL_BUILD_S = 2.0  # after the planner's timeout: a heuristic fallback, building from the cells, storing (§12.1)
 CONTINUATION_TOKENS = 96  # one sentence about results that arrived after the answer started (§3.7)
 # Short answers (voice, and text chats' default) stop at the end of the sentence that reaches this many words, or at
@@ -440,6 +445,7 @@ class _Progress:
     llm_ms: float | None = None  # the answer's generation time, once complete
     notice: LiveNote | None = None  # the live-data notice the answer started with
     language_retry: bool = False  # the answer came out in the wrong script and was asked again (B5)
+    pieces: int = 0  # pieces the model streamed for the current attempt (one a token): did it reach its cap?
     name_documents: bool = False  # the answer says which document its figures come from (UX5)
     # The canvas (§12.1)
     panels: list[Visual] = field(default_factory=list)  # on screen when the turn started
@@ -985,8 +991,9 @@ class ChatTurnService:
         p.renames = self._renames(turn, p)
         prompt = self._prompt(turn, plan, history, p.sources, p.memory, p)
         short = plan.mode in ("conversation", "clarification")
-        max_tokens = SHORT_REPLY_TOKENS if short else ANSWER_LENGTHS[turn.length].max_tokens
+        max_tokens = SHORT_REPLY_TOKENS[plan.language] if short else ANSWER_LENGTHS[turn.length].max_tokens
         guard = self._guard(turn, p)
+        guard.whole_sentences = short  # (a reply cut by the cap ends at its last whole sentence, never mid-word)
         stream = self._guarded_stream(prompt, plan.language, max_tokens, p, guard)
         model_parts: list[str] = []
         try:
@@ -1128,8 +1135,10 @@ class ChatTurnService:
             held: list[str] = []
             wrong = False
             stream = self.llm.stream(prompt, max_tokens=max_tokens)
+            p.pieces = 0
             async with contextlib.aclosing(stream):  # type: ignore[type-var]  (closing the stream stops generation)
                 async for piece in stream:
+                    p.pieces += 1
                     if check.verdict is not None:
                         yield piece
                         continue
@@ -1178,7 +1187,7 @@ class ChatTurnService:
                     if out.verdict == "stop":
                         return
             if not retry:
-                out = guard.finish()
+                out = guard.finish(truncated=p.pieces >= max_tokens - CAP_SLACK)
                 if out.text:
                     yield out.text
                 retry = out.verdict == "retry"

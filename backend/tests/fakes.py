@@ -355,6 +355,7 @@ class FakeLLM(LLMClient):
         self.json_delay: float | Callable[[list[LLMMessage]], float] = 0.0  # a function of the messages: per call
         self.json_cancelled = 0  # router calls cancelled before they answered
         self.warmed: list[list[LLMMessage]] = []  # prompts read with warm_up (startup, the next turn's prefix)
+        self.capped = False  # a stream ends after ``max_tokens`` pieces (one piece a token), as a real model's does
 
     async def generate_json[M: BaseModel](
         self,
@@ -406,6 +407,8 @@ class FakeLLM(LLMClient):
         finished = False
         try:
             for i in range(0, len(text), self.piece_chars):
+                if self.capped and max_tokens is not None and i // self.piece_chars >= max_tokens:
+                    break
                 if self.fail_after is not None and i // self.piece_chars >= self.fail_after:
                     raise self.fail_with or LLMError("stream broke")
                 while hold is not None and i // self.piece_chars >= hold and not self.released:

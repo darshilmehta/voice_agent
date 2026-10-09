@@ -480,6 +480,43 @@ def test_sentence_ends():
     assert sentence_end("राजस्व बढ़ा। अब") == len("राजस्व बढ़ा।")
 
 
+# ------------------------------------------------------------------ short replies cut by the token cap (last round, 5)
+
+
+def fed(guard: AnswerGuard, text: str, size: int = 4) -> str:
+    return "".join(guard.feed(text[i : i + size]).text for i in range(0, len(text), size))
+
+
+def test_a_short_reply_is_released_in_whole_words():
+    guard = AnswerGuard(whole_sentences=True)
+    assert fed(guard, "क्या आप किसी विशिष्ट विषय") == "क्या आप किसी विशिष्ट "  # "विषय" may still grow
+    assert guard.active
+
+
+def test_a_reply_cut_by_the_cap_in_its_first_sentence_ends_at_its_last_whole_word():
+    """The last real run spoke "क्या आप किसी विशिष्ट विषय" and "या इसक": the cap cut them mid-sentence, the second
+    mid-word."""
+    guard = AnswerGuard(whole_sentences=True)
+    released = fed(guard, "क्या आप किसी विशिष्ट विषय के बारे में या इसक")
+    end = guard.finish(truncated=True)
+    assert released + end.text == "क्या आप किसी विशिष्ट विषय के बारे में या …"
+    assert guard.checks[-1] == {"check": "length", "action": "cut_at_word", "text": released.strip() + " इसक"}
+
+
+def test_a_reply_cut_by_the_cap_after_a_whole_sentence_ends_there():
+    guard = AnswerGuard(whole_sentences=True)
+    released = fed(guard, "क्या आप योजना की पात्रता के बारे में पूछ रहे हैं? या इसके लाभ के बारे में जानना")
+    assert released == "क्या आप योजना की पात्रता के बारे में पूछ रहे हैं? "  # the second sentence is held whole
+    assert guard.finish(truncated=True).text == ""  # and dropped: it was cut
+    assert guard.checks[-1]["action"] == "cut_sentence_dropped"
+
+
+def test_a_reply_that_ends_by_itself_keeps_its_last_words():
+    guard = AnswerGuard(whole_sentences=True)
+    released = fed(guard, "Do you mean the eligibility rules? Or the benefits")
+    assert released + guard.finish().text == "Do you mean the eligibility rules? Or the benefits"
+
+
 def test_the_first_word_after_a_fixed_prefix_is_lower_cased_when_common():
     guard = AnswerGuard(lower_first=True)
     assert guard.feed("The capital of France is Paris.").text == "the capital of France is Paris."

@@ -362,3 +362,23 @@ async def test_a_question_about_another_document_after_the_age_rule_is_not_answe
     fakes.llm.route = {"intent": "document_qa", "query": "What was Valmora's revenue in FY24?"}
     events = await turn(service, chat.id, "वालमोरा का FY24 में राजस्व", modality="voice", language="hi")
     assert saved(events).route["query_en"] == "What was Valmora's revenue in FY24?"
+
+
+# ------------------------------------------------------------------ item 5: Hindi short replies cut mid-sentence
+
+CLARIFY = "क्या आप योजना की पात्रता के बारे में पूछ रहे हैं? "
+LONG = "या आप इसके लाभ, वजीफ़े, टूलकिट सहायता, बैंक ऋण पर अनुदान और प्रशिक्षण केंद्रों " * 6  # no end: cut by the cap
+
+
+async def test_a_hindi_clarification_gets_three_times_the_tokens_and_ends_at_a_whole_sentence(notice, fakes):
+    service, chat_id = notice
+    fakes.llm.route = {"intent": "clarification", "query": None}
+    fakes.llm.capped, fakes.llm.piece_chars = True, 1  # one character a token: the cap cuts the second sentence
+    fakes.llm.reply = CLARIFY + LONG
+    events = await turn(service, chat_id, "उसके बारे में और बताओ", modality="voice", language="hi")
+    assert fakes.llm.calls[-1]["max_tokens"] == 288
+    assert saved(events).text == CLARIFY.strip() and spoken(events) == CLARIFY  # nothing of the cut sentence
+    fakes.llm.reply = "Do you mean the eligibility rules? " + "Or the benefits, the stipend and the toolkit " * 6
+    events = await turn(service, chat_id, "tell me more about that", modality="voice", language="en")
+    assert fakes.llm.calls[-1]["max_tokens"] == 96
+    assert saved(events).text == "Do you mean the eligibility rules?"

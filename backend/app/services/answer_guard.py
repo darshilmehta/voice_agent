@@ -535,6 +535,9 @@ class AnswerGuard:
     max_words: int | None = None
     max_sentences: int | None = None
     lower_first: bool = False  # the answer follows a fixed prefix: its first word in lower case when common
+    # A short reply (conversation, clarification): never released mid-word, and when the model's token cap cuts it,
+    # it ends at its last whole sentence (last round, item 5: Hindi clarifications ended "… किसी विशिष्ट विषय").
+    whole_sentences: bool = False
     checks: list[dict[str, Any]] = field(default_factory=list)
     attempt: int = 1
 
@@ -562,7 +565,13 @@ class AnswerGuard:
 
     @property
     def active(self) -> bool:
-        return self.sentence_hold or self.token_hold or self.max_words is not None or self.max_sentences is not None
+        return (
+            self.sentence_hold
+            or self.token_hold
+            or self.whole_sentences
+            or self.max_words is not None
+            or self.max_sentences is not None
+        )
 
     # -------------------------------------------------------------- streaming
 
@@ -585,13 +594,25 @@ class AnswerGuard:
         out.append(self._spaced(self._partial()))
         return Released("".join(out))
 
-    def finish(self) -> Released:
-        """The model's stream ended: the last sentence."""
+    def finish(self, *, truncated: bool = False) -> Released:
+        """The model's stream ended: the last sentence. ``truncated``: it ended because it reached its token cap, so a
+        last sentence without its end was cut: dropped when nothing of it is out yet and a sentence before it was;
+        else ended at its last whole word with "…" (a word may have been cut too)."""
         if self.done:
             return Released()
         rest, self.buffer = self.buffer, ""
         if not (self.current + rest).strip():
             return Released()
+        if truncated and sentence_end(self.current + rest + " ") is None:
+            if not self.current.strip() and self.sentences > 0:
+                self._record("length", "cut_sentence_dropped", rest)
+                return Released()
+            at = max(rest.rfind(" "), rest.rfind("\n"))  # before the last word, which the cap may have cut
+            kept = rest[:at].rstrip(" ,;:\u2014\u2013-") if at >= 0 else ""
+            if not (self.current + kept).strip():
+                return Released()
+            self._record("length", "cut_at_word", self.current + rest)
+            return Released(self._spaced(self._fix_tokens(kept) + "\u2026"))
         r = self._sentence(rest)
         return Released(self._spaced(r.text), r.verdict)
 
@@ -728,6 +749,13 @@ class AnswerGuard:
                 if len(words) <= hold:
                     return ""
                 cut = words[len(words) - hold - 1].end()
+        elif self.whole_sentences:
+            # whole words of the first sentence as they come; later sentences whole (they can be dropped if cut)
+            if self.sentences > 0:
+                return ""
+            cut = max(self.buffer.rfind(" "), self.buffer.rfind("\n")) + 1
+            if cut <= 0:
+                return ""
         else:
             cut = len(self.buffer)
         text, self.buffer = self.buffer[:cut], self.buffer[cut:]
