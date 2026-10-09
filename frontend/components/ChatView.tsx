@@ -171,8 +171,9 @@ function ChatPage({ chat }: { chat: Chat }) {
     if (savedByVoice > 0) onSettled();
   }, [savedByVoice, onSettled]);
 
-  // The automatic title arrives a second or two after the first answer is saved: ask again after each saved answer
-  // (voice `agent_message`, or a typed turn that finished) while the chat still has the placeholder title.
+  // The automatic title arrives a second or two after the first answer is saved, later if the model is busy: after each
+  // saved answer (voice `agent_message`, or a typed turn that finished) keep asking for about a minute, and whenever the
+  // user comes back to the tab, while the chat still has the placeholder title (lib/auto-title.ts).
   const answersSaved =
     snapshot.messages.reduce((n, m) => n + (m.role === "agent" ? 1 : 0), 0) + conversation.turns.filter((t) => t.agent).length;
   useAutoTitleRefresh(chat, answersSaved);

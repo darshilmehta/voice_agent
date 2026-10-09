@@ -355,6 +355,14 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     return promise;
   }, []);
 
+  // A mutation's response is newer than any read of the same entity still in flight (a title check that left before a
+  // rename, say): drop those reads' results, so a slow one can't put the old values back, and let later loads start
+  // fresh instead of joining a read whose result will be discarded.
+  const supersede = useCallback((key: SlotKey) => {
+    generation.current.set(key, (generation.current.get(key) ?? 0) + 1);
+    inflight.current.delete(key);
+  }, []);
+
   const actions = useMemo<WorkspaceActions>(() => {
     const loadProjects = (force = false) =>
       run(keys.projects, () => api.listProjects({ includeArchived: true }), (items) => dispatch({ type: "projectList", items }), force);
@@ -410,6 +418,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       },
       async updateChat(chatId, patch) {
         const chat = await api.updateChat(chatId, patch);
+        supersede(keys.entity(chatId));
         dispatch({ type: "chat", chat });
         void loadChats(chat.project_id, true);
         if ("pinned" in patch || "archived" in patch) void loadPins(true);
@@ -417,6 +426,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       },
       async regenerateTitle(chatId, force = false) {
         const chat = await api.regenerateTitle(chatId, { force });
+        supersede(keys.entity(chatId));
         dispatch({ type: "chat", chat });
         void loadChats(chat.project_id, true); // the new title also moves the chat in the sidebar's order
         return chat;
@@ -454,7 +464,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
         }
       },
     };
-  }, [api, run]);
+  }, [api, run, supersede]);
 
   // Poll the document lists that still have ingestion in progress.
   const ingesting = Object.entries(state.documents)
