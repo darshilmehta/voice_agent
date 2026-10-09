@@ -44,6 +44,9 @@ RERANK_MAX_TOKENS = 512
 RERANK_BATCH_SIZE = 32
 RERANK_BATCH_SIZE_MPS = 2
 UPSERT_BATCH = 256
+# Chunks of a document read to find its label (``VectorStore.document_labels``): the longest wins, and only the chunks
+# under the document's title lack the title in theirs.
+LABEL_SAMPLE = 16
 
 
 def rerank_batch_size(device: str) -> int:
@@ -259,6 +262,13 @@ class VectorStore(Provider):
         """The documents among ``document_ids`` whose index must be rebuilt: no chunks indexed, or chunks built by
         another ``chunking_version`` (what is embedded changed). Order of ``document_ids`` kept."""
         raise NotImplementedError(f"{type(self).__name__}.outdated")
+
+    async def document_labels(self, filters: RetrievalFilters) -> dict[str, str]:
+        """document id → its label (``Chunk.document_label``: file name and title) for the documents in
+        ``filters.document_ids``; documents without chunks, or labels, are left out. The label is the longest one among
+        a sample of the document's chunks: chunks under the title omit it from theirs. A store that can't say returns
+        nothing, and retrieval then doesn't check which document's passage it found (``services/subjects.py``)."""
+        return {}
 
 
 def build_filter(filters: RetrievalFilters) -> qm.Filter:
@@ -491,6 +501,32 @@ class QdrantStore(VectorStore):
             if total.count == 0 or other.count > 0:
                 out.append(doc_id)
         return out
+
+    async def document_labels(self, filters: RetrievalFilters) -> dict[str, str]:
+        ids = filters.document_ids
+        if not ids:
+            return {}
+        client = self.client()
+
+        async def label_of(document_id: str) -> tuple[str, str]:
+            flt = build_filter(RetrievalFilters(filters.project_id, (document_id,)))
+            points, _ = await client.scroll(
+                self.collection,
+                scroll_filter=flt,
+                limit=LABEL_SAMPLE,
+                with_payload=["document_label"],
+                with_vectors=False,
+            )
+            labels = [str((p.payload or {}).get("document_label") or "") for p in points]
+            return document_id, max(labels, key=len, default="")
+
+        try:
+            pairs = await asyncio.gather(*(label_of(d) for d in ids))
+        except Exception as e:
+            if _not_found(e):  # nothing ingested yet
+                return {}
+            raise
+        return {d: label for d, label in pairs if label}
 
     async def drop_collection(self) -> None:
         """Delete the whole collection (tests, re-index). Recreated on the next upsert."""

@@ -123,12 +123,14 @@ def _abstention(summary: Mapping[str, Any]) -> str:
     overall = ab["overall"]
     gate = (
         f"Gate (`Confidence.above_threshold`): answer when the best reranker score >= `min_rerank_score` = **{t}** and "
-        "the best passage states every fiscal year the question names (nothing retrieved always abstains)."
+        "the best passage states every fiscal year the question names and some passage is about the company it names "
+        "(nothing retrieved always abstains)."
     )
     score_gate = ab.get("score_gate")
     if score_gate:
         gate += (
-            f" {ab.get('vetoed', 0)} questions name a year their best passage doesn't state; without that check the "
+            f" {ab.get('vetoed', 0)} questions name a year their best passage doesn't state, or a company no passage found "
+            "is about; without those checks the "
             f"score alone would answer {score_gate['answered_answerable']} answerable and "
             f"{score_gate['answered_unanswerable']} unanswerable questions."
         )

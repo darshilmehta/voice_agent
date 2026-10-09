@@ -122,6 +122,21 @@ class FakeStore(VectorStore):
         self.project_deletes: list[str] = []
         self.count_override: int | None = None
         self.fail_with: Exception | None = None  # raised by search and delete calls
+        self.labels: dict[str, str] = {}  # document id → label; empty: the longest label among the stored points
+        self.label_calls: list[tuple[str, ...]] = []  # document ids asked for, per ``document_labels`` call
+        self.fail_labels: Exception | None = None
+
+    async def document_labels(self, filters: RetrievalFilters) -> dict[str, str]:
+        ids = tuple(filters.document_ids or ())
+        self.label_calls.append(ids)
+        if self.fail_labels is not None:
+            raise self.fail_labels
+        found = {d: self.labels[d] for d in ids if d in self.labels}
+        for p in self._matching(filters):
+            d = p.chunk.document_id
+            if d not in self.labels and len(p.chunk.document_label) > len(found.get(d, "")):
+                found[d] = p.chunk.document_label
+        return {d: label for d, label in found.items() if label}
 
     async def upsert(self, chunks: Sequence[IndexedChunk]) -> None:
         for c in chunks:

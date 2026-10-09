@@ -53,7 +53,7 @@ class QueryRecord:
     timings_ms: dict[str, float] = field(default_factory=dict)
     sources: list[Passage] = field(default_factory=list)  # context handed to the answer step (after budget/dedupe)
     answer: AnswerRecord | None = None
-    veto: bool = False  # the gate refuses it whatever the score (Confidence.missing_periods)
+    veto: bool = False  # the gate refuses it whatever the score (Confidence.missing_periods, missing_subjects)
     subtype: str | None = None  # unanswerable questions: near_miss_year, other_company, ...
 
     def gate(self) -> GateSample:

@@ -480,7 +480,7 @@ async def run_queries(
             dense=conf.dense_similarity if conf else None,
             timings_ms=dict(result.timings_ms),
             sources=[passage(s.chunk, names, s.rerank_score) for s in sources],
-            veto=conf is not None and bool(conf.missing_periods),
+            veto=conf is not None and bool(conf.missing_periods or conf.missing_subjects),
             subtype=q.subtype,
         )
         is_pipeline_variant = variant == "routed" or (
