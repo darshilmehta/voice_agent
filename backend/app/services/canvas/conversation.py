@@ -88,7 +88,8 @@ _KIND_WORDS: tuple[tuple[str, VisualKind], ...] = (
     (r"waterfall(?:\s+chart)?|bridge\s+chart", "waterfall"),
     (r"bar\s+(?:chart|graph)|bars|column\s+chart|bar|बार\s*(?:चार्ट|ग्राफ़|ग्राफ)?", "bar"),
     (r"line\s+(?:chart|graph)|trend\s+line|line|लाइन\s*(?:चार्ट|ग्राफ़|ग्राफ)?|रेखा\s*(?:चार्ट|ग्राफ़|ग्राफ)", "line"),
-    (r"table|tabular|टेबल|तालिका|सारणी", "table"),
+    # "तेबल" is how Whisper writes a spoken "टेबल" (seen in the demo verification run).
+    (r"table|tabular|टेबल|तेबल|तालिका|सारणी", "table"),
     (r"timeline|टाइमलाइन", "timeline"),
     (r"kpi|kpis|tiles|cards|टाइल्स?", "kpi"),
 )
@@ -375,7 +376,7 @@ _EDIT_WORDS = wordset(
     isko ise isey isse is ye yeh usko use usse wo woh vo ko mein me main men ek ki ke ka jagah ab zara thoda
     dikhao dikhaiye dikhaye dikha do dijiye banao banaiye bana badlo badal dalo karo kar kariye kijiye chahiye
     इसे इसको इस यह ये उसे उसको उस वो वह को में एक की के का जगह अब ज़रा थोड़ा
-    दिखाओ दिखाइए दिखाएं दिखाएँ दिखा दो दीजिए बनाओ बनाइए बना बदलो बदल करो कर कीजिए करें चाहिए चार्ट ग्राफ़ ग्राफ
+    दिखाओ दिखाइए दिखाएं दिखाएँ दिखा दो दीजिए बनाओ पनाओ बनाइए बना बदलो बदल करो कर कीजिए करें चाहिए चार्ट ग्राफ़ ग्राफ
     add include compare next alongside beside too also well with against bhi saath jodo jod daalo sirf keval
     भी साथ जोड़ो जोड़ जोड़ें डालो सिर्फ़ सिर्फ केवल
     na toh yaar bhai plz pls jara thora jaldi ना तो यार भाई जरा थोड़ा जल्दी
