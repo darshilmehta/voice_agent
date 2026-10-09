@@ -104,6 +104,18 @@ To turn it on:
 
 Public engines rate-limit and block automated traffic (CAPTCHAs, "too many requests"), so some engines often return nothing; that is why several are asked in parallel. Fine for a demo, not for production (DESIGN §3.7).
 
+## Live visual canvas
+
+Tables are typed into datasets after ingestion, and each project gets an overview (DESIGN §12.1). The visual planner is one JSON call to `llm.router_model`.
+
+| `canvas` key | Local value | Meaning |
+|---|---|---|
+| `planner_timeout_ms` | `8000` | The planner's model call. Past it, a visual the user asked for ("show me …") gets the best table's default chart; otherwise none. Ollama answers one request at a time, so the planner may wait behind the spoken answer. |
+| `planner_max_tokens` | `200` | Output cap of that call (a plan is ~60 tokens of compact JSON). |
+| `planner_candidates` | `4` | Datasets offered to the planner per question (best matches of the chat's documents). |
+| `max_panels` | `12` | Panels per chat canvas; adding one more removes the oldest unpinned panel. |
+| `overview_panels` | `3` | Panels on a project's overview (KPI tiles, a trend, a composition); `0`: no overview. |
+
 ## Provider status
 
 What the POC builds vs. what stays a placeholder. (No application code exists yet — see `docs/DESIGN.md` §10 for build phases.)
