@@ -79,4 +79,5 @@ async def _seq_of(s: AsyncSession, chat_id: str, message_id: str) -> int:
 
 
 def _summary(row: orm.ChatSummary, covers_seq: int, message_count: int) -> ChatSummary:
-    return ChatSummary.model_validate(row).model_copy(update={"stale": covers_seq < message_count})
+    update = {"covers_seq": covers_seq, "message_count": message_count, "stale": covers_seq < message_count}
+    return ChatSummary.model_validate(row).model_copy(update=update)
