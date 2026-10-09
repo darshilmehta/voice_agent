@@ -4,9 +4,12 @@
             → object store (generated key, never the uploaded filename) → document PENDING + job QUEUED → job queue
     job:    temp copy from the object store → IngestionService.ingest_file (parse, chunk, embed, index)
             → tables saved as datasets (§12.1) + document READY with counts, or FAILED with the error
-            → when the queue drains, the parser releases its models (§8: Docling is loaded only for ingestion)
+            → when the long lane drains, the parser releases its models (§8: Docling is loaded only for ingestion)
     delete: vectors first (a document must never stay searchable without its record), then rows (chat scopes
             pruned), then stored files
+
+Ingestions run in the job queue's long lane, one at a time; the short lane (chat titles) is separate, so a title never
+waits for a conversion or for the startup model preload that ``wait_before_ingesting`` holds a long-lane worker on.
 
 Only the provider interfaces are used (``ObjectStore``, ``JobQueue``, ``VectorStore`` …), so S3 or Redis are drop-ins.
 """
@@ -31,7 +34,7 @@ from ..providers.ingestion import IngestionError
 from ..providers.models import ModelUnavailableError
 from ..providers.registry import Container
 from ..providers.retrieval import VectorStore
-from ..providers.runtime import JobQueue
+from ..providers.runtime import LANE_LONG, JobQueue
 from ..providers.storage import MetadataDB, ObjectNotFound, ObjectStore
 from ..settings import Settings
 from .base import InvalidInput, Unavailable
@@ -201,7 +204,7 @@ class DocumentPipeline:
     async def start(self) -> None:
         """Hook the queue's idle signal and resume ingestions a restart interrupted."""
         try:
-            self.queue.on_idle(self._release_parser)
+            self.queue.on_idle(self._release_parser, lane=LANE_LONG)
             jobs = await self.documents.recover_interrupted()
         except NotImplementedError as e:  # placeholder providers (cloud template in tests): nothing to run
             log.warning("document pipeline not started: %s", e)
@@ -251,7 +254,7 @@ class DocumentPipeline:
         return doc, True
 
     async def _submit(self, job_id: str) -> None:
-        await self.queue.submit(f"ingest {job_id}", partial(self.run_job, job_id))
+        await self.queue.submit(f"ingest {job_id}", partial(self.run_job, job_id), lane=LANE_LONG)
 
     # -------------------------------------------------------------- ingestion job
 

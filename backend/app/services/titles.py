@@ -1,7 +1,8 @@
 """Automatic chat titles (docs/DESIGN.md §3.9): a short title from the first question, off the answer's critical path.
 
     first agent message saved ──hook──► chat still untitled (auto title = the placeholder)?
-                                         └─► job queue: ask the LLM for ≤ 6 words in the conversation's language
+                                         └─► job queue, short lane (never behind an ingestion): ask the LLM for
+                                              ≤ 6 words in the conversation's language
                                               (small token cap, timeout, one retry)  ─ failed ─► cleaned first question
                                               └─► write the title only if nobody renamed the chat meanwhile
 
@@ -27,7 +28,7 @@ from ..db.types import utcnow
 from ..domain.projects import Chat, Message
 from ..providers.llm import LLMClient
 from ..providers.registry import Container
-from ..providers.runtime import JobQueue
+from ..providers.runtime import LANE_SHORT, JobQueue
 from ..providers.storage import MetadataDB
 from ..settings import Language, Settings
 from .base import InvalidInput, NotFound, Service, ServiceError, Unavailable, get_or_404
@@ -89,7 +90,7 @@ class TitleService(Service):
             return
         self._pending.add(chat_id)
         try:
-            await self.queue.submit(JOB_NAME, partial(self._job, chat_id))
+            await self.queue.submit(JOB_NAME, partial(self._job, chat_id), lane=LANE_SHORT)
         except Exception as e:  # queue shut down or a placeholder provider: the next agent message tries again
             self._pending.discard(chat_id)
             log.warning("chat %s: title job not queued: %s", chat_id, e)

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
 
 from app.providers.llm import LLMError, LLMMessage, LLMUnavailableError
-from app.providers.runtime import Job, JobQueue
+from app.providers.runtime import LANE_LONG, LANE_SHORT, Job, JobQueue
 from app.services import titles as titles_module
 from app.services.base import InvalidInput, Unavailable
 from app.services.chats import DEFAULT_TITLE, ChatService
@@ -89,11 +90,13 @@ class InlineQueue(JobQueue):
 
     def __init__(self) -> None:
         self.jobs: list[tuple[str, Job]] = []
+        self.lanes: list[str] = []  # the lane of every job submitted, in order
         self.fail_with: Exception | None = None
 
-    async def submit(self, name: str, job: Job) -> None:
+    async def submit(self, name: str, job: Job, *, lane: str = LANE_LONG) -> None:
         if self.fail_with is not None:
             raise self.fail_with
+        self.lanes.append(lane)
         self.jobs.append((name, job))
 
     async def run_all(self) -> None:
@@ -149,6 +152,7 @@ async def test_title_is_generated_in_the_background_after_the_first_answer(env):
 
     await env.turn(chat)
     assert [name for name, _ in env.queue.jobs] == ["chat-title"]  # queued, not run: the answer didn't wait for it
+    assert env.queue.lanes == [LANE_SHORT]  # never behind an ingestion in the long lane
     assert env.llm.calls == [] and (await env.title(chat)) == (DEFAULT_TITLE, True)
 
     await env.queue.run_all()
@@ -484,3 +488,66 @@ def test_titles_are_off_unless_enabled(make_app):
         seed.ask(chat.id, EN, "It was 18.2%.")
         seed.drain()
         assert seed.chat_row(chat.id)["title"] == DEFAULT_TITLE and llm.calls == []
+
+
+def _wait(condition, timeout: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def test_a_title_does_not_wait_behind_a_running_ingestion(make_app):
+    """B4: titles and ingestions used to share one worker, so a title written seconds after the answer only showed up
+    once a 29-page PDF had finished converting. The title has its own lane now."""
+    llm = ScriptedLLM(lambda messages: "FY24 EBITDA margin" if is_title(messages) else "It was 18.2% [S1].")
+    fakes = make_fakes(llm)
+    fakes.parser.gate = gate = asyncio.Event()  # the conversion runs until the test opens the gate
+    with make_app(fakes, auto_titles=True) as api:
+        seed = Seeder(api)
+        project = seed.project()
+        upload = api.post(
+            f"/api/projects/{project}/documents",
+            files={"file": ("long.txt", b"Key Metrics\n\nEBITDA margin improved to 18.2% in FY24.", "text/plain")},
+        )
+        assert upload.status_code == 202
+        doc = upload.json()["id"]
+        assert _wait(lambda: api.get(f"/api/documents/{doc}").json()["status"] == "PROCESSING")
+
+        chat = seed.chat(project)
+        seed.ask(chat.id, EN, "It was 18.2% [S1].", modality="voice")
+        assert _wait(lambda: seed.chat_row(chat.id)["title"] != DEFAULT_TITLE), "the title waited for the ingestion"
+        assert seed.chat_row(chat.id)["title"] == "FY24 EBITDA margin"
+        assert api.get(f"/api/documents/{doc}").json()["status"] == "PROCESSING"  # still converting
+
+        seed.run(gate.set)
+        seed.drain()
+        assert api.get(f"/api/documents/{doc}").json()["status"] == "READY"
+
+
+def test_a_title_does_not_wait_for_the_model_preload_that_holds_ingestion_back(make_app):
+    """The ingestion worker waits for the startup preload (``wait_before_ingesting``); the title job doesn't."""
+    llm = ScriptedLLM(lambda messages: "FY24 EBITDA margin" if is_title(messages) else "It was 18.2% [S1].")
+    with make_app(make_fakes(llm), auto_titles=True) as api:
+        seed = Seeder(api)
+        preloaded = asyncio.Event()
+        api.app.state.document_pipeline.wait_before_ingesting = preloaded.wait  # type: ignore[attr-defined]
+        project = seed.project()
+        upload = api.post(
+            f"/api/projects/{project}/documents", files={"file": ("a.txt", b"EBITDA margin 18.2%", "text/plain")}
+        )
+        doc = upload.json()["id"]
+        time.sleep(0.1)
+        assert api.get(f"/api/documents/{doc}").json()["status"] == "PENDING"  # its worker is parked on the preload
+
+        chat = seed.chat(project)
+        seed.ask(chat.id, EN, "It was 18.2% [S1].")
+        assert _wait(lambda: seed.chat_row(chat.id)["title"] == "FY24 EBITDA margin"), (
+            "the title waited for the preload"
+        )
+
+        seed.run(preloaded.set)
+        seed.drain()
+        assert api.get(f"/api/documents/{doc}").json()["status"] == "READY"
