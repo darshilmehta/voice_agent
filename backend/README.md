@@ -70,7 +70,20 @@ Upload is `multipart/form-data` with one field, `file`. The extension must be in
 
 A `Citation` is `{"source_id": "S1", "document_id", "filename", "page_start", "page_end", "chunk_id", "snippet"}`; answers mark sources as `[S1]`. Unknown chat or invalid text fail before the stream (`404` / `422`).
 
-Every turn (phase 1) is a document question: retrieval runs within the chat's project, narrowed to its `document_scope`, over `READY` documents only. If the best passage scores below `retrieval.min_rerank_score` the agent abstains with a fixed sentence in the user's language and no model call (`abstained: true`, no sources). Otherwise the top passages become numbered sources (deduplicated, grouped by section, within `retrieval.context_token_budget`) and `qwen3:4b-instruct` answers from them only, citing `[S#]`; markers naming no source are removed from the saved text, and lists are normalized to `[S1][S2]`. The answer language is `language` when given, else Hindi when at least as many words are in Devanagari as in Latin script, else English. The last 6 messages go along as context. The agent message records the route (top-level `abstained` and `stopped` booleans, confidence, model, prompt version) and latency (retrieval, rerank, first delta, total).
+Every turn is routed first (`services/router.py`, `services/planning.py`, docs/DESIGN.md §3.4): a keyword fast path recognises stop, acknowledgements ("okay", "theek hai"), thanks, greetings, pure language requests and English standalone questions that name the documents; anything else goes to the router model (`qwen3:4b-instruct`, JSON schema: intent + standalone English question, `llm.router_timeout_ms`), while retrieval of the raw utterance runs speculatively alongside it (a standalone question whose retrieval is confident before the router answers skips the router). The model only proposes; application code validates the proposal and decides the retrieval policy:
+
+| Intent | What the turn does |
+|---|---|
+| `document_qa`, `correction` of a document question, `resume_document` with a question | search (rewritten / English query), grounded answer citing `[S#]`, or abstain |
+| `mixed` | search; grounded answer that may add general knowledge, marked as such; not covered → general answer saying so |
+| `general_qa`, `correction` of a general question | no search; general-knowledge answer, no citations, says it isn't from the documents |
+| `conversation` | no search; one-line reply (thanks / greetings / language requests: fixed text, no model) |
+| `clarification` | no search; one short question back |
+| `resume_document` without a question | no search; fixed text: back to the document topic |
+| `backchannel` | no search; "Anything else?" (nothing if that was just said) |
+| `stop` | nothing is said; the turn ends with a `role: "event"` message |
+
+Router failure or timeout falls back to phase 1: a document question on the raw utterance. Document search runs within the chat's project, narrowed to its `document_scope`, over `READY` documents only. If the best passage scores below `retrieval.min_rerank_score` the agent abstains with a fixed sentence in the user's language and no model call (`abstained: true`, no sources; only document questions abstain). Otherwise the top passages become numbered sources (deduplicated, grouped by section, within `retrieval.context_token_budget`) and the model answers from them only, citing `[S#]`; markers naming no source are removed from the saved text, and lists are normalized to `[S1][S2]`. The answer language (`services/language.py`): a language the user asks for ("answer in Hindi", which sticks), else `language` when given, else the language of the message (Devanagari or romanized Hindi → Hindi), else the previous answer's. Prompts carry the last 6 messages plus the chat's memory summary (refreshed in the background, `llm.memory_summary_*`), never the whole transcript. The conversation state (topics, languages, last interrupted answer, `retrieval_enabled`) is kept per chat in `chat_states`. The agent message records the route (`intent`, `rewritten_query`, `query_en`, `topic`, `is_topic_shift`, `response_language`, `answer`, `router`, `speculation`, top-level `abstained` and `stopped` booleans, retrieval confidence, model, prompt version) and latency (router, retrieval, rerank, first delta, total).
 
 If the client disconnects mid-answer, generation is cancelled (the stream to Ollama is closed) and the text generated so far is saved as the agent message with `route.stopped: true`, citing only the sources that text cites; if no text was generated yet, no agent message is saved.
 
@@ -201,9 +214,12 @@ app/
     ingestion.py     ingest_file: parse → chunk → embed → upsert (no DB writes)
     retrieval.py     hybrid search → rerank → top N + confidence signal
     document_pipeline.py  upload validation, dedupe, ingestion jobs, deletion of vectors/files/rows
-    chat_turns.py         ChatTurnService: one turn (text or voice) as typed events: save → (router slot) →
-                          retrieve → gate → sources → answer; answer length is a parameter; stop = cancel
-    sources.py prompts.py language.py   numbered sources + citation checks, answer prompt, answer language
+    chat_turns.py         ChatTurnService: one turn (text or voice) as typed events: save → plan → retrieve →
+                          gate → sources → answer; answer length is a parameter; stop = cancel
+    router.py planning.py   turn router (fast path, router model, validation) and planning (speculative
+                          retrieval, timeout/fallback, retrieval policy)
+    conversation.py memory.py   per-chat conversation state; memory summary and when it may run
+    sources.py prompts.py language.py   numbered sources + citation checks, prompts per answer mode, language rules
     preload.py            background model preloading at startup, reported in /health
     voice/                the voice loop: protocol.py (messages, frames, close codes), turn_taking.py (endpointing,
                           barge-in verdict), speech_text.py (speakable chunks, heard text, backchannels),

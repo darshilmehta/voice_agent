@@ -26,6 +26,7 @@ TABLES = {
     "chats",
     "messages",
     "chat_summaries",
+    "chat_states",
     "document_tables",
 }
 

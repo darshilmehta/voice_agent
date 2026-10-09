@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from pydantic import BaseModel, ValidationError
 
 from app.providers.ingestion import (
     Chunk,
@@ -295,9 +297,16 @@ def keyword_scorer(query: str, passage: str) -> float:
     return sum(1 for w in words if w in text) / len(words)
 
 
+RouteScript = dict[str, Any] | str | Exception | None
+
+
 class FakeLLM(LLMClient):
     """Streams a scripted reply in small pieces and records every call. ``reply`` may be a function of the messages;
-    ``fail_with`` raises before (or, with ``fail_after`` pieces, during) the stream."""
+    ``fail_with`` raises before (or, with ``fail_after`` pieces, during) the stream.
+
+    JSON output (the router): ``route`` is the proposal to return — a dict, raw JSON text, an exception to raise, or
+    a function of the messages giving one of those; None (the default) raises LLMError, so the turn falls back to a
+    document question as in phase 1. ``json_delay`` makes the call slow (timeouts)."""
 
     name = "fake"
 
@@ -312,6 +321,37 @@ class FakeLLM(LLMClient):
         self.closed = False  # the last stream was closed before it finished (generation cancelled)
         self.hold_after: int | None = None  # streams started now stop after this many pieces until released
         self.released = False
+        self.route: RouteScript | Callable[[list[LLMMessage]], RouteScript] = None
+        self.json_calls: list[dict[str, Any]] = []
+        self.json_delay = 0.0
+        self.json_cancelled = 0  # router calls cancelled before they answered
+
+    async def generate_json[M: BaseModel](
+        self,
+        messages: Sequence[LLMMessage],
+        schema: type[M],
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> M:
+        self.json_calls.append({"messages": list(messages), "schema": schema, "model": model, "max_tokens": max_tokens})
+        try:
+            if self.json_delay:
+                await asyncio.sleep(self.json_delay)
+        except asyncio.CancelledError:
+            self.json_cancelled += 1
+            raise
+        script = self.route(list(messages)) if callable(self.route) else self.route
+        if script is None:
+            raise LLMError("no route scripted")
+        if isinstance(script, Exception):
+            raise script
+        content = script if isinstance(script, str) else json.dumps(script)
+        try:
+            return schema.model_validate_json(content)
+        except ValidationError as e:
+            raise LLMError(f"model output doesn't match {schema.__name__}: {e.errors()[:1]}") from e
 
     async def stream(  # type: ignore[override]
         self,

@@ -17,6 +17,7 @@ import asyncio
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any, Literal
 
 from ..providers.ingestion import Chunk
 from ..providers.registry import Container
@@ -159,6 +160,30 @@ class RetrievalService:
     ) -> RetrievalResult:
         t0 = time.perf_counter()
         hits, timings = await self._search(query, project_id=project_id, document_ids=document_ids, query_en=query_en)
+        return await self.rank(query, hits, query_en=query_en, timings=timings, started=t0)
+
+    async def search_timed(
+        self,
+        query: str,
+        *,
+        project_id: str,
+        document_ids: Sequence[str] | None = None,
+        query_en: str | None = None,
+    ) -> tuple[list[SearchHit], dict[str, float]]:
+        """``search`` with its embed and search timings (the first half of ``retrieve``)."""
+        return await self._search(query, project_id=project_id, document_ids=document_ids, query_en=query_en)
+
+    async def rank(
+        self,
+        query: str,
+        hits: Sequence[SearchHit],
+        *,
+        query_en: str | None = None,
+        timings: dict[str, float] | None = None,
+        started: float | None = None,
+    ) -> RetrievalResult:
+        """Rerank search hits and build the result (the second half of ``retrieve``): the reranker scores
+        ``query_en`` when given. ``started`` (a ``perf_counter`` value) is when the search began, for the total."""
         t1 = time.perf_counter()
         rerank_query = (query_en or "").strip() or query
         ranked = await self.rerank(rerank_query, hits)
@@ -169,12 +194,126 @@ class RetrievalService:
             chunks=ranked[: self.config.rerank_top_n],
             candidate_count=len(hits),
             confidence=confidence_of(ranked, self.config.min_rerank_score),
-            timings_ms={**timings, "rerank": _ms(t2 - t1), "total": _ms(t2 - t0)},
+            timings_ms={
+                **(timings or {}),
+                "rerank": _ms(t2 - t1),
+                "total": _ms(t2 - (t1 if started is None else started)),
+            },
         )
 
 
 def _ms(seconds: float) -> float:
     return round(seconds * 1000, 1)
+
+
+# ------------------------------------------------------------------ speculative retrieval
+
+SpeculationOutcome = Literal[
+    "used",  # the route asked for the same query: the speculative result is the turn's retrieval
+    "reused_search",  # same query plus an English one: its search hits were kept, the English query added
+    "discarded",  # the route asked for another query, or for no retrieval
+    "none",  # no speculation (no documents, retrieval off, nothing to search)
+]
+
+
+def same_query(a: str | None, b: str | None) -> bool:
+    """Equal up to case, spacing and trailing punctuation."""
+
+    def norm(q: str | None) -> str:
+        return " ".join((q or "").casefold().split()).rstrip("?.!।").strip()
+
+    return norm(a) == norm(b)
+
+
+class SpeculativeRetrieval:
+    """Retrieval of the raw utterance, started while the router decides (§3.3 d, §9.5), so a document turn whose
+    route keeps the query doesn't wait for retrieval after the router.
+
+    ``rerank=False`` only searches (cheap: embedding + vector search) and leaves the reranker, which shares the GPU
+    with the router model, for the final query. ``result_for`` hands the work over or discards it (see
+    ``SpeculationOutcome``); ``discard`` cancels whatever is still running. Errors surface only when the result is
+    used (a discarded speculation's failure is ignored).
+    """
+
+    def __init__(
+        self,
+        service: RetrievalService,
+        query: str,
+        *,
+        project_id: str,
+        document_ids: Sequence[str] | None,
+        rerank: bool = True,
+    ) -> None:
+        self.service = service
+        self.query = query
+        self.project_id = project_id
+        self.document_ids = document_ids
+        self.started = time.perf_counter()
+        self._search: asyncio.Task[tuple[list[SearchHit], dict[str, float]]] = asyncio.ensure_future(
+            service.search_timed(query, project_id=project_id, document_ids=document_ids)
+        )
+        self._ranked: asyncio.Task[RetrievalResult] | None = asyncio.ensure_future(self._rank()) if rerank else None
+        for task in (self._search, self._ranked):
+            if task is not None:
+                task.add_done_callback(_ignore_failure)
+
+    async def _rank(self) -> RetrievalResult:
+        hits, timings = await asyncio.shield(self._search)
+        return await self.service.rank(self.query, hits, timings=timings, started=self.started)
+
+    @property
+    def reranks(self) -> bool:
+        return self._ranked is not None
+
+    async def wait_ranked(self) -> RetrievalResult | None:
+        """The reranked result once it is ready (None without reranking or when it failed)."""
+        if self._ranked is None:
+            return None
+        await asyncio.wait([self._ranked])
+        return self.peek()
+
+    def peek(self) -> RetrievalResult | None:
+        """The reranked result if it is ready, without waiting."""
+        task = self._ranked
+        if task is None or not task.done() or task.cancelled() or task.exception() is not None:
+            return None
+        return task.result()
+
+    async def result_for(self, query: str, query_en: str | None) -> tuple[RetrievalResult, SpeculationOutcome]:
+        """The turn's retrieval for the route's ``query`` (and English query)."""
+        en = query_en if query_en and not same_query(query_en, query) else None
+        if not same_query(query, self.query):
+            self.discard()
+            result = await self.service.retrieve(
+                query, project_id=self.project_id, document_ids=self.document_ids, query_en=en
+            )
+            return result, "discarded"
+        if en is None:
+            if self._ranked is not None:
+                return await self._ranked, "used"
+            hits, timings = await self._search
+            return await self.service.rank(query, hits, timings=timings, started=self.started), "used"
+        if self._ranked is not None:
+            self._ranked.cancel()  # scored the wrong query; the reranker should score the English one
+        hits, timings = await self._search
+        t0 = time.perf_counter()
+        en_hits = await self.service.search(en, project_id=self.project_id, document_ids=self.document_ids)
+        fused = fuse_hit_lists([hits, en_hits], limit=self.service.config.prefetch_k)
+        timings = {**timings, "search_en": _ms(time.perf_counter() - t0)}
+        result = await self.service.rank(query, fused, query_en=en, timings=timings, started=self.started)
+        return result, "reused_search"
+
+    def discard(self) -> None:
+        for task in (self._ranked, self._search):
+            if task is not None and not task.done():
+                task.cancel()
+
+
+def _ignore_failure(task: asyncio.Task[Any]) -> None:
+    """Mark a speculative task's failure as seen (its error matters only if the result is used, and then it is raised
+    again by awaiting the task)."""
+    if not task.cancelled():
+        task.exception()
 
 
 def _queries(query: str, query_en: str | None) -> list[str]:

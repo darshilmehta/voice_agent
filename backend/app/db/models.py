@@ -221,6 +221,33 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+class ChatState(Base):
+    """A chat's conversation state (§3.5): one row per chat, written only by the chat pipeline from validated turn
+    routes, read by the next turn (so it survives restarts). What the conversation is about (active and previous
+    topic; the last document topic and question, for "back to the report"; the documents the last document answer
+    drew on), its languages (the user's last input language, the last answer's, and the one the user asked for),
+    the answer the user last cut off, and whether turns may search the documents. Live voice-session state
+    (listening, speaking) is not stored.
+
+    ``last_interrupted_message_id`` is a plain id, not a foreign key: a stale one (message deleted) is harmless."""
+
+    __tablename__ = "chat_states"
+
+    chat_id: Mapped[str] = mapped_column(ID, _parent("chats"), primary_key=True)
+    active_topic: Mapped[str | None] = mapped_column(String(200))
+    previous_topic: Mapped[str | None] = mapped_column(String(200))
+    document_topic: Mapped[str | None] = mapped_column(String(200))
+    document_query: Mapped[str | None] = mapped_column(Text)
+    active_document_ids: Mapped[list[str]] = mapped_column(default=list)
+    input_language: Mapped[str | None] = mapped_column(String(8))
+    response_language: Mapped[str | None] = mapped_column(String(8))
+    preferred_language: Mapped[str | None] = mapped_column(String(8))
+    last_intent: Mapped[str | None] = mapped_column(String(32))
+    last_interrupted_message_id: Mapped[str | None] = mapped_column(ID)
+    retrieval_enabled: Mapped[bool] = mapped_column(default=True)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
 class ChatSummary(Base):
     """The latest summary of a chat per kind: ``user`` (the on-demand digest) or ``memory`` (the compact context
     that keeps prompts short, §3.5). ``covers_message_id`` is the last message it includes."""

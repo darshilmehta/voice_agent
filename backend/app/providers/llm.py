@@ -68,9 +68,11 @@ class LLMClient(Provider):
         *,
         model: str | None = None,
         temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> M:
         """Output constrained to ``schema``'s JSON schema and validated with it (router model and router temperature
-        unless given). Raises LLMError when the output doesn't validate."""
+        unless given; ``max_tokens`` caps generation). Raises LLMError when the output doesn't validate (also when
+        the cap cut it short)."""
         raise NotImplementedError(f"{type(self).__name__}.generate_json")
 
 
@@ -231,6 +233,7 @@ class OllamaLLM(LLMClient):
         *,
         model: str | None = None,
         temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> M:
         cfg = self.config
         body = self.request_body(
@@ -238,6 +241,7 @@ class OllamaLLM(LLMClient):
             model=model or cfg.router_model,  # type: ignore[attr-defined]
             temperature=cfg.temperature.router if temperature is None else temperature,  # type: ignore[attr-defined]
             stream=False,
+            max_tokens=max_tokens,
             format=schema.model_json_schema(),
         )
         try:

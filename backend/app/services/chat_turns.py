@@ -1,13 +1,24 @@
 """One turn of a chat (text or voice) as a stream of typed events (docs/DESIGN.md §3.2-§3.6, §3.9).
 
     save the user message                                        → UserMessageEvent
-    plan the turn (phase 1: always document Q&A; phase 3 slots the router in here, §3.4)
-    retrieve within the chat's project and document scope (READY documents only)
-    abstention gate: no evidence above the threshold → fixed answer in the user's language, no LLM
-    numbered sources [S1]… (dedupe, sections, context budget)    → SourcesEvent
-    grounded answer streamed from the LLM                        → DeltaEvent …
-    citations validated, agent message saved with latency         → AgentMessageEvent
+    plan the turn: route + retrieval policy (services/planning.py: a keyword fast path, else the router model
+      alongside a speculative retrieval; a timeout or failure falls back to a document question, §3.4)
+    document turns: retrieve within the chat's project and document scope (READY documents only)
+      abstention gate: no evidence above the threshold → fixed answer in the user's language, no LLM
+      numbered sources [S1]… (dedupe, sections, context budget)  → SourcesEvent
+    other turns: no retrieval                                    → SourcesEvent (no sources, not abstained)
+    the answer streamed from the LLM (grounded, mixed, general, conversation or clarification prompt), or a fixed
+      text ("back to the report…", "Anything else?"), or nothing (stop) → DeltaEvent …
+    citations validated, message saved with route and latency, conversation state advanced → AgentMessageEvent
     any failure                                                  → ErrorEvent (stage: retrieval | llm | storage), end
+
+Every turn that doesn't fail ends with ``AgentMessageEvent``. A "stop" turn says nothing: no ``DeltaEvent``, and the
+message it ends with has role ``event`` (a short notice for the transcript, carrying the route).
+
+Prompts carry recent messages + the chat's memory summary + evidence + the utterance, never the whole transcript
+(§3.5); the memory summary is refreshed in the background after turns, never while one is answering
+(services/memory.py). The conversation state (services/conversation.py) is read before the turn and advanced from
+its validated route when its answer is saved.
 
 Transport-agnostic: ``ChatTurnService`` knows nothing about HTTP. The SSE endpoint (``api/chats.py``) only serialises
 the events (``event.name`` + ``event.payload()``); the voice WebSocket (phase 4-6) runs the same turn with
@@ -18,21 +29,25 @@ The user message stays saved when a later stage fails; a failed answer is not sa
 barge-in), cancel the task consuming the events or ``await events.aclose()``: generation is cancelled (the LLM stream
 is closed) and the text generated so far is saved with ``route.stopped = true``, citing only what that text cites;
 nothing is saved if no text was generated yet. Every saved agent message's ``route`` carries top-level ``abstained``
-and ``stopped`` booleans. A caller that knows what the user actually heard of the answer (the voice session, §3.3 c)
-passes an ``AnswerStop`` to ``run``: the stopped answer is saved with that ``heard_text`` and ``route.interrupted``
-(the reason), and the saved message is handed back on it.
+and ``stopped`` booleans (``abstained``: a document question the documents couldn't answer; never a turn that
+deliberately didn't search) and the router's decision (intent, rewritten and English queries, topic, shift,
+language). A caller that knows what the user actually heard of the answer (the voice session, §3.3 c) passes an
+``AnswerStop`` to ``run``: the stopped answer is saved with that ``heard_text`` and ``route.interrupted`` (the
+reason), and the saved message is handed back on it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import time
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Literal, Protocol
+from typing import Any, ClassVar, Literal
 
+from ..domain.conversation import ConversationState
 from ..domain.projects import Chat, Citation, Message, Modality
 from ..providers.llm import LLMClient, LLMMessage
 from ..providers.registry import Container
@@ -40,31 +55,61 @@ from ..providers.storage import MetadataDB
 from ..settings import Language, Settings
 from .base import InvalidInput
 from .chats import ChatService
+from .conversation import ConversationStateService, TurnOutcome, state_writes
 from .documents import DocumentService
-from .language import choose_language, message_language
+from .language import asked_language, decide_language, message_language
+from .memory import MemoryKeeper, chat_activity
 from .messages import MessageService
+from .planning import DocumentQARouter, TurnPlan, TurnPlanner, interrupted_answer
 from .prompts import (
     ANSWER_LENGTHS,
-    PROMPT_VERSION,
+    PROMPT_IDS,
+    SILENT_NOTICES,
     AbstainReason,
     AnswerLength,
     abstention,
+    ack_text,
     answer_system_prompt,
     answer_user_prompt,
+    clarification_system_prompt,
+    conversation_system_prompt,
+    general_system_prompt,
+    general_user_prompt,
+    resume_text,
+    with_memory,
 )
-from .retrieval import Confidence, RetrievalResult, RetrievalService
+from .retrieval import Confidence, RetrievalResult, RetrievalService, SpeculationOutcome
+from .router import LLMTurnRouter, RouteRequest, TurnRouter, heard
 from .sources import Source, build_sources, finalize_answer, strip_markers, trim_open_marker
 
 log = logging.getLogger(__name__)
 
+__all__ = [  # the turn API used by the transports, and the router slot (phase 1's stand-in is kept for tests)
+    "AgentMessageEvent",
+    "AnswerStop",
+    "ChatEvent",
+    "ChatTurnService",
+    "DeltaEvent",
+    "DocumentQARouter",
+    "ErrorEvent",
+    "SourcesEvent",
+    "Turn",
+    "TurnPlan",
+    "TurnRouter",
+    "UserMessageEvent",
+    "detach",
+    "wait_for_background",
+]
+
 TEXT_MAX = 4000
 HISTORY_MESSAGES = 6  # recent messages sent as conversation context (three exchanges)
 HISTORY_CHARS = 1000  # per message
+SHORT_REPLY_TOKENS = 96  # conversation replies and clarifying questions: one sentence
 
 Stage = Literal["retrieval", "llm", "storage"]
 
-# Saves of stopped answers (and voice session clean-ups) run as their own tasks, so a cancelled request can't interrupt
-# them; keep them referenced.
+# Saves of stopped answers, voice session clean-ups and memory summaries run as their own tasks, so a cancelled
+# request can't interrupt them; keep them referenced.
 _BACKGROUND: set[asyncio.Task[Any]] = set()
 
 
@@ -78,7 +123,8 @@ def detach(coro: Any) -> asyncio.Task[Any]:
 
 
 async def wait_for_background() -> None:
-    """Wait for pending saves of stopped answers and session clean-ups of this event loop (tests, shutdown)."""
+    """Wait for pending saves of stopped answers, session clean-ups and memory summaries of this event loop (tests,
+    shutdown)."""
     loop = asyncio.get_running_loop()
     while pending := [t for t in _BACKGROUND if t.get_loop() is loop and not t.done()]:
         await asyncio.wait(pending)
@@ -111,7 +157,8 @@ class UserMessageEvent:
 
 @dataclass(frozen=True, slots=True)
 class SourcesEvent:
-    """The numbered sources the answer may cite (none when abstaining) and the retrieval confidence."""
+    """The numbered sources the answer may cite (none when abstaining or not searching) and the retrieval
+    confidence."""
 
     sources: list[Citation]
     confidence: Confidence | None
@@ -139,7 +186,8 @@ class DeltaEvent:
 
 @dataclass(frozen=True, slots=True)
 class AgentMessageEvent:
-    """The agent's answer, saved: final text and the citations it actually makes."""
+    """The agent's answer, saved: final text and the citations it actually makes. (A "stop" turn: a message with role
+    ``event`` and no answer.)"""
 
     message: Message
     name: ClassVar[str] = "agent_message"
@@ -163,7 +211,7 @@ class ErrorEvent:
 ChatEvent = UserMessageEvent | SourcesEvent | DeltaEvent | AgentMessageEvent | ErrorEvent
 
 
-# ------------------------------------------------------------------ turn and plan
+# ------------------------------------------------------------------ turn
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,21 +253,10 @@ class AnswerStop:
     user: Message | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class TurnPlan:
-    """What to do with a user message. Phase 3's router (§3.4) produces this from the LLM (intent, rewritten and
-    English queries, tools); phase 1 always plans document Q&A behind the abstention gate."""
-
-    query: str
-    language: Language
-    intent: Literal["document_qa"] = "document_qa"
-    needs_retrieval: bool = True
-    query_en: str | None = None
-
-
 @dataclass
 class _Progress:
-    """How far a turn's answer got, so a stopped answer can be saved with what it had."""
+    """How far a turn's answer got, so a stopped answer can be saved with what it had, and what the turn read before
+    planning (for the route and the conversation state)."""
 
     plan: TurnPlan
     result: RetrievalResult | None = None
@@ -233,17 +270,10 @@ class _Progress:
     saving: bool = False  # the complete answer is being saved: a stop must not save a second copy
     final_save: asyncio.Task[Message] | None = None  # that save, as its own task: a stop waits for it
     final: Message | None = None  # the complete answer, saved
-
-
-class TurnRouter(Protocol):
-    async def plan(self, turn: Turn, history: Sequence[Message]) -> TurnPlan: ...
-
-
-class DocumentQARouter:
-    """Phase 1: every turn is a document question."""
-
-    async def plan(self, turn: Turn, history: Sequence[Message]) -> TurnPlan:
-        return TurnPlan(query=turn.text, language=turn.language)
+    state: ConversationState | None = None  # None: stopped before it was read
+    memory: str | None = None  # the chat's memory summary
+    ready: Mapping[str, str] = field(default_factory=dict)  # READY documents: id → filename
+    speculation: SpeculationOutcome = "none"
 
 
 @dataclass
@@ -282,10 +312,13 @@ class ChatTurnService:
         self.chats = ChatService(db)
         self.messages = MessageService(db)
         self.documents = DocumentService(db)
+        self.states = ConversationStateService(db)
         self.retrieval = retrieval
         self.llm = llm
         self.settings = settings
-        self.router = router or DocumentQARouter()
+        self.router: TurnRouter = router if router is not None else LLMTurnRouter(llm)
+        self.planner = TurnPlanner(retrieval, self.router, timeout_s=settings.llm.router_timeout_ms / 1000)
+        self.memory = MemoryKeeper(db, llm, settings, window=HISTORY_MESSAGES)
 
     @classmethod
     def from_container(cls, container: Container) -> ChatTurnService:
@@ -308,9 +341,11 @@ class ChatTurnService:
         input_latency: dict[str, Any] | None = None,
     ) -> Turn:
         """Check the chat and the message before any event is produced (unknown chat → NotFound, bad text →
-        InvalidInput). ``language`` forces the answer language (else the message's script decides); ``modality`` is
-        recorded on both messages; ``length`` sets the answer style and token cap. Voice turns pass the spoken
-        language (``input_language``, saved on the user message) and the STT timings (``input_latency``)."""
+        InvalidInput). The answer language follows ``services/language.py``: a language the user asks for (now or
+        earlier in the chat), ``language`` when the caller forces one, else the language of the message (the spoken
+        one for voice), else the previous answer's. ``modality`` is recorded on both messages; ``length`` sets the
+        answer style and token cap. Voice turns pass the spoken language (``input_language``, saved on the user
+        message) and the STT timings (``input_latency``)."""
         chat = await self.chats.get(chat_id)
         text = text.strip()
         if not text:
@@ -319,9 +354,21 @@ class ChatTurnService:
             raise InvalidInput(f"text is longer than {TEXT_MAX} characters")
         if length not in ANSWER_LENGTHS:
             raise InvalidInput(f"length must be one of {', '.join(ANSWER_LENGTHS)}")
-        fallback: Language = chat.language if chat.language in ("en", "hi") else self.settings.client.default_language  # type: ignore[assignment]
-        language_ = choose_language(text, language, fallback)
-        return Turn(chat, text, language_, language, modality, length, input_language, input_latency)
+        await state_writes().settled(chat.id)  # the previous turn's state update, if still being written
+        state = await self.states.get(chat.id)
+        decision = decide_language(
+            text,
+            requested=language,
+            spoken=input_language,
+            preferred=state.preferred_language,
+            fallback=self._fallback_language(chat, state),
+        )
+        return Turn(chat, text, decision.language, language, modality, length, input_language, input_latency)
+
+    def _fallback_language(self, chat: Chat, state: ConversationState) -> Language:
+        if state.response_language is not None:
+            return state.response_language
+        return chat.language if chat.language in ("en", "hi") else self.settings.client.default_language  # type: ignore[return-value]
 
     async def save_user_message(self, turn: Turn) -> Message:
         """Save the turn's user message. ``run`` does it itself unless the caller saved it first (voice: so that a
@@ -338,8 +385,8 @@ class ChatTurnService:
     async def save_unanswered(self, turn: Turn, *, heard_text: str, reason: InterruptReason) -> Message:
         """Close a turn that was stopped before its answer had any text (voice): an empty agent message with
         ``route.stopped``, so the transcript shows the question was stopped, not lost."""
-        plan = TurnPlan(query=turn.text, language=turn.language)
-        route = self._route(turn, plan, None, abstained=False, reason=None, sources=0, stopped=True)
+        p = _Progress(TurnPlan(query=turn.text, language=turn.language))
+        route = self._route(turn, p, abstained=False, reason=None, stopped=True)
         route["interrupted"] = reason
         return await self.messages.append(
             turn.chat.id,
@@ -355,7 +402,19 @@ class ChatTurnService:
         self, turn: Turn, *, stop: AnswerStop | None = None, user: Message | None = None
     ) -> AsyncGenerator[ChatEvent, None]:
         """The turn's events. ``stop``: see ``AnswerStop`` (callers that know what was heard of a stopped answer).
-        ``user``: the user message, if the caller already saved it with ``save_user_message``."""
+        ``user``: the user message, if the caller already saved it with ``save_user_message``. While the turn runs,
+        the chat's memory summary waits (or gives way if it is running): one LLM serves both."""
+        activity = chat_activity()
+        activity.turn_started(turn.chat.id)
+        try:
+            async with contextlib.aclosing(self._run(turn, stop, user)) as events:
+                async for event in events:
+                    yield event
+        finally:
+            job = functools.partial(self.memory.refresh_if_due, turn.chat.id)
+            activity.turn_finished(turn.chat.id, job, spawn=detach)
+
+    async def _run(self, turn: Turn, stop: AnswerStop | None, user: Message | None) -> AsyncGenerator[ChatEvent, None]:
         clock = _Clock()
         chat = turn.chat
         if user is None:
@@ -403,46 +462,86 @@ class ChatTurnService:
         """Everything after the user message, recording its progress in ``p`` so that ``run`` can save a stopped
         answer. ``run`` closes this generator when it is closed, which closes the LLM stream (stops generation)."""
         chat = turn.chat
-        plan = p.plan = await self.router.plan(turn, history)
         try:
-            ready = await self.documents.ready_documents(chat.project_id, chat.document_scope)
-            result = (
-                await self.retrieval.retrieve(
-                    plan.query, project_id=chat.project_id, document_ids=list(ready), query_en=plan.query_en
-                )
-                if ready
-                else None
-            )
+            await state_writes().settled(chat.id)
+            p.state = await self.states.get(chat.id)
+            p.memory = await self.memory.current(chat.id)
         except Exception as e:
-            log.warning("chat %s: retrieval failed: %s", chat.id, _describe(e))
+            log.exception("chat %s: reading the conversation state failed", chat.id)
+            yield ErrorEvent("storage", f"could not read the conversation state: {_describe(e)}")
+            return
+        try:
+            ready = p.ready = await self.documents.ready_documents(chat.project_id, chat.document_scope)
+        except Exception as e:
+            log.warning("chat %s: listing the documents failed: %s", chat.id, _describe(e))
             yield ErrorEvent("retrieval", f"document search failed: {_describe(e)}")
             return
-        p.result = result
-        retrieval_ms = p.retrieval_ms = clock.ms()
-        confidence = result.confidence if result is not None else None
+        state = p.state
+        request = RouteRequest(
+            turn.text, turn.language, history, state, list(ready.values()), interrupted_answer(history)
+        )
+        plan = p.plan = await self.planner.plan(
+            request, project_id=chat.project_id, ready=ready, retrieval_enabled=state.retrieval_enabled
+        )
+        if plan.speculated and plan.speculation is None:
+            p.speculation = "discarded"  # the route needs no retrieval
 
-        if confidence is None or not confidence.above_threshold:
-            reason: AbstainReason = "no_documents" if not ready else "not_covered"
-            p.abstained, p.reason = True, reason
-            yield SourcesEvent([], confidence, abstained=True)
-            answer = abstention(plan.language, reason)
+        if plan.mode == "silent":
+            yield SourcesEvent([], None, abstained=False)
+            async for event in self._save_silent(turn, p, clock):
+                yield event
+            return
+        if plan.mode in ("resume", "ack"):
+            answer = self._fixed_reply(plan, p)
+            yield SourcesEvent([], None, abstained=False)
             p.parts.append(answer)
             yield DeltaEvent(answer)
-            route = self._route(turn, plan, result, abstained=True, reason=reason, sources=0)
-            latency = self._latency(clock, result, retrieval_ms, first_delta_ms=clock.ms(), llm_ms=None)
-            async for event in self._save_answer(turn, plan, answer, [], route, latency, p):
+            route = self._route(turn, p, abstained=False, reason=None, model_used=False)
+            latency = self._latency(clock, p, first_delta_ms=clock.ms(), llm_ms=None)
+            async for event in self._save_answer(turn, answer, [], route, latency, p):
                 yield event
             return
 
-        assert result is not None
-        sources = p.sources = build_sources(
-            result.chunks, ready, budget_tokens=self.settings.retrieval.context_token_budget
-        )
-        yield SourcesEvent([s.citation() for s in sources], confidence, abstained=False)
+        if plan.needs_retrieval:
+            try:
+                result = p.result = await self._retrieve(plan, p, chat) if ready else None
+            except Exception as e:
+                log.warning("chat %s: retrieval failed: %s", chat.id, _describe(e))
+                yield ErrorEvent("retrieval", f"document search failed: {_describe(e)}")
+                return
+            p.retrieval_ms = clock.ms()
+            confidence = result.confidence if result is not None else None
+            if confidence is None or not confidence.above_threshold:
+                if plan.mode == "mixed":  # the document part isn't covered: general knowledge, saying so
+                    plan = p.plan = plan.as_general("not_covered" if ready else "no_documents")
+                    yield SourcesEvent([], confidence, abstained=False)
+                else:
+                    reason: AbstainReason = "no_documents" if not ready else "not_covered"
+                    p.abstained, p.reason = True, reason
+                    yield SourcesEvent([], confidence, abstained=True)
+                    answer = abstention(plan.language, reason)
+                    p.parts.append(answer)
+                    yield DeltaEvent(answer)
+                    route = self._route(turn, p, abstained=True, reason=reason, model_used=False)
+                    latency = self._latency(clock, p, first_delta_ms=clock.ms(), llm_ms=None)
+                    async for event in self._save_answer(turn, answer, [], route, latency, p):
+                        yield event
+                    return
+            else:
+                assert result is not None
+                p.sources = build_sources(
+                    result.chunks, ready, budget_tokens=self.settings.retrieval.context_token_budget
+                )
+                yield SourcesEvent([s.citation() for s in p.sources], confidence, abstained=False)
+        else:
+            yield SourcesEvent([], None, abstained=False)
 
         p.llm_start = time.perf_counter()
-        prompt = self._prompt(turn, plan, history, sources)
-        stream = self.llm.stream(prompt, max_tokens=ANSWER_LENGTHS[turn.length].max_tokens)
+        prompt = self._prompt(turn, plan, history, p.sources, p.memory)
+        short = plan.mode in ("conversation", "clarification")
+        stream = self.llm.stream(
+            prompt, max_tokens=SHORT_REPLY_TOKENS if short else ANSWER_LENGTHS[turn.length].max_tokens
+        )
         try:
             async with contextlib.aclosing(stream):  # type: ignore[type-var]  (closing the stream stops generation)
                 async for piece in stream:
@@ -454,77 +553,130 @@ class ChatTurnService:
             log.warning("chat %s: answer generation failed: %s", chat.id, _describe(e))
             yield ErrorEvent("llm", f"answer generation failed: {_describe(e)}")
             return
-        answer, citations = finalize_answer("".join(p.parts), sources)
+        answer, citations = finalize_answer("".join(p.parts), p.sources)
         if not answer:
             yield ErrorEvent("llm", "the model returned an empty answer")
             return
-        if not citations:
+        if p.sources and not citations:
             log.info("chat %s: answer cites no source", chat.id)
-        route = self._route(turn, plan, result, abstained=False, reason=None, sources=len(sources))
-        latency = self._latency(
-            clock, result, retrieval_ms, first_delta_ms=p.first_delta_ms, llm_ms=clock.ms(p.llm_start)
-        )
-        async for event in self._save_answer(turn, plan, answer, citations, route, latency, p):
+        route = self._route(turn, p, abstained=False, reason=None)
+        latency = self._latency(clock, p, first_delta_ms=p.first_delta_ms, llm_ms=clock.ms(p.llm_start))
+        async for event in self._save_answer(turn, answer, citations, route, latency, p):
             yield event
 
     # -------------------------------------------------------------- helpers
 
+    async def _retrieve(self, plan: TurnPlan, p: _Progress, chat: Chat) -> RetrievalResult:
+        """The plan's retrieval: the speculative one when the route kept its query, else a new one."""
+        if plan.speculation is not None:
+            result, p.speculation = await plan.speculation.result_for(plan.query, plan.query_en)
+            return result
+        return await self.retrieval.retrieve(
+            plan.query, project_id=chat.project_id, document_ids=list(p.ready), query_en=plan.query_en
+        )
+
+    @staticmethod
+    def _fixed_reply(plan: TurnPlan, p: _Progress) -> str:
+        if plan.mode == "ack":
+            return ack_text(plan.ack or "ack", plan.language)
+        state = p.state
+        active = [p.ready[d] for d in (state.active_document_ids if state is not None else []) if d in p.ready]
+        topic = state.document_topic if state is not None else None
+        return resume_text(plan.language, topic, active or list(p.ready.values()))
+
     async def _history(self, chat_id: str, *, before: int) -> list[Message]:
+        """Recent user and agent messages, oldest first, without "stop" turns (they got no answer)."""
         if before <= 1:
             return []
-        page = await self.messages.list(chat_id, before=before, limit=HISTORY_MESSAGES)
-        return [m for m in page.items if m.role in ("user", "agent")]
+        items = (await self.messages.list(chat_id, before=before, limit=HISTORY_MESSAGES)).items
+        kept = []
+        for i, m in enumerate(items):
+            if m.role == "event":
+                continue
+            if m.role == "user" and i + 1 < len(items) and items[i + 1].role == "event":
+                continue
+            kept.append(m)
+        return kept
 
     def _prompt(
-        self, turn: Turn, plan: TurnPlan, history: Sequence[Message], sources: Sequence[Source]
+        self,
+        turn: Turn,
+        plan: TurnPlan,
+        history: Sequence[Message],
+        sources: Sequence[Source],
+        memory: str | None,
     ) -> list[LLMMessage]:
-        messages = [LLMMessage("system", answer_system_prompt(plan.language, turn.length))]
+        language, length = plan.language, turn.length
+        if plan.mode in ("grounded", "mixed"):
+            system = answer_system_prompt(language, length, mixed=plan.mode == "mixed")
+            question = answer_user_prompt(plan.query, sources, language)
+        elif plan.mode == "general":
+            system = general_system_prompt(language, length, plan.general_note)
+            question = general_user_prompt(plan.query, language)
+        elif plan.mode == "clarification":
+            system, question = clarification_system_prompt(language), turn.text
+        else:
+            system, question = conversation_system_prompt(language), turn.text
+        messages = [LLMMessage("system", with_memory(system, memory))]
         for m in history:
             # Interrupted voice answers: only what was heard ("" when nothing was: the answer is left out).
-            text = strip_markers(m.heard_text if m.heard_text is not None else m.text)[:HISTORY_CHARS]
+            text = strip_markers(heard(m))[:HISTORY_CHARS]
             if text:
                 messages.append(LLMMessage("user" if m.role == "user" else "assistant", text))
-        messages.append(LLMMessage("user", answer_user_prompt(plan.query, sources, plan.language)))
+        messages.append(LLMMessage("user", question))
         return messages
 
     def _route(
         self,
         turn: Turn,
-        plan: TurnPlan,
-        result: RetrievalResult | None,
+        p: _Progress,
         *,
         abstained: bool,
         reason: AbstainReason | None,
-        sources: int,
         stopped: bool = False,
+        model_used: bool = True,
     ) -> dict[str, Any]:
+        """The message's ``route`` (§3.9): the validated route (§3.4), how it was decided, and what the answer did.
+        ``abstained`` and ``stopped`` stay top-level booleans."""
+        plan, result = p.plan, p.result
+        route = plan.route
+        prompt = PROMPT_IDS[plan.mode] if model_used else None
         return {
             "intent": plan.intent,
             "needs_retrieval": plan.needs_retrieval,
+            "rewritten_query": route.rewritten_query if route is not None else None,
+            "query_en": plan.query_en,
+            "tools": list(route.tools) if route is not None else [],
+            "topic": route.topic if route is not None else None,
+            "is_topic_shift": route.is_topic_shift if route is not None else False,
+            "response_language": plan.language,
             "language": plan.language,
+            "input_language": turn.input_language or message_language(turn.text),
+            "route_confidence": route.confidence if route is not None else None,
+            "answer": plan.mode,
+            "general_note": plan.general_note,
+            "router": plan.decision.record() if plan.decision is not None else None,
+            "speculation": p.speculation,
+            "memory": bool(p.memory) and prompt is not None,
             "abstained": abstained,
             "abstain_reason": reason,
             "stopped": stopped,
             "confidence": confidence_json(result.confidence if result is not None else None),
             "candidates": result.candidate_count if result is not None else 0,
-            "sources": sources,
+            "sources": len(p.sources),
             "length": turn.length,
-            "model": None if abstained else self.settings.llm.chat_model,
-            "prompt": PROMPT_VERSION,
+            "model": self.settings.llm.chat_model if prompt is not None else None,
+            "prompt": prompt,
         }
 
     @staticmethod
-    def _latency(
-        clock: _Clock,
-        result: RetrievalResult | None,
-        retrieval_ms: float | None,
-        *,
-        first_delta_ms: float | None,
-        llm_ms: float | None,
-    ) -> dict[str, Any]:
-        timings = result.timings_ms if result is not None else {}
+    def _latency(clock: _Clock, p: _Progress, *, first_delta_ms: float | None, llm_ms: float | None) -> dict[str, Any]:
+        timings = p.result.timings_ms if p.result is not None else {}
+        decision = p.plan.decision
         return {
-            "retrieval_ms": retrieval_ms,
+            "router_ms": p.plan.router_ms,
+            "router_llm_ms": decision.llm_ms if decision is not None else None,
+            "retrieval_ms": p.retrieval_ms,
             "embed_ms": timings.get("embed"),
             "search_ms": timings.get("search"),
             "rerank_ms": timings.get("rerank"),
@@ -533,25 +685,62 @@ class ChatTurnService:
             "total_ms": clock.ms(),
         }
 
+    def _advance_state(
+        self,
+        turn: Turn,
+        p: _Progress,
+        citations: Sequence[Citation],
+        *,
+        completed: bool,
+        message_id: str | None = None,
+    ) -> asyncio.Task[Any] | None:
+        """Move the conversation state on from this turn's validated route (application code owns the state). The
+        write runs as its own task (a stop can't cancel it), after any earlier one for the chat (``StateWrites``); the
+        next turn reads the state only once it is written. ``message_id``: a stopped answer's (it becomes the
+        interrupted one)."""
+        plan = p.plan
+        if p.state is None or plan.route is None:  # stopped before the route was decided: nothing to record
+            return None
+        outcome = TurnOutcome(
+            route=plan.route.model_copy(update={"needs_retrieval": plan.needs_retrieval}),
+            query=plan.query if plan.needs_retrieval else None,
+            input_language=turn.input_language or message_language(turn.text),
+            asked_language=asked_language(turn.text),
+            searched=plan.needs_retrieval and bool(p.ready),
+            cited_document_ids=[c.document_id for c in citations],
+            completed=completed,
+            message_id=message_id,
+            interrupted_message_id=plan.interrupted.message_id if plan.interrupted is not None else None,
+        )
+        chat_id = turn.chat.id
+        return state_writes().schedule(chat_id, functools.partial(self.states.apply, chat_id, outcome), spawn=detach)
+
     async def _save_answer(
         self,
         turn: Turn,
-        plan: TurnPlan,
         answer: str,
         citations: list[Citation],
         route: dict[str, Any],
         latency: dict[str, Any],
         p: _Progress,
+        *,
+        role: Literal["agent", "event"] = "agent",
     ) -> AsyncGenerator[ChatEvent, None]:
+        # The state is written before the answer, so nothing of this turn is written after its agent_message (the voice
+        # session's own saves, e.g. what was heard, then never wait on it). A stop arriving meanwhile saves the answer
+        # as stopped (its state follows, chained after this one).
+        write = self._advance_state(turn, p, citations, completed=True)
+        if write is not None:
+            await asyncio.shield(write)
         p.saving = True  # from here on a stop must not save a second copy
         # Its own task: a stop arriving mid-save can't roll it back, and run's stop handler waits for it.
         p.final_save = detach(
             self.messages.append(
                 turn.chat.id,
-                role="agent",
+                role=role,
                 text=answer,
                 modality=turn.modality,
-                language=plan.language,
+                language=p.plan.language,
                 citations=citations,
                 route=route,
                 latency=latency,
@@ -566,20 +755,27 @@ class ChatTurnService:
         p.final = agent
         yield AgentMessageEvent(agent)
 
+    async def _save_silent(self, turn: Turn, p: _Progress, clock: _Clock) -> AsyncGenerator[ChatEvent, None]:
+        """A turn that gets no answer ("stop", a repeated "okay"): an ``event`` message records its route."""
+        route = self._route(turn, p, abstained=False, reason=None, model_used=False)
+        latency = self._latency(clock, p, first_delta_ms=None, llm_ms=None)
+        notice = SILENT_NOTICES.get(p.plan.intent, "Acknowledged")
+        async for event in self._save_answer(turn, notice, [], route, latency, p, role="event"):
+            yield event
+
     async def _save_stopped(self, turn: Turn, p: _Progress, clock: _Clock, stop: AnswerStop | None) -> None:
         """Save an answer that was stopped: the text generated so far (a marker cut in half dropped), citing only the
-        sources that text cites, with what was heard of it when the caller knows (``stop``). Without ``stop``,
-        nothing is saved when no text remains; with it (voice) an empty answer is saved, so the turn is closed."""
+        sources that text cites, with what was heard of it when the caller knows (``stop``), and remember it as the
+        interrupted answer. Without ``stop``, nothing is saved when no text remains; with it (voice) an empty answer
+        is saved, so the turn is closed."""
         text, citations = finalize_answer(trim_open_marker("".join(p.parts)), p.sources)
         if not text and stop is None:
             return
-        route = self._route(
-            turn, p.plan, p.result, abstained=p.abstained, reason=p.reason, sources=len(p.sources), stopped=True
-        )
+        route = self._route(turn, p, abstained=p.abstained, reason=p.reason, stopped=True)
         if stop is not None and stop.reason is not None:
             route["interrupted"] = stop.reason
         llm_ms = clock.ms(p.llm_start) if p.llm_start is not None else None
-        latency = self._latency(clock, p.result, p.retrieval_ms, first_delta_ms=p.first_delta_ms, llm_ms=llm_ms)
+        latency = self._latency(clock, p, first_delta_ms=p.first_delta_ms, llm_ms=llm_ms)
         try:
             message = await self.messages.append(
                 turn.chat.id,
@@ -597,4 +793,5 @@ class ChatTurnService:
             return
         if stop is not None:
             stop.saved = message
+        self._advance_state(turn, p, message.citations, completed=False, message_id=message.id)
         log.info("chat %s: answer stopped after %d characters", turn.chat.id, len(text))

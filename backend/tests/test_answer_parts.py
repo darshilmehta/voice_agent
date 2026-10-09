@@ -29,7 +29,8 @@ def ranked(*chunks, scores=None) -> list[RankedChunk]:
         ("वित्त वर्ष 2024 में EBITDA मार्जिन कितना था?", "hi"),
         ("FY24 में EBITDA margin क्या था?", "hi"),  # tie → Hindi: the grammar is Hindi
         ("What is the मार्जिन in FY24?", "en"),
-        ("EBITDA margin kya tha?", "en"),  # romanized Hindi needs the router (phase 3)
+        ("EBITDA margin kya tha?", "hi"),  # romanized Hindi (Hinglish) is Hindi
+        ("What was the revenue yaar?", "en"),  # one stray Hindi word doesn't make it Hindi
         ("18.2%?", None),
         ("", None),
     ],

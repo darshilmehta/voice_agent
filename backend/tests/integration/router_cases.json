@@ -1,0 +1,112 @@
+{
+  "about": "Labelled router turns (docs/DESIGN.md §3.4) for tests/integration/test_router_eval.py. Each case: the utterance, a short history ([role, text] or [role, text, heard_text] for an interrupted answer), the conversation state's topics, the expected intent (plus acceptable alternatives) and words the standalone query / English query must contain (any of each inner list).",
+  "documents": ["annual_report.pdf"],
+  "cases": [
+    {"id": "doc-fresh-margin", "utterance": "What was the EBITDA margin in FY24?", "intent": "document_qa"},
+    {"id": "doc-fresh-revenue", "utterance": "How much did revenue grow last year?", "intent": "document_qa"},
+    {"id": "doc-fresh-supplier", "utterance": "Which product depends on a single supplier?", "intent": "document_qa"},
+    {"id": "doc-fresh-auditor", "utterance": "Who audits the company's accounts?", "intent": "document_qa"},
+    {"id": "doc-fresh-uncovered", "utterance": "What is the CEO's salary?", "intent": "document_qa", "also": ["mixed"]},
+    {
+      "id": "doc-followup-year", "utterance": "And in FY23?", "intent": "document_qa",
+      "history": [["user", "What was the EBITDA margin in FY24?"], ["agent", "The EBITDA margin in FY24 was 18.2%."]],
+      "topic": "ebitda margin", "query": [["FY23", "2023"], ["margin"]]
+    },
+    {
+      "id": "doc-followup-why", "utterance": "Why did it grow so much?", "intent": "document_qa",
+      "history": [["user", "How much did revenue grow in FY24?"], ["agent", "Revenue grew 34% in FY24, led by the enterprise segment."]],
+      "topic": "revenue growth", "query": [["revenue"]]
+    },
+    {
+      "id": "doc-yes-to-offer", "utterance": "Yes please", "intent": "document_qa", "also": ["backchannel"],
+      "history": [["user", "How much did revenue grow in FY24?"], ["agent", "Revenue grew 34% in FY24. Want the breakdown by segment?"]],
+      "topic": "revenue growth", "query": [["segment"]]
+    },
+    {"id": "gen-capital", "utterance": "By the way, what's the capital of France?", "intent": "general_qa",
+     "history": [["user", "What was the EBITDA margin in FY24?"], ["agent", "The EBITDA margin in FY24 was 18.2%."]], "topic": "ebitda margin"},
+    {"id": "gen-chai", "utterance": "How do I make masala chai?", "intent": "general_qa"},
+    {"id": "gen-ebitda-definition", "utterance": "What does EBITDA stand for?", "intent": "general_qa", "also": ["mixed", "document_qa"]},
+    {"id": "gen-cricket", "utterance": "Who won the cricket world cup in 2011?", "intent": "general_qa"},
+    {
+      "id": "mixed-margin-good", "utterance": "Is an 18% EBITDA margin good for a manufacturing company?", "intent": "mixed",
+      "also": ["general_qa", "document_qa"],
+      "history": [["user", "What was the EBITDA margin in FY24?"], ["agent", "The EBITDA margin in FY24 was 18.2%."]], "topic": "ebitda margin"
+    },
+    {"id": "mixed-gdp", "utterance": "How does our revenue growth compare with India's GDP growth?", "intent": "mixed", "also": ["document_qa"]},
+    {"id": "conv-hello", "utterance": "Hello, how are you?", "intent": "conversation"},
+    {"id": "conv-who", "utterance": "Who are you?", "intent": "conversation"},
+    {"id": "conv-thanks", "utterance": "Thank you, that was really helpful!", "intent": "conversation", "also": ["backchannel"],
+     "history": [["user", "What was the EBITDA margin in FY24?"], ["agent", "The EBITDA margin in FY24 was 18.2%."]], "topic": "ebitda margin"},
+    {"id": "conv-praise", "utterance": "You're doing a great job", "intent": "conversation"},
+    {
+      "id": "resume-plain", "utterance": "Okay, let's go back to the annual report.", "intent": "resume_document",
+      "history": [["user", "What's the capital of France?"], ["agent", "The capital of France is Paris."]],
+      "topic": "capital france", "document_topic": "ebitda margin"
+    },
+    {
+      "id": "resume-with-question", "utterance": "Anyway, back to the document. What did it say about debt?", "intent": "resume_document",
+      "also": ["document_qa"],
+      "history": [["user", "How do I make masala chai?"], ["agent", "Simmer tea leaves with milk, sugar and spices."]],
+      "topic": "masala chai", "document_topic": "ebitda margin", "query": [["debt"]]
+    },
+    {
+      "id": "resume-hindi", "utterance": "चलो वापस रिपोर्ट पर चलते हैं", "intent": "resume_document",
+      "history": [["user", "भारत की राजधानी क्या है?"], ["agent", "भारत की राजधानी नई दिल्ली है।"]],
+      "topic": "capital india", "document_topic": "revenue"
+    },
+    {
+      "id": "corr-interrupted-year", "utterance": "No, I meant FY23", "intent": "correction", "also": ["document_qa"],
+      "history": [["user", "What was the EBITDA margin in FY24?"], ["agent", "The EBITDA margin in FY24 was 18.2%, up from 16.9% the year before.", "The EBITDA margin in FY24 was"]],
+      "topic": "ebitda margin", "query": [["FY23", "2023"], ["margin"]]
+    },
+    {
+      "id": "corr-metric", "utterance": "Sorry, not revenue, net profit.", "intent": "correction", "also": ["document_qa"],
+      "history": [["user", "What was the revenue in FY24?"], ["agent", "Revenue in FY24 was ₹4,210 crore."]],
+      "topic": "revenue", "query": [["profit"]]
+    },
+    {
+      "id": "corr-interrupted-metric", "utterance": "No wait, I meant the EBITDA margin", "intent": "correction", "also": ["document_qa"],
+      "history": [["user", "What was revenue in FY24?"], ["agent", "Revenue in FY24 was ₹4,210 crore and grew 34% on the enterprise segment.", "Revenue in FY24 was ₹4,210 crore and"]],
+      "topic": "revenue", "query": [["EBITDA", "margin"]]
+    },
+    {
+      "id": "corr-hinglish", "utterance": "nahi nahi, FY23 ka batao", "intent": "correction", "also": ["document_qa"],
+      "history": [["user", "What was the EBITDA margin in FY24?"], ["agent", "The EBITDA margin in FY24 was 18.2%."]],
+      "topic": "ebitda margin", "query_en": [["FY23", "2023"]]
+    },
+    {"id": "stop-plain", "utterance": "Stop.", "intent": "stop"},
+    {"id": "stop-long", "utterance": "Okay that's enough, please stop talking", "intent": "stop",
+     "history": [["user", "Tell me about the risks."], ["agent", "The report lists supplier concentration, currency and regulatory risks.", "The report lists supplier"]]},
+    {"id": "stop-hinglish", "utterance": "bas karo", "intent": "stop"},
+    {"id": "bc-okay", "utterance": "Okay.", "intent": "backchannel", "also": ["conversation"],
+     "history": [["user", "What was the EBITDA margin in FY24?"], ["agent", "The EBITDA margin in FY24 was 18.2%."]], "topic": "ebitda margin"},
+    {"id": "bc-mmhmm", "utterance": "mm-hmm", "intent": "backchannel"},
+    {"id": "bc-haan", "utterance": "haan theek hai", "intent": "backchannel", "also": ["conversation"],
+     "history": [["user", "FY24 mein revenue kitna tha?"], ["agent", "FY24 में राजस्व ₹4,210 करोड़ था।"]], "topic": "revenue"},
+    {"id": "bc-achha", "utterance": "achha", "intent": "backchannel", "also": ["conversation"]},
+    {"id": "clar-that-one", "utterance": "What about that one?", "intent": "clarification"},
+    {"id": "clar-number", "utterance": "Tell me the number", "intent": "clarification", "also": ["document_qa"]},
+    {
+      "id": "hi-margin", "utterance": "वित्त वर्ष 2024 में EBITDA मार्जिन कितना था?", "intent": "document_qa",
+      "query_en": [["EBITDA"], ["2024", "FY24"]]
+    },
+    {
+      "id": "hi-misspelled-profit", "utterance": "वित्त वर्ष 2024 में कंपनी का मुनापा कितना था?", "intent": "document_qa",
+      "query_en": [["profit"]]
+    },
+    {"id": "hi-revenue-growth", "utterance": "कंपनी का राजस्व कितना बढ़ा?", "intent": "document_qa", "query_en": [["revenue"]]},
+    {"id": "hinglish-revenue", "utterance": "FY24 mein revenue kitna tha?", "intent": "document_qa", "query_en": [["revenue"]]},
+    {
+      "id": "hinglish-followup", "utterance": "aur FY23 mein?", "intent": "document_qa",
+      "history": [["user", "What was the EBITDA margin in FY24?"], ["agent", "The EBITDA margin in FY24 was 18.2%."]],
+      "topic": "ebitda margin", "query_en": [["FY23", "2023"]]
+    },
+    {"id": "hi-general-capital", "utterance": "भारत की राजधानी क्या है?", "intent": "general_qa"},
+    {"id": "hinglish-general-chai", "utterance": "chai kaise banate hain?", "intent": "general_qa"},
+    {"id": "hi-thanks", "utterance": "धन्यवाद, बहुत अच्छा जवाब था", "intent": "conversation", "also": ["backchannel"]},
+    {
+      "id": "stop-after-interrupt", "utterance": "stop", "intent": "stop",
+      "history": [["user", "Summarize the risks section."], ["agent", "The risks section covers supplier concentration, currency exposure and regulation.", "The risks section covers"]]
+    }
+  ]
+}
