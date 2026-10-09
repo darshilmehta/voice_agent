@@ -5,6 +5,7 @@
 Environment (defaults suit the main checkout, where data/ holds the models and smoke fixtures):
     MODELS_ROOT   directory with huggingface/ (HF_HOME) and docling/ (artifacts)   default <repo>/data/models
     SMOKE_DOCS    directory with annual_report.pdf (written by scripts/smoke/05)  default <repo>/data/smoke/docs
+    SMOKE_AUDIO   directory with the speech clips (scripts/smoke/09)          default <repo>/data/smoke/audio
     QDRANT_URL    a local Qdrant; a uniquely named collection is created and dropped default http://127.0.0.1:6333
 """
 
@@ -59,6 +60,24 @@ def smoke_docs() -> Path:
     if not (docs / "annual_report.pdf").is_file():
         pytest.skip(f"annual_report.pdf not found in {docs} (run scripts/smoke/05_docling.py or set SMOKE_DOCS)")
     return docs
+
+
+@pytest.fixture(scope="session")
+def smoke_audio() -> Path:
+    audio = Path(os.environ.get("SMOKE_AUDIO") or PROJECT_ROOT / "data/smoke/audio")
+    if not (audio / "say_en_0.wav").is_file():
+        pytest.skip(f"speech clips not found in {audio} (run scripts/smoke/09_kokoro.py or set SMOKE_AUDIO)")
+    return audio
+
+
+def require_chat_model(settings: Settings) -> None:
+    """Skip unless Ollama is reachable and has the configured chat model."""
+    try:
+        pulled = {m["name"] for m in httpx.get(f"{settings.llm.base_url}/api/tags", timeout=2).json()["models"]}
+    except httpx.HTTPError as e:
+        pytest.skip(f"Ollama not reachable at {settings.llm.base_url}: {e}")
+    if settings.llm.chat_model not in pulled:
+        pytest.skip(f"{settings.llm.chat_model} not pulled in Ollama")
 
 
 @pytest.fixture(scope="session")

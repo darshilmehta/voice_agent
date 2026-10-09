@@ -381,7 +381,7 @@ WS                /ws/chats/{id}                      live voice or text session
 
 One WebSocket per live voice session on a chat. The backend and the voice-first chat page (§1, §3.8) build against exactly this.
 
-**Endpoint:** `WS /ws/chats/{chat_id}/voice`. Unknown chat → close code `4404`; a project with no READY document still connects (turns abstain, as in text chat). One active voice session per chat: a second connection closes the first with code `4409`.
+**Endpoint:** `WS /ws/chats/{chat_id}/voice`. Unknown chat → close code `4404`; a project with no READY document still connects (turns abstain, as in text chat). One active voice session per chat: a second connection closes the first with code `4409`. A browser page whose `Origin` is not in `server.cors_allowed_origins` is closed with `4403` (a missing `Origin`, i.e. a non-browser client, is allowed). 4403 and 4404 are final: the client doesn't reconnect. Messages over 64 KiB close the connection.
 
 **Audio frames (binary WebSocket messages).**
 
@@ -423,19 +423,28 @@ Server → client:
 **Turn-taking rules.**
 
 1. **End of turn**: the server's VAD (Silero, `vad.*` config) on the incoming audio is the source of truth. After `end_of_turn_ms` of silence the utterance is transcribed (STT; language restricted to the configured languages), saved as a user message, and answered with `ChatTurnService` using `modality="voice"`, `length="short"`. Utterances shorter than `vad.min_speech_ms` are ignored.
-2. **Speaking**: answer deltas are cut into speakable chunks (first chunk at the first clause boundary or ≤ 8 words; then sentences), each synthesized by Kokoro and streamed as `audio_chunk` + binary frames while generation continues.
-3. **Barge-in** (§3.3 duck-then-decide): on `barge_in_start` the server keeps listening; if the new speech lasts ≥ `vad.min_speech_ms` and its transcript is more than `voice.barge_in.backchannel_max_words` words (or isn't a backchannel like "mm-hmm", "okay", "haan"), it sends `barge_in: stop`, cancels the answer, and saves the agent message with **`heard_text`** = the text of fully played chunks plus the proportional share of the chunk being played at `played_ms`; then processes the new utterance as the next user turn. Otherwise `barge_in: resume`. A decision is always sent within `voice.barge_in.decision_timeout_ms`.
-4. **Stop**: `stop` cancels like a confirmed barge-in; `route.stopped = true` as in text chat.
-5. Everything said is persisted as messages in the chat (§3.9): the transcript view and the text endpoint see the same history.
+2. **Speaking**: answer deltas are cut into speakable chunks (first chunk at the first clause boundary or ≤ 5 words; then sentences; never right after an abbreviation such as "Rs." or "U.S."), each synthesized by Kokoro and streamed as `audio_chunk` + binary frames while generation continues.
+3. **Barge-in** (§3.3 duck-then-decide): on `barge_in_start` the server keeps listening and decides:
+   - **stop** when the transcript has real words beyond acknowledgements (more than `voice.barge_in.backchannel_max_words` of them, or an interruption cue such as "wait", "no", "रुको", a question word), or when speech is still going at the deadline. It cancels the answer and saves the agent message with **`heard_text`** = the text of fully played chunks plus the proportional share (whole words) of the chunk playing at the current playback position; the new utterance becomes the next user turn.
+   - **resume** for acknowledgements and hums ("okay", "mm-hmm", "M M", "haan", "achha theek hai", "हम्म"), noise, or a short burst that has ended. A partial transcript with fewer than 2 real words never decides stop on its own.
+
+   A decision is always sent within `voice.barge_in.decision_timeout_ms`. The server may also send `barge_in: stop` **without** a `barge_in_start` (the user spoke while the answer was still being written and the client's VAD didn't fire); the client treats it the same way.
+4. **Stop**: `stop` cancels like a confirmed barge-in; `route.stopped = true` as in text chat. A `stop` during a pending barge-in decision is answered with `barge_in: stop`. A `stop` while the utterance is still being transcribed covers it too: the client gets `state: interrupted`, `user_message`, `turn`, an empty stopped `agent_message`, then `state: listening`, and nothing is answered.
+5. **Ignored utterances** (too short, an acknowledgement or hum, noise, a failed transcription): every `user_speech start` is still closed by `user_speech end`, followed by `barge_in: resume` if a decision was pending and the current `state` again (or `error {stage: "stt"}` first), so the client can clear its captions.
+6. Everything said is persisted as messages in the chat (§3.9): the transcript view and the text endpoint see the same history. An interrupted answer records why in `route.interrupted`: `"barge_in"`, `"stop"`, or `"disconnect"` (client dropped, replaced by another tab, server shutdown).
 
 **Ordering guarantees** (the client relies on these and still guards against stale messages):
 
-- Within a turn the server sends `user_message`, `turn`, `sources`, then the `delta` / `audio_chunk` + frames stream, then `agent_message`. **`agent_message` comes after the turn's last binary frame**, so the client sends `playback_done` only when the answer has really finished playing. If TTS fails partway, `error {stage: "tts"}` comes before `agent_message`.
+- Within a turn the server sends `user_message`, `turn`, `sources`, then the `delta` / `audio_chunk` + frames stream, then `agent_message`. **`agent_message` comes after the turn's last binary frame**, so the client sends `playback_done` only when the answer has really finished playing. If TTS fails partway, `error {stage: "tts"}` comes before `agent_message`. A chunk's frames come in order and before the next `audio_chunk`, but other messages (`delta`, `user_speech`, `barge_in`) may arrive between them; frames are matched by their header, not by position.
+- When an answer that was already saved complete is cut during playback, its `agent_message` is sent again with the same `id`, now carrying `heard_text`; the client updates it in place.
 - After `barge_in: stop` (or a client `stop`) the server sends nothing more for that `turn_id`: no `delta`, `audio_chunk` or frames. The interrupted turn's `agent_message` (with `heard_text`) comes before the next turn's `user_message`.
 - `turn_id` strictly increases within a session. A reconnect is a new session: the client resets its turn tracking on `ready` and reloads the transcript tail.
-- `stop` while thinking (before any speech) cancels the turn and saves the agent message with `route.stopped = true`, then the server returns to `listening`.
+- `stop` while thinking (before any speech) cancels the turn and saves the agent message with `route.stopped = true` (empty or partial text), then the server returns to `listening`. Every cut voice turn ends with an agent message, even an empty one.
+- After a cut, the state goes straight to `thinking` when the interrupting utterance is already being answered.
 
-**Startup.** The backend preloads the embedder, reranker, STT and TTS models at startup (in the background, reported by `/health`), so the first spoken question isn't slowed by model loading (§9 measured ~3.7 s for a cold reranker).
+**Startup.** The backend preloads the embedder, reranker, STT and TTS models and the Ollama model (with the answers' `num_ctx`) at startup, in the background (~20–35 s, reported by `/health`), so the first spoken question isn't slowed by model loading (§9 measured ~3.7 s for a cold reranker).
+
+Repeated input errors (odd-length audio frames, VAD failures) are reported at most once per kind every 5 s.
 
 ---
 
@@ -697,7 +706,7 @@ Findings → design changes:
 
 - **Libraries phone home unless given local paths.** FlagEmbedding calls `snapshot_download` on the repo id and, offline, rejects our deliberately partial snapshot. Providers must resolve models to a local snapshot directory (`local_snapshot(repo_id)`) and never pass bare repo ids. `strict_offline` caught this.
 - **Equal-weight RRF demotes cross-lingual answers to #2**: sparse matching is noise when query and document languages differ. Hybrid is judged on recall (top-3 = 8/8); the **reranker owns final order**. Optional later: down-weight sparse when query language ≠ document language.
-- **Reranker scores are not calibrated across languages.** A fixed 0.3 abstention cutoff would reject real Hindi questions. Changes: (1) the router also emits an **English search query** for non-English turns and the reranker scores that; (2) abstention uses **top score + gap to the next candidate + dense similarity**, thresholds tuned on the eval set.
+- **Reranker scores are not calibrated across languages.** A fixed 0.3 abstention cutoff would reject real Hindi questions (and, measured in phase 4 on the smoke documents, even Whisper's exact transcript of an English revenue question scored 0.282: answerable questions scored 0.074–0.983, unanswerable ones ≤ 0.013, so `retrieval.min_rerank_score` is **0.05** until phase 2 re-tunes it on the eval set). Changes: (1) the router also emits an **English search query** for non-English turns and the reranker scores that; (2) abstention uses **top score + gap to the next candidate + dense similarity**, thresholds tuned on the eval set.
 
 ### 9.3 Smoke tests 06–07, 09 results (speech)
 
@@ -800,6 +809,20 @@ Expected after these: **~2.5–3 s** to the first content audio on this Mac. The
 - Still-open bug: "let's go back to the annual report" → router `backchannel`, answer claims no document access even with the prompt guard (4b ignores it). Fix in build: rule + session-state for resume phrases; never call the answer model without either sources or an explicit general-knowledge route.
 - **Barge-in semantics (from the user's mic test):** ducking alone isn't enough — the agent kept talking and finished its thought. Required behavior: duck on speech onset → **stop and discard the rest of the answer** once speech is confirmed (≥ `minSpeechMs`, then transcript check) → restore volume on misfire. `mic.html` now implements duck → stop → restore.
 
+**Voice loop as built (phases 4–6, measured 2026-10-09).** Opt-in `tests/integration/test_voice_e2e.py` (real models, real-time audio) and a browser run of the voice-first chat page against the real backend (synthetic mic through the real worklet, browser VAD and socket):
+
+| ms after the user stops speaking | Document answer | Correction after barge-in | Abstained (no LLM) |
+|---|---|---|---|
+| End of turn detected (`end_of_turn_ms` 600) | ~610–660 | ~660 | ~705 |
+| `user_message` (speculative STT reused: 112–314 ms after end of turn; up to ~1.3 s on a first turn) | 790–1,980 | ~785–795 | ~950–975 |
+| First `delta` (retrieval 260–590, of which rerank 190–340; LLM first token 1.1–2.1 s) | 1,900–4,100 | ~2,160–2,590 | ~1,230–1,250 |
+| **First agent audio** (5-word first chunk, Kokoro CPU ~0.5 s) | **2,700–4,900** (browser median 3,200) | **~3,240–3,610** | **~1,620** |
+
+- Before these changes the same test measured 6.8 s; §9.5's estimate was ~5.0–5.4 s. Applied: background preload (including Ollama with the answers' `num_ctx`, which saved a reload worth ~0.8 s on the first answer), speculative STT, 5-word first chunk, 8 reranked candidates.
+- Browser side: first audio frame ≈ server + 0.12 s; duck 60–77 ms after speech onset; barge-in `stop` 0.61–0.67 s after speech start; backchannel `resume` ~0.7–0.78 s; local Stop/Esc 1–2 ms.
+- What remains is mostly Ollama prompt prefill (~370 tokens/s, ≈ 2.7 ms per prompt token of sources). Next steps (phase 9): fewer or shorter passages for voice answers, a speculative answer started before routing, an instant acknowledgement, Kokoro on MPS under load.
+- Measured with other apps (and, for the browser run, another agent's Ollama calls) running: slightly pessimistic.
+
 ### 9.6 Smoke test 12 results (network off)
 
 Run 2026-10-08 21:51 with Wi-Fi off (`network: unreachable ✓`), `UV_OFFLINE=1`, `HF_HUB_OFFLINE=1`:
@@ -837,7 +860,8 @@ Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first
 | −1 Downloads + smoke tests | ✅ done | §9; initial commit |
 | 0 Skeleton | ✅ done | PRs #1–#3 (hygiene, backend skeleton, frontend shell), #5 (CI), #8 (Docker images + `full` profile, `docker.config.json`, `strict_offline_local_hosts`) |
 | 1 Projects + text document chat | ✅ done | #10 persistence (SQLite + Alembic, projects/chats/messages/pins API), #11 ingestion + hybrid retrieval, #12 sidebar, project and chat pages, transcript view, #16 upload + background ingestion + streamed cited chat (transport-agnostic `ChatTurnService`), #14 upload UI + streaming composer + citation popovers. Verified end to end on the real models: FY24 EBITDA 18.2% cited p.2 in EN and HI, out-of-document question abstains, transcript survives reload |
-| 4–6 Voice loop | next | protocol §3.10; voice backend and voice-first chat page in parallel |
+| 4–6 Voice loop | ✅ done | #17 + #19 protocol (§3.10), #21 voice session backend (VAD, speculative STT, Kokoro streaming, barge-in, preload), #20 voice-first chat page (presence field, captions, browser VAD barge-in, transcript panel, "Start a conversation"), #18 citation tables. Independently reviewed (both sides) and verified end to end on the real models in the browser: spoken question → cited spoken answer, barge-in with `heard_text`, backchannels ignored, stop, Hindi, reload, second tab, backend restart; first audio median ~3.2 s in the browser, 2.7–4.9 s across runs (§9.5) |
+| 3 + 7 Router, state, revisit features | in progress | router + conversation state + drift/languages; titles, summaries, export |
 
 Design-only PRs so far: #4 and #6 (voice presence UI, §3.8), #7 (projects, chats, transcripts, §3.9).
 

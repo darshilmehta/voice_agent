@@ -11,7 +11,7 @@ from .conftest import CLOUD_SECRETS, make_model_assets, mock_http
 
 
 def _client(settings, http, **kw) -> TestClient:
-    return TestClient(create_app(settings, build_container(settings, http=http, **kw)))
+    return TestClient(create_app(settings, build_container(settings, http=http, **kw), preload_models=False))
 
 
 def _by_capability(body: dict) -> dict[str, dict]:
@@ -64,7 +64,7 @@ def test_health_survives_a_crashing_check(load_local, tmp_path, monkeypatch):
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(container["tts"], "health", boom)
-    with TestClient(create_app(s, container)) as client:
+    with TestClient(create_app(s, container, preload_models=False)) as client:
         tts = _by_capability(client.get("/health").json())["tts"]
     assert tts["status"] == "down" and "kaboom" in tts["detail"]
 

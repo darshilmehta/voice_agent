@@ -135,6 +135,21 @@ def test_processing_is_visible_while_the_job_runs(app, fakes):
     assert app.get(f"/api/documents/{doc_id}").json()["status"] == "READY"
 
 
+def test_ingestion_waits_for_the_startup_model_preload(app, fakes):
+    """A conversion during the preload would hold off its model loads (models.TorchGate), and the questions queued
+    behind them; uploads made meanwhile stay PENDING and are ingested once the preload is over."""
+    pipeline = app.app.state.document_pipeline  # type: ignore[attr-defined]
+    assert pipeline.wait_before_ingesting == app.app.state.preloader.wait  # type: ignore[attr-defined]
+    preloaded = asyncio.Event()
+    pipeline.wait_before_ingesting = preloaded.wait
+    doc_id = upload(app, _project(app), "a.md", b"# Notes\n\nHello.").json()["id"]
+    time.sleep(0.2)
+    assert app.get(f"/api/documents/{doc_id}").json()["status"] == "PENDING" and fakes.parser.parsed_paths == []
+    _run(app, preloaded.set)
+    drain(app)
+    assert app.get(f"/api/documents/{doc_id}").json()["status"] == "READY"
+
+
 def test_failed_ingestion_is_recorded_with_a_readable_error(app, fakes):
     p = _project(app)
     r = upload(app, p, "blank.txt", b"  \n\n \n")  # text, but nothing to index

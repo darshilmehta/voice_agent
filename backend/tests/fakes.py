@@ -1,4 +1,5 @@
-"""In-memory stand-ins for the ingestion/retrieval/LLM providers: no ML libraries, models, Qdrant or Ollama needed."""
+"""In-memory stand-ins for the ingestion/retrieval/LLM/speech providers: no ML libraries, models, Qdrant or Ollama
+needed."""
 
 from __future__ import annotations
 
@@ -7,6 +8,8 @@ import hashlib
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from app.providers.ingestion import (
     Chunk,
@@ -29,6 +32,8 @@ from app.providers.retrieval import (
     SparseVector,
     VectorStore,
 )
+from app.providers.speech import SpeechRecognizer, SpeechSynthesizer, Transcript, VoiceActivityDetector
+from app.services.language import message_language
 
 
 def make_chunk(index: int = 0, *, document_id: str = "doc1", project_id: str = "proj1", **over: Any) -> Chunk:
@@ -305,6 +310,8 @@ class FakeLLM(LLMClient):
         self.delay = 0.0  # seconds before each piece
         self.sent = 0  # pieces yielded by the last stream
         self.closed = False  # the last stream was closed before it finished (generation cancelled)
+        self.hold_after: int | None = None  # streams started now stop after this many pieces until released
+        self.released = False
 
     async def stream(  # type: ignore[override]
         self,
@@ -321,11 +328,14 @@ class FakeLLM(LLMClient):
             raise self.fail_with
         text = self.reply(list(messages)) if callable(self.reply) else self.reply
         self.sent, self.closed = 0, False
+        hold = self.hold_after
         finished = False
         try:
             for i in range(0, len(text), self.piece_chars):
                 if self.fail_after is not None and i // self.piece_chars >= self.fail_after:
                     raise self.fail_with or LLMError("stream broke")
+                while hold is not None and i // self.piece_chars >= hold and not self.released:
+                    await asyncio.sleep(0.005)  # the model is "still thinking" (until cancelled)
                 if self.delay:
                     await asyncio.sleep(self.delay)
                 self.sent += 1
@@ -333,3 +343,102 @@ class FakeLLM(LLMClient):
             finished = True
         finally:
             self.closed = not finished
+
+
+# ------------------------------------------------------------------ speech
+#
+# Test audio encodes what was "said" in its loudness: speech(ms, tone=30) is a constant 0.30 signal, silence is zeros.
+# FakeVAD hears speech in any frame above 0.02; FakeSTT maps the utterance's peak level (in hundredths) to a script.
+
+IN_RATE = 16_000
+OUT_RATE = 24_000
+
+
+def speech(ms: float, tone: int = 30) -> bytes:
+    """PCM16 16 kHz "speech" at level tone/100 (FakeSTT's key for what was said)."""
+    return np.full(int(IN_RATE * ms / 1000), round(tone / 100 * 32767), dtype="<i2").tobytes()
+
+
+def silence(ms: float) -> bytes:
+    return bytes(int(IN_RATE * ms / 1000) * 2)
+
+
+class FakeVAD(VoiceActivityDetector):
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.fail_with: Exception | None = None
+        self.streams = 0
+
+    def open_stream(self) -> _FakeVADStream:
+        self.streams += 1
+        return _FakeVADStream(self)
+
+
+class _FakeVADStream:
+    def __init__(self, vad: FakeVAD) -> None:
+        self.vad = vad
+
+    async def __call__(self, frames: np.ndarray) -> list[float]:
+        if self.vad.fail_with is not None:
+            raise self.vad.fail_with
+        return [0.9 if float(np.abs(f).max()) > 0.02 else 0.0 for f in frames]
+
+    def reset(self) -> None:
+        pass
+
+
+class FakeSTT(SpeechRecognizer):
+    """``scripts`` maps a tone to the text heard; the language is the only allowed one, else read from the script."""
+
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.scripts: dict[int, str | Callable[[float], str]] = {}  # a callable gets the audio's length in ms
+        self.calls: list[dict[str, Any]] = []
+        self.cancelled = 0  # transcriptions cancelled while running (stale speculative jobs)
+        self.fail_with: Exception | None = None
+        self.delay = 0.0
+
+    async def transcribe(self, pcm16k: np.ndarray, languages: Sequence[str]) -> Transcript:  # type: ignore[override]
+        tone = round(float(np.abs(pcm16k).max()) * 100) if pcm16k.size else 0
+        ms = len(pcm16k) * 1000 / IN_RATE
+        self.calls.append({"tone": tone, "ms": ms, "languages": list(languages)})
+        if self.delay:
+            try:
+                await asyncio.sleep(self.delay)
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+        if self.fail_with is not None:
+            raise self.fail_with
+        script = self.scripts.get(tone, "")
+        text = script(ms) if callable(script) else script
+        language = languages[0] if len(languages) == 1 else (message_language(text) or "en")
+        return Transcript(text, language)  # type: ignore[arg-type]
+
+
+class FakeTTS(SpeechSynthesizer):
+    """100 ms of audio per word, so what was heard at a given played_ms is exact."""
+
+    name = "fake"
+    MS_PER_WORD = 100
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.fail_with: Exception | None = None
+        self.fail_from = 0  # with fail_with: the first call that fails (0 = every call)
+        self.delay = 0.0
+
+    @property
+    def sample_rate(self) -> int:
+        return OUT_RATE
+
+    async def synthesize(self, text: str, language: str) -> bytes:  # type: ignore[override]
+        self.calls.append((text, language))
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.fail_with is not None and len(self.calls) > self.fail_from:
+            raise self.fail_with
+        samples = OUT_RATE * self.MS_PER_WORD // 1000 * len(text.split())
+        return np.full(samples, 1000, dtype="<i2").tobytes()

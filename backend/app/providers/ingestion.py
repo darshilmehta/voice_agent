@@ -38,6 +38,12 @@ if TYPE_CHECKING:
 # Directories `docling-tools models download` creates under artifacts_path.
 DOCLING_LAYOUT = "docling-project--docling-layout-heron"
 DOCLING_TABLES = "docling-project--docling-models"
+# Docling's models run on the CPU, never the GPU: ingestion then never waits for, or makes wait, the GPU work of
+# questions and voice turns (see models.TorchGate). Measured cost (M4, warm): the 3-page smoke PDF 0.86 → 1.16 s,
+# a 30-page PDF 6.9 → 11.3 s (0.23 → 0.38 s per page) compared with Docling's default (layout model on MPS).
+# A large parse still slows a concurrent voice turn (Kokoro's synthesis most, CPU and memory contention); measured
+# no better with Docling in a separate, niced process, on MPS or CPU.
+DOCLING_DEVICE = "cpu"
 OCR_ARTIFACTS = {"rapidocr": "RapidOcr"}
 
 # File types Docling converts (TXT is read directly: Docling has no plain-text backend).
@@ -419,10 +425,11 @@ class DoclingParser(DocumentParser):
         with self._lock:
             conv, self._converter = self._converter, None
             if conv is not None:
-                conv.initialized_pipelines.clear()
-                del conv
-        gc.collect()
-        models.free_torch_memory()
+                with models.TORCH.load():  # freeing torch memory is exclusive like loading (see TorchGate)
+                    conv.initialized_pipelines.clear()
+                    del conv
+                    gc.collect()
+                    models.free_torch_memory()
 
     # -------------------------------------------------------------- parsing
 
@@ -465,7 +472,10 @@ class DoclingParser(DocumentParser):
         with self._lock:
             conv = self._converter = self._converter or self._build_converter()
             try:
-                res = conv.convert(path, raises_on_error=False, max_num_pages=self.cfg.max_pages)
+                # Docling runs on the CPU (DOCLING_DEVICE): a shared torch user, so questions and voice turns keep
+                # the GPU while documents ingest, and nothing here can collide with their MPS work.
+                with models.TORCH.use(DOCLING_DEVICE):
+                    res = conv.convert(path, raises_on_error=False, max_num_pages=self.cfg.max_pages)
             except Exception as e:  # docling raises for unreadable/corrupt input before producing a result
                 raise IngestionError(f"{path.name}: conversion failed: {type(e).__name__}: {e}") from e
         errors = [e.error_message for e in res.errors]
@@ -475,6 +485,10 @@ class DoclingParser(DocumentParser):
         return res.document, errors
 
     def _build_converter(self) -> DocumentConverter:
+        """The converter. Docling builds a format's pipeline (and loads its models) inside the first conversion of
+        that format, under the same shared CPU torch use as the conversion: on the CPU at the default dtype, building
+        them doesn't change state other threads depend on (unlike half-precision or MPS loads, see TorchGate)."""
+        from docling.datamodel.accelerator_options import AcceleratorOptions
         from docling.datamodel.base_models import InputFormat
         from docling.datamodel.pipeline_options import PdfPipelineOptions
         from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -483,6 +497,7 @@ class DoclingParser(DocumentParser):
         opts = PdfPipelineOptions(artifacts_path=str(self.artifacts_path))
         opts.do_table_structure = True
         opts.do_ocr = cfg.ocr
+        opts.accelerator_options = AcceleratorOptions(device=DOCLING_DEVICE)
         if cfg.ocr:
             opts.ocr_options = _ocr_options(cfg.ocr_engine)
         return DocumentConverter(

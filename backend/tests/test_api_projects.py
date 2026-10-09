@@ -251,7 +251,7 @@ def test_projects_chats_and_pins_survive_a_restart(load_local):
     settings = load_local()
 
     def app() -> TestClient:
-        return TestClient(create_app(settings, build_container(settings, http=mock_http())))
+        return TestClient(create_app(settings, build_container(settings, http=mock_http()), preload_models=False))
 
     with app() as api:
         p = _project(api)

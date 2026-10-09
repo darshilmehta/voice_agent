@@ -67,6 +67,10 @@ class Provider:
     async def close(self) -> None:
         """Release resources. Called once at shutdown."""
 
+    async def preload(self) -> None:
+        """Load models now instead of on first use (the app preloads the conversation models in the background at
+        startup, so the first question isn't slowed by loading). Default: nothing to load."""
+
     async def health(self) -> ProviderHealth:
         return self._health(HealthStatus.OK)
 

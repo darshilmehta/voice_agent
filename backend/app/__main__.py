@@ -5,6 +5,7 @@ import sys
 import uvicorn
 
 from .providers.registry import resolve_providers
+from .services.voice.protocol import MAX_MESSAGE_BYTES
 from .settings import ConfigError, load_settings
 
 
@@ -23,6 +24,7 @@ def main() -> int:
         proxy_headers=bool(settings.server.trusted_proxy_ips),
         forwarded_allow_ips=",".join(settings.server.trusted_proxy_ips) or None,
         log_config=None,
+        ws_max_size=MAX_MESSAGE_BYTES,  # voice WebSocket: audio frames are ≤ 32 KiB, control messages tiny
     )
     return 0
 

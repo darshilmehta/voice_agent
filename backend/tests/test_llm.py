@@ -141,6 +141,23 @@ async def test_generate_json_rejects_output_that_does_not_validate(load_local):
         await llm.generate_json(MESSAGES, Route)
 
 
+async def test_preload_loads_the_chat_model_with_the_answers_context_size(load_local):
+    llm, rec = make_llm(load_local, lambda r: httpx.Response(200, json={"done": True, "done_reason": "load"}))
+    await llm.preload()
+    assert rec.requests[0].url.path == "/api/generate"
+    # no prompt: Ollama only loads the model; same num_ctx as answers, or the first answer reloads it
+    assert rec.body() == {"model": "qwen3:4b-instruct", "options": {"num_ctx": 8192}, "keep_alive": "30m"}
+
+
+async def test_preload_failures_are_llm_errors(load_local):
+    llm, _ = make_llm(load_local, lambda r: httpx.Response(404, json={"error": "model not found"}))
+    with pytest.raises(LLMError, match="model not found"):
+        await llm.preload()
+    down, _ = make_llm(load_local, lambda r: (_ for _ in ()).throw(httpx.ConnectError("refused", request=r)))
+    with pytest.raises(LLMUnavailableError, match="unreachable"):
+        await down.preload()
+
+
 def test_openai_compatible_placeholder_raises(cloud_settings):
     from app.providers.registry import build_container
 

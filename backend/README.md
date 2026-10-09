@@ -1,6 +1,6 @@
 # Backend
 
-FastAPI service: configuration, provider registry, health, projects/chats/transcripts persistence, document upload and ingestion, text chat answered from the documents with citations, and (in later phases) the voice loop. Architecture: [`../docs/DESIGN.md`](../docs/DESIGN.md).
+FastAPI service: configuration, provider registry, health, projects/chats/transcripts persistence, document upload and ingestion, text chat answered from the documents with citations, and the voice loop (a WebSocket per live voice session: VAD, STT, the same answer pipeline, TTS, barge-in). Architecture: [`../docs/DESIGN.md`](../docs/DESIGN.md).
 
 ## Run
 
@@ -8,11 +8,15 @@ FastAPI service: configuration, provider registry, health, projects/chats/transc
 uv sync
 ```
 
-Ingestion and retrieval run local models (Docling, BGE-M3, bge-reranker-v2-m3) from the optional `ml` dependency group. Without it the app starts and `/health` marks those providers `degraded`:
+Ingestion, retrieval and speech run local models (Docling, BGE-M3, bge-reranker-v2-m3, Silero VAD, mlx-whisper or faster-whisper, Kokoro) from the optional `ml` dependency group. Without it the app starts and `/health` marks those providers `degraded`:
 
 ```bash
 uv sync --group ml
 ```
+
+At startup the conversation models (VAD, STT, TTS, embedder, reranker) load one after another in the background and Ollama is asked to load the chat model, so the first spoken question isn't slowed by loading; `/health` reports it under `preload` (`loading` → `ready`, or `degraded` with the reason per model). Documents uploaded meanwhile stay `PENDING` until the preload is over.
+
+PyTorch work from different threads (ingestion, questions, speech) goes through one process-wide gate (`TorchGate` in `app/providers/models.py`): loading or freeing a model runs alone (a load changes process-wide torch state and copies weights to the GPU), inference on MPS runs one call at a time (a document is embedded one batch at a time, so a question waits for one batch at most), CPU inference runs alongside. Docling runs on the CPU, so a document being parsed doesn't hold up questions. Without the gate, concurrent MPS work aborts the process (Metal assertion, exit 134). mlx-whisper uses MLX's own GPU queue and isn't gated.
 
 ```bash
 uv run python -m app
@@ -41,6 +45,7 @@ The config file is `../config/local.config.json` unless `APP_CONFIG_FILE` says o
 | `GET /api/chats/{id}/messages` | The transcript, paginated: `?after=<seq>` reads forward, `?before=<seq>` reads backward, `limit` ≤ 200 |
 | `POST /api/chats/{id}/messages` | Ask in text: `{"text", "language": "en" \| "hi" \| null}` → the answer as Server-Sent Events (below) |
 | `GET /api/pins` | Pinned projects and chats for the sidebar, most recently pinned first |
+| `WS /ws/chats/{id}/voice` | A live voice conversation in the chat (below) |
 
 Lists return `{"items": [...]}`. Unknown ids are `404`, invalid input `422`, both with a `detail` message. `PATCH` changes only the fields sent; unknown fields are rejected. A transcript page is `{"items", "total", "has_more", "next_cursor"}`, items always in chronological order; pass `next_cursor` back as the same parameter (`after` or `before`) for the next page. To open a chat at its latest messages, request `before=<message_count + 1>`. A `503` means a dependency the operation needs is down (e.g. Qdrant during a delete); nothing was changed.
 
@@ -66,7 +71,50 @@ Every turn (phase 1) is a document question: retrieval runs within the chat's pr
 
 If the client disconnects mid-answer, generation is cancelled (the stream to Ollama is closed) and the text generated so far is saved as the agent message with `route.stopped: true`, citing only the sources that text cites; if no text was generated yet, no agent message is saved.
 
-The turn itself is `ChatTurnService` (`app/services/chat_turns.py`), which knows nothing about HTTP: `begin(chat_id, text, language=…, modality="text" | "voice", length="short" | "full")` validates, and `run(turn)` yields typed events (`UserMessageEvent`, `SourcesEvent`, `DeltaEvent`, `AgentMessageEvent`, `ErrorEvent`, each with `name` and `payload()`). Cancelling the consumer or `aclose()` on the events stops the answer as above. This endpoint only serialises the events; the voice WebSocket will run the same turns with `modality="voice"` and speak the deltas. `length="short"` (the default, and what this endpoint uses for now) asks for 1–3 speakable sentences with a 384-token cap; `"full"` asks for a fuller written answer (768).
+The turn itself is `ChatTurnService` (`app/services/chat_turns.py`), which knows nothing about HTTP: `begin(chat_id, text, language=…, modality="text" | "voice", length="short" | "full")` validates, and `run(turn)` yields typed events (`UserMessageEvent`, `SourcesEvent`, `DeltaEvent`, `AgentMessageEvent`, `ErrorEvent`, each with `name` and `payload()`). Cancelling the consumer or `aclose()` on the events stops the answer as above. This endpoint only serialises the events; the voice WebSocket runs the same turns with `modality="voice"` and speaks the deltas. `length="short"` (the default, and what this endpoint uses for now) asks for 1–3 speakable sentences with a 384-token cap; `"full"` asks for a fuller written answer (768).
+
+### Voice
+
+`WS /ws/chats/{id}/voice` is one live voice session (`app/services/voice/`; the endpoint in `app/api/voice.py` only adapts the WebSocket). A browser page from an origin not in `server.cors_allowed_origins` → close code `4403` (the CORS middleware doesn't cover WebSockets; requests without an `Origin` header are not browser pages and are allowed). Unknown chat → `4404`. Both are sent after accepting, so browsers see the code. One session per chat: opening a second one closes the first with `4409`, after the first has saved its state. A chat without `READY` documents still talks (its turns abstain). `end` closes with `1000`; server shutdown with `1001`. Messages over 64 KiB close the connection (uvicorn `ws_max_size`).
+
+**Audio.** Client → server binary frames: PCM16 LE mono 16 kHz, 20–64 ms each (512 samples = 1,024 bytes typical), sent continuously while the mic is on; audio before `start` is ignored with an `audio` error. Input errors (malformed frames or control messages, VAD failures) are reported once per kind every 5 s, not once per message. Server → client binary frames: a 12-byte header (`uint32` LE `turn_id`, `chunk_index`, `seq`, `seq` counting the frames of one chunk from 0) + PCM16 LE mono 24 kHz, 200 ms per frame. Play only the current turn's frames.
+
+**Control messages** (JSON text, field `type`). Client → server: `start {language: "en" | "hi" | null}` (null: detect per utterance among `stt.languages`), `barge_in_start {turn_id, played_ms}`, `playback {turn_id, played_ms}` (optional progress), `playback_done {turn_id}`, `stop {}`, `end {}`. Server → client:
+
+| Message | Fields |
+|---|---|
+| `ready` | `session_id`, `input_sample_rate: 16000`, `output_sample_rate: 24000`, `language` (followed by the current `state`) |
+| `state` | `state: listening \| thinking \| speaking \| interrupted` |
+| `user_speech` | `phase: start \| end` (server VAD; `end` after `vad.end_of_turn_ms` of silence, or when a too-short burst is dropped) |
+| `transcript_partial` | `text`: the speculative transcript taken during the end-of-turn silence, or the transcript of speech that interrupts the agent |
+| `user_message` | `message`: the saved user message (`modality: "voice"`, the spoken `language`, STT timings in `latency`) |
+| `turn` | `turn_id` of the answer that follows (1, 2, 3, … within the session) |
+| `sources` | same payload as the SSE `sources` event |
+| `delta` | `turn_id`, `text` |
+| `audio_chunk` | `turn_id`, `chunk_index`, `text` (what is spoken: no `[S#]` markers), `duration_ms`; its binary frames follow, in order, before the next `audio_chunk` (other messages may come between them) |
+| `agent_message` | `message`: the saved answer; `heard_text` set only if it was interrupted |
+| `barge_in` | `turn_id`, `decision: stop \| resume`; after every `barge_in_start`, also when `stop` arrives while it is pending; also `stop` without a `barge_in_start` when an utterance that isn't a backchannel ends while the agent answers |
+| `error` | `detail`, `stage: stt \| retrieval \| llm \| tts \| storage \| audio`; the session stays open |
+
+**Ordering guarantees.** Within a turn: `user_message`, `turn`, `sources`, then `delta`s interleaved with `audio_chunk` + frames, then `agent_message` after the turn's last frame (so `playback_done` can follow it; if TTS fails partway, `error {stage: "tts"}` comes before `agent_message` and the text is still complete). Once `barge_in {decision: "stop"}` is sent, or `stop` is handled, nothing more of that turn is sent (no `delta`, `audio_chunk` or frame; the turn is muted before the decision goes out); its `agent_message` with `heard_text` follows — empty text if nothing had been generated — and comes before the next turn's `user_message`/`turn` (preceded by them if the cut came before they were sent). The user message is saved before the answer starts, so a cut turn always has both messages. `stop` while an utterance is still being transcribed (the client already shows `thinking`): `state interrupted`, then that utterance's `user_message`, `turn` and an empty stopped `agent_message`, then `state listening`; it isn't answered. A complete answer that is cut during playback is sent again as `agent_message` with the same id and `heard_text`. `turn_id` strictly increases within a session.
+
+**Turn-taking.** The server's Silero VAD on the incoming audio is the source of truth: an utterance starts at speech probability ≥ `vad.threshold` (keeping ~190 ms before it) and ends after `vad.end_of_turn_ms` of silence (Silero's hysteresis: below threshold − 0.15); bursts under `vad.min_speech_ms` are ignored. At half the end-of-turn silence the utterance is transcribed speculatively and that transcript is used at the end of the turn unless speech resumed (§9.4). STT language detection is limited to `stt.languages` (or the `start` language). The transcript becomes a user message answered by `ChatTurnService` with `modality="voice"`, `length="short"`; the answer language is the spoken one. Utterances that are only hums ("hmm", "mm-hmm", "M M", "उम्म") or Whisper noise ("you") start no turn.
+
+**Ignored utterances** always leave the client in a known state. Every `user_speech start` is followed by `user_speech end`; then:
+
+| Case | What the client gets after `user_speech end` |
+|---|---|
+| shorter than `vad.min_speech_ms` | `barge_in {resume}` if a decision was pending, then the current `state` again (`listening`, `thinking` or `speaking`) |
+| a backchannel or hum while the agent answers, with `barge_in_start` | `transcript_partial`s, `barge_in {resume}` (at the latest at the deadline, or twice the deadline while only acknowledgements are being said), then `state speaking` (or `thinking`) again |
+| the same without `barge_in_start` (the browser VAD missed it) | `transcript_partial`, then `state speaking` (or `thinking`) again; no `barge_in` (none was started) |
+| hums, noise, only acknowledgements ("Yeah, right.", "okay", "हाँ") or an empty transcript while the agent is silent | `state thinking` (sent at the end of the utterance), then `state listening` |
+| transcription failed | `error {stage: "stt"}`, `barge_in {resume}` if one was pending, then the current `state` |
+
+**Speaking.** Deltas are cut into chunks: the first at the first clause boundary (at least 2 words) or after 5 words, then whole sentences (a sentence over 30 words is cut at a clause); boundaries are punctuation followed by whitespace (`.!?।॥,;:`), so `18.2%` and `4,210` never split. Markers and markdown are not spoken; only the first `voice.max_spoken_sentences` sentences are spoken (the rest is on screen). Each chunk is synthesized with Kokoro while generation continues.
+
+**Barge-in (duck, then decide).** On `barge_in_start` the server keeps listening and decides within `voice.barge_in.decision_timeout_ms`: once the new speech reaches `vad.min_speech_ms` it is transcribed (and again when it pauses). A backchannel is made of acknowledgements ("mm-hmm", "okay", "yeah", "haan", "achha theek hai", "ठीक है", …) and hums, however many; only other words count against `voice.barge_in.backchannel_max_words` ("yes please" passes), and an interruption cue ("stop", "wait", "no", a question word, "रुको", …) or the absence of any acknowledgement makes it not a backchannel. A transcript that isn't a backchannel is `stop` at once, unless it has fewer than 2 real words and the speech has already ended (Whisper mishears short snapshots: that waits for more evidence); hums, noise and empty transcripts never stop the answer by themselves. At the deadline, speech still going on is `stop`, a short burst that ended (or nothing) is `resume`; but if what has been said so far is only acknowledgements ("Yeah…" of "Yeah, right"), the decision waits up to twice `decision_timeout_ms` (transcribing again meanwhile) and is `resume` unless real words come: only those stop the answer. On `stop` generation and TTS are cancelled and the answer is saved with `heard_text` = the fully played chunks + the share of the chunk playing at `played_ms` in proportion to its duration, in whole words (rounded down); the new utterance becomes the next user turn when it ends. An utterance that ends while the agent is answering and isn't a backchannel stops the answer too, even without `barge_in_start` (also after a `resume`). `stop` cancels the same way (`route.interrupted: "stop"`; `played_ms` from the last `playback` report plus the time since, else from when each chunk should have played: from its arrival or the end of the previous one). When the session ends mid-answer (client gone, `end`, replaced by another session, server shutdown) the answer is saved the same way with `route.interrupted: "disconnect"`. Interrupted answers carry `route.stopped: true` and `route.interrupted: "barge_in" | "stop" | "disconnect"`; the next answer's prompt sees what was heard (nothing, if nothing was), not the whole answer. After an LLM error the cut-off fragment of the answer is not spoken.
+
+A turn ends (`state: listening`) on `playback_done`, or 2 s after its audio should have finished playing if the client never says so (following the chunks as they were sent, gaps included, and pushed back by `playback` reports). Everything said is saved as messages of the chat, so the transcript view and the text endpoint see the same history.
 
 ## Database
 
@@ -100,6 +148,10 @@ RUN_INTEGRATION=1 uv run --group ml pytest tests/integration -s
 
 They read models from `MODELS_ROOT` (default `../data/models`) and the smoke-test documents from `SMOKE_DOCS` (default `../data/smoke/docs`, written by `scripts/smoke/05_docling.py`); Qdrant from `QDRANT_URL` (default `http://127.0.0.1:6333`). `test_chat_e2e.py` also needs Ollama with `qwen3:4b-instruct` and checks phase 1 end to end over HTTP: upload until `READY`, English and Hindi fact questions cited to page 2, an out-of-document question abstaining, two documents told apart, nothing leaking across projects. Timings, ranks and answers print in the summary.
 
+`test_voice_e2e.py` (also needs Ollama, and the speech clips in `SMOKE_AUDIO`, default `../data/smoke/audio`, written by `scripts/smoke/09_kokoro.py`) runs the voice loop over the WebSocket with every real model preloaded: a spoken revenue question streamed in real time must come back transcribed, answered with citations and spoken; a spoken correction barges in mid-answer and must stop it (with `heard_text`) and be answered (Whisper must understand that spoken answer again); a Hindi question must be detected as Hindi. It prints the latency from the end of the user's speech to each stage.
+
+`test_concurrency_e2e.py` (same needs) uploads the smoke PDF the moment the app starts, while the models preload (it must wait, `PENDING`, and then become `READY`), then times a text and a spoken question while idle and again while a 60-page PDF is being ingested.
+
 ## Layout
 
 ```text
@@ -110,8 +162,8 @@ app/
   settings.py        JSON config schema + loader (${VAR} secrets, SECTION__KEY env overrides)
   offline.py         strict_offline guard, HF offline env
   logging_setup.py   console or JSON logs
-  api/               /health, /api/config/public, projects, documents (upload, delete), chats (+ messages, SSE), pins;
-                     deps.py wires services
+  api/               /health, /api/config/public, projects, documents (upload, delete), chats (+ messages, SSE), pins,
+                     voice (WebSocket adapter); deps.py wires services
   db/
     models.py        SQLAlchemy models: projects, documents, document_versions, ingestion_jobs, document_tables, chats,
                      messages, chat_summaries
@@ -124,13 +176,14 @@ app/
   providers/
     base.py          Provider, PlaceholderProvider, health model, local_snapshot()
     registry.py      capability → provider resolution, Container
-    models.py        local-model health, lazy ML imports (ml group), ModelUnavailableError
+    models.py        local-model health, lazy ML imports (ml group), LazyModelProvider (load/preload/unload)
     ingestion.py     DoclingParser: ParsedDocument (pages, items, tables + cells), chunking with provenance
     retrieval.py     BgeM3Embedder (dense + sparse), BgeReranker, QdrantStore (hybrid RRF search)
     llm.py           OllamaLLM: streamed chat + JSON-schema output (think off, num_ctx, keep_alive, temperatures)
     storage.py       SqliteDB (metadata), FilesystemStore (object store: safe generated keys, temp copies)
     runtime.py       InProcessJobQueue (asyncio workers, idle hook, graceful shutdown), auth, sessions, events
-    speech.py web_search.py
+    speech.py        SileroVAD (per-session streams), MlxWhisper / FasterWhisper, KokoroTTS, audio transport
+    web_search.py
   services/
     ingestion.py     ingest_file: parse → chunk → embed → upsert (no DB writes)
     retrieval.py     hybrid search → rerank → top N + confidence signal
@@ -138,6 +191,10 @@ app/
     chat_turns.py         ChatTurnService: one turn (text or voice) as typed events: save → (router slot) →
                           retrieve → gate → sources → answer; answer length is a parameter; stop = cancel
     sources.py prompts.py language.py   numbered sources + citation checks, answer prompt, answer language
+    preload.py            background model preloading at startup, reported in /health
+    voice/                the voice loop: protocol.py (messages, frames, close codes), turn_taking.py (endpointing,
+                          barge-in verdict), speech_text.py (speakable chunks, heard text, backchannels),
+                          session.py (VoiceSession state machine, VoiceSessions: one per chat)
 tests/
   integration/       opt-in, real models + Qdrant (RUN_INTEGRATION=1)
 ```
