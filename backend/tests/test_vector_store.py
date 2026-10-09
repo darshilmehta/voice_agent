@@ -25,6 +25,7 @@ from app.providers.retrieval import (
     build_filter,
     build_hybrid_query,
     cosine,
+    rerank_batch_size,
     to_hit,
     to_point,
 )
@@ -242,3 +243,9 @@ def test_client_is_created_lazily_without_network(store):
     assert store.client() is client  # constructed once, no compatibility request
     asyncio.run(store.close())
     assert store._client is None
+
+
+def test_the_reranker_uses_small_length_sorted_batches_on_mps():
+    """Less padding: ~45% faster on the M4 (see RERANK_BATCH_SIZE_MPS); other devices keep large batches."""
+    assert rerank_batch_size("mps") == 2
+    assert rerank_batch_size("cpu") == rerank_batch_size("cuda") == 32

@@ -33,14 +33,21 @@ SPARSE = "sparse"
 # Longest text the embedder reads. Chunks are ≤ ~target_tokens, but whole tables can be longer; BGE-M3 handles 8192.
 EMBED_MAX_TOKENS = 2048
 # Query + passage tokens the cross-encoder reads (as in smoke test 04). Chunks of target_tokens (500) fit almost
-# whole; long table chunks are cut, which bounds their cost. Reranking is compute-bound and linear in the number of
-# candidates (retrieval.prefetch_k): on an M4 (MPS, fp16) ~110 ms per ~425-token candidate, ~68 ms at ~250 and
-# ~35 ms at ~120 tokens, so 20 full-size candidates take ~2.0 s and 8 take ~0.9 s. prefetch_k is 8: on the smoke
-# corpus padded with long distractors the answer's fused rank stayed within the top 5 (EN, HI, Hinglish, identifier
-# and cross-lingual queries), and the reranker reorders whatever is in the list.
+# whole; long table chunks are cut, which bounds their cost (none of the phase-2 eval corpus's: its longest chunk is
+# ~430 tokens). Reranking is compute-bound and linear in the number of candidates (retrieval.prefetch_k).
 RERANK_MAX_TOKENS = 512
+# Pairs per forward pass. sentence-transformers sorts pairs by length, so small batches pad each pair only to its
+# neighbours' length instead of the longest candidate's: on the M4 (MPS, fp16, phase-2 eval candidates of ~50-430
+# tokens, p50) 8 candidates take ~340 ms in batches of 2 against ~615 ms in one batch of 32, 12 take ~490 against
+# ~930 ms, 16 take ~640 against ~1,240 ms (batches of 1 and 4 are within ~40 ms of 2). Other devices keep large
+# batches (unmeasured; CUDA prefers them).
 RERANK_BATCH_SIZE = 32
+RERANK_BATCH_SIZE_MPS = 2
 UPSERT_BATCH = 256
+
+
+def rerank_batch_size(device: str) -> int:
+    return RERANK_BATCH_SIZE_MPS if device == "mps" else RERANK_BATCH_SIZE
 
 
 class VectorStoreError(RuntimeError):
@@ -215,7 +222,9 @@ class BgeReranker(Reranker, LazyModelProvider):
             model = self._model_locked()
             with self._torch_use():
                 scores = model.predict(
-                    [(query, p) for p in passages], batch_size=RERANK_BATCH_SIZE, show_progress_bar=False
+                    [(query, p) for p in passages],
+                    batch_size=rerank_batch_size(self.cfg.device),
+                    show_progress_bar=False,
                 )
         return [float(s) for s in scores]
 
