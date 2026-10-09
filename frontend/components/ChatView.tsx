@@ -20,12 +20,15 @@ import { useBackend, useDocumentTitle } from "@/lib/backend-context";
 import { useChatTurns } from "@/lib/chat-turns";
 import { LANGUAGE_NAMES } from "@/lib/format";
 import { useSummaryRequests } from "@/lib/summary-request";
+import { useCanvas } from "@/lib/canvas/use-canvas";
 import { useChatSummary } from "@/lib/use-chat-summary";
 import { wantsAutoStart } from "@/lib/voice/autostart";
 import { useVoiceSession } from "@/lib/voice/use-voice-session";
 import { isIngesting, keys, projectName, slotOf, useWorkspace, useWorkspaceActions } from "@/lib/workspace";
 
 import { useEntityActions } from "./Actions";
+import { CanvasDebug } from "./canvas/CanvasDebug";
+import { CanvasPanel } from "./canvas/CanvasPanel";
 import { DOCUMENT_STATUS } from "./Documents";
 import { Icon } from "./Icon";
 import { Menu } from "./Menu";
@@ -139,6 +142,16 @@ function ChatPage({ chat }: { chat: Chat }) {
   const [autoStart] = useState(() => wantsAutoStart(chat.id));
   const [panelOpen, setPanelOpen] = useState(() => chat.message_count > 0);
   const [typeOpen, setTypeOpen] = useState(false);
+
+  // The live visual canvas (docs §12.1): charts built from the documents' tables, drawn when the first one arrives. The
+  // voice view docks the presence field while it has something to show.
+  const canvas = useCanvas(chat.id);
+  const canvasNode = canvas.hasContent ? <CanvasPanel canvas={canvas} docsById={docsById} language={language} /> : null;
+  // A dropped voice connection may have missed canvas events: read the canvas again when the session comes back.
+  const reloadCanvas = canvas.reload;
+  useEffect(() => {
+    if (snapshot.resyncs > 0) reloadCanvas();
+  }, [snapshot.resyncs, reloadCanvas]);
 
   // The panel shows the transcript or the summary (components/Summary.tsx). The summary lives here, so one that is
   // being written keeps going while the reader looks at the transcript.
@@ -312,6 +325,7 @@ function ChatPage({ chat }: { chat: Chat }) {
           </div>
         </div>
         <ScopeBar chat={chat} docs={docs} />
+        <CanvasDebug chatId={chat.id} />
       </header>
 
       {chat.archived && (
@@ -340,14 +354,20 @@ function ChatPage({ chat }: { chat: Chat }) {
           panelTabs={tabs}
           composer={composer}
           language={language}
+          canvas={canvasNode}
+          canvasCount={canvas.panels.length}
         />
       ) : (
         <>
+          {canvasNode && <div className="cv-inline">{canvasNode}</div>}
           <div className="panel-bar">{tabs}</div>
           {panel}
           {composer}
         </>
       )}
+      <p className="visually-hidden" role="status" aria-live="polite">
+        {canvas.announcement}
+      </p>
     </div>
   );
 }
