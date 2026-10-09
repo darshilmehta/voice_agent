@@ -59,6 +59,10 @@ export function canvasReducer(state: CanvasState, action: CanvasAction): CanvasS
         const panels = sortPanels(ev.panels);
         return { ...state, panels, loaded: true, pending: settle(state.pending, state.panels, panels) };
       }
+      if (ev.phase === "failed" && ev.detail === "cancelled") {
+        // Given up because the conversation moved on (a newer question, stop): the skeleton just goes, no note.
+        return { ...state, pending: withoutId(state.pending, ev.visualId) };
+      }
       if (ev.phase === "preparing" || ev.phase === "failed") {
         const entry: Pending = { id: ev.visualId, phase: ev.phase, detail: ev.detail, since: action.now };
         return { ...state, pending: [...withoutId(state.pending, ev.visualId), entry] };

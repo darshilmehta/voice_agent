@@ -53,6 +53,7 @@ import {
   showsSources,
   sourcesToShow,
   understoodAsByUser,
+  visualIdOf,
   type Basis,
 } from "@/lib/route";
 import { searchOfRoute, type WebSearchState } from "@/lib/web-search";
@@ -791,6 +792,13 @@ const MessageItem = memo(function MessageItem({
               </>
             )}
           </span>
+        </p>
+      )}
+
+      {!isUser && visualIdOf(m) && (
+        <p className="msg-note">
+          <Icon name="chart" size={13} />
+          <span>Chart added to the canvas</span>
         </p>
       )}
 

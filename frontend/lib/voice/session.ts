@@ -22,6 +22,7 @@
 
 import type { Language, Message, SourcesPayload } from "../api";
 import { publishRawCanvasEvent } from "../canvas/events";
+import { withVisual } from "../route";
 import { applyTool, endSearch, NO_WEB, parseTool, type WebSearchState, type WebTurn } from "../web-search";
 import { MIC_ERROR_TEXT, MicError, openMic, voiceSupport, type MicCapture, type MicErrorKind } from "./capture";
 import { AgentPlayer } from "./playback";
@@ -206,6 +207,8 @@ export class VoiceSession {
   private maxTurnId = -1;
   /** Turns that were cut off (stop, barge-in, replaced): whatever else arrives for them is ignored. */
   private cutTurns = new Set<number>();
+  /** Turns whose visual is ready (§12.1), by turn id: their answers say "Chart added". */
+  private visualOfTurn = new Map<number, string>();
   /** Stop was pressed while the answer had no id yet (or before the question was saved): it cancels the turn that arrives. */
   private stopPending = false;
   /** The socket dropped: the next `ready` is a new server session. */
@@ -755,9 +758,11 @@ export class VoiceSession {
         break;
       }
       case "agent_message": {
-        const m = msg.message;
         this.stopPending = false;
         const turn = this.snap.turn ?? freshTurn(null);
+        // Its visual may have become ready first (§12.1): the saved message didn't know yet ("Chart added").
+        const visualId = turn.id !== null ? this.visualOfTurn.get(turn.id) : undefined;
+        const m = visualId ? withVisual(msg.message, visualId) : msg.message;
         // The server sends an answer again, with the same id, when a complete answer is cut during playback (it now
         // has `heard_text`): that updates the turn's message and the transcript in place.
         const resent = turn.message !== null && turn.message.id === m.id;
@@ -795,8 +800,12 @@ export class VoiceSession {
         break;
       case "visual":
       case "canvas":
-        // The live canvas follows these (lib/canvas); they never touch the conversation's own state.
+        // The live canvas follows these (lib/canvas). They may come after the turn's agent_message, or for a turn
+        // that was cut; a visual that is ready only marks its answer in the transcript ("Chart added").
         publishRawCanvasEvent(this.opts.chatId, msg.type, msg);
+        if (msg.type === "visual" && msg.phase === "ready" && typeof msg.turn_id === "number") {
+          this.noteVisual(msg.turn_id, msg.visual_id);
+        }
         break;
       case "error":
         // The error path may send no terminal `tool` event: whatever search was running is over.
@@ -804,6 +813,17 @@ export class VoiceSession {
         // A failed transcription (or any failure before the question was saved) leaves no message: clear the words.
         if (!this.snap.userFinal && this.snap.caption === "user" && !this.snap.userSpeaking) this.dropUserCaption();
         break;
+    }
+  }
+
+  /** A turn's visual became ready: remember it, and mark the turn's saved answer if it is there already. */
+  private noteVisual(turnId: number, visualId: string): void {
+    this.visualOfTurn.set(turnId, visualId);
+    const turn = this.snap.turn;
+    const answer = turn && turn.id === turnId ? turn.message : null;
+    if (turn && answer) {
+      const marked = withVisual(answer, visualId);
+      this.set({ messages: this.withMessage(marked), turn: { ...turn, message: marked } });
     }
   }
 

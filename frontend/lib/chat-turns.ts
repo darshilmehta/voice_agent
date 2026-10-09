@@ -3,7 +3,9 @@
 /**
  * Questions asked in this page view and their streaming answers ("turns"), shown after the saved transcript.
  *
- * One turn at a time. A turn goes sending → searching (the user message is saved) → answering (sources arrived,
+ * One turn at a time (a done turn's stream may stay open a few seconds for its visual, docs/DESIGN.md §12.1: the next
+ * question can be asked meanwhile, and a `visual` that becomes ready marks the answer "Chart added"). A turn goes
+ * sending → searching (the user message is saved) → answering (sources arrived,
  * text streams) → done (the saved agent message replaces the streamed text). It can end failed (an `error` event, a
  * refused request, or a stream that closed early) or stopped (the user aborted; what arrived is kept). Answer
  * deltas are applied once per animation frame, so fast token streams don't re-render per token.
@@ -19,6 +21,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { errorMessage, isAbort, type Api, type Language, type Message, type SourcesPayload, type StreamFailure } from "./api";
 import { publishRawCanvasEvent } from "./canvas/events";
 import { splitCitations } from "./citations";
+import { withVisual } from "./route";
 import { applyTool, endSearch, NO_WEB, type WebTurn } from "./web-search";
 
 export type TurnPhase = "sending" | "searching" | "answering" | "done" | "failed" | "stopped";
@@ -56,6 +59,13 @@ export const spokenText = (text: string) =>
     .join("")
     .replace(/\s+([.,;:!?।])/g, "$1")
     .trim();
+
+/** The id of a visual that just became ready (`event: visual`, phase ready), else null. */
+function readyVisualId(name: string, data: unknown): string | null {
+  if (name !== "visual" || !data || typeof data !== "object") return null;
+  const d = data as { phase?: unknown; visual_id?: unknown };
+  return d.phase === "ready" && typeof d.visual_id === "string" ? d.visual_id : null;
+}
 
 let counter = 0;
 
@@ -101,6 +111,8 @@ export function useChatTurns(api: Api, chatId: string, onSettled?: () => void, o
         for await (const ev of api.sendMessage(chatId, { text, language }, ctrl.signal)) {
           if (ev.type === "canvas") {
             publishRawCanvasEvent(chatId, ev.name, ev.data); // the canvas follows visuals as they are prepared (lib/canvas)
+            const visualId = readyVisualId(ev.name, ev.data);
+            if (visualId) update(key, (t) => (t.agent ? { ...t, agent: withVisual(t.agent, visualId) } : t)); // "Chart added"
             continue;
           }
           if (ev.type === "delta") {
@@ -126,6 +138,8 @@ export function useChatTurns(api: Api, chatId: string, onSettled?: () => void, o
             finished = true;
             update(key, (t) => ({ ...t, agent: ev.message, phase: "done", web: endSearch(t.web) }));
             setAnnouncement(`Answer: ${spokenText(ev.message.text)}`);
+            // The stream may stay open for the answer's visual (§12.1): the next question can be asked meanwhile.
+            if (controller.current === ctrl) controller.current = null;
           } else if (ev.type === "error") {
             finished = true;
             update(key, (t) => ({ ...t, phase: "failed", failure: { ...ev.failure, saved }, web: endSearch(t.web) }));
