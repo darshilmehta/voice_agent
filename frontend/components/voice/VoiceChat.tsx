@@ -18,7 +18,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import type { Chat, ProjectDocument, SourcesPayload } from "@/lib/api";
 import { useBackend } from "@/lib/backend-context";
 import { citedIds, toSourceRefs, type SourceRef } from "@/lib/citations";
-import { LIVE_NOTE_TEXT, answerKindOf, basisOf, liveNoteOf, showsSources, sourcesToShow } from "@/lib/route";
+import { LIVE_NOTE_TEXT, answerKindOf, basisOf, isFixedReply, liveNoteOf, showsSources, sourcesToShow } from "@/lib/route";
 import { consumeAutoStart } from "@/lib/voice/autostart";
 import { MIC_ERROR_TEXT, voiceSupport, type MicErrorKind } from "@/lib/voice/capture";
 import { searchingNow, type VoiceSession, type VoiceSnapshot } from "@/lib/voice/session";
@@ -90,7 +90,7 @@ function useAnswerSources(turn: VoiceSnapshot["turn"], docsById: Record<string, 
     const live: SourcesPayload["sources"] = turn.sources?.sources ?? [];
     const basis = message ? basisOf(message, { documents: saved.some((r) => r.kind === "document"), web: savedWeb }) : null;
     const webResults = turn.web.sources.length > 0 || live.some((c) => c.kind === "web");
-    const abstained = !basis && !webResults && (turn.sources?.abstained ?? false);
+    const abstained = !basis && !webResults && !isFixedReply(kind) && (turn.sources?.abstained ?? false);
     if (saved.length > 0) return { refs: sourcesToShow(kind, saved), abstained };
     // The filler ("Let me look that up.") is spoken but isn't the answer: it can't cite anything.
     const spoken = turn.chunks.filter((c) => !c.filler);

@@ -108,6 +108,14 @@ export function labelFor(set: ReadonlySet<Provenance>): Basis | null {
   return general ? (documents ? "mixed" : "general") : null;
 }
 
+/**
+ * Replies that say something fixed or small-talk and answer no question: the "We were talking about…" resume line, an
+ * acknowledgement, chit-chat, a clarifying question, silence. They get no basis label (the label says where an answer's
+ * content comes from; these have none), unless they cite the web.
+ */
+export const isFixedReply = (kind: AnswerKind | null): boolean =>
+  kind === "resume" || kind === "ack" || kind === "conversation" || kind === "clarification" || kind === "silent";
+
 /** What the page can see an answer cites: passages of the documents and web results. */
 export interface Cited {
   documents: boolean;
@@ -127,6 +135,9 @@ export function basisOf(m: Routed, cited: Cited): Basis | null {
   if (declared) {
     const set = new Set(declared);
     if (cited.web) set.add("web");
+    // A fixed reply (the resume line, "Done.", a thanks) claims nothing: the backend lists "general" for it because it
+    // isn't from the documents, but "General knowledge, not from your documents" would say it answered something.
+    if (isFixedReply(answerKindOf(m))) set.delete("general");
     return labelFor(set);
   }
   if (cited.web) return cited.documents ? "documents_web" : "web";
@@ -193,8 +204,38 @@ export function visualIdOf(m: Routed): string | null {
   return typeof id === "string" && id ? id : null;
 }
 
-/** `m` with the visual its turn produced (a `visual {phase: "ready"}` event), as the backend saves it. */
+/** The canvas edit a reply applied (`route.canvas_edit`: "make it a bar chart", "put FY23 next to it"), or null. */
+export interface CanvasEditNote {
+  op: string;
+  outcome: string;
+}
+
+export function canvasEditOf(m: Routed): CanvasEditNote | null {
+  const edit = m.route?.canvas_edit;
+  if (!edit || typeof edit !== "object") return null;
+  const { op, outcome } = edit as { op?: unknown; outcome?: unknown };
+  return typeof op === "string" && typeof outcome === "string" ? { op, outcome } : null;
+}
+
+/** Edits that redraw a chart (a kind, periods, a rebuild by the planner); removing, pinning and clearing don't. */
+const REDRAWS: ReadonlySet<string> = new Set(["kind", "periods", "only", "model"]);
+
+/**
+ * The reply changed a chart already on the canvas ("Chart updated", quietly). The chart wasn't added by this turn, so
+ * the transcript doesn't say "Chart added" for it, however its `visual` event arrives.
+ */
+export function visualUpdatedOf(m: Routed): boolean {
+  const edit = canvasEditOf(m);
+  return edit !== null && edit.outcome === "done" && REDRAWS.has(edit.op);
+}
+
+/**
+ * `m` with the visual its turn produced (a `visual {phase: "ready"}` event), as the backend saves it. Only a turn that
+ * added a visual has one: a canvas edit's reply gets the `visual` events of the panel it rebuilt in place, which isn't
+ * a new chart, so it is returned as it is.
+ */
 export function withVisual(m: Message, visualId: string): Message {
+  if (canvasEditOf(m) !== null) return m;
   return { ...m, route: { ...(m.route ?? {}), visual_id: visualId, visual_status: "ready" } };
 }
 

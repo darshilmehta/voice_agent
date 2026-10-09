@@ -48,12 +48,14 @@ import {
   answerKindOf,
   basisOf,
   isBrief,
+  isFixedReply,
   isWebBasis,
   liveNoteOf,
   showsSources,
   sourcesToShow,
   understoodAsByUser,
   visualIdOf,
+  visualUpdatedOf,
   type Basis,
 } from "@/lib/route";
 import { searchOfRoute, type WebSearchState } from "@/lib/web-search";
@@ -723,7 +725,7 @@ const MessageItem = memo(function MessageItem({
   const searched = webOn && !isUser ? (search && search.status !== "ended" ? search : (searchOfRoute(m.route) ?? search ?? null)) : null;
   const liveNote = webOn && !isUser ? liveNoteOf(m) : null;
   // The documents didn't cover it: "Not in your documents", unless it was answered from general knowledge on purpose.
-  const abstained = !isUser && !basis && (live?.abstained ?? abstainedFlag(m));
+  const abstained = !isUser && !basis && !isFixedReply(kind) && (live?.abstained ?? abstainedFlag(m));
   const heard = m.heard_text;
   const cutOff = m.role === "agent" && heard !== null && heard !== m.text;
   // What was played, when it is the start of the answer; the rest is shown dimmed as not heard.
@@ -799,6 +801,12 @@ const MessageItem = memo(function MessageItem({
         <p className="msg-note">
           <Icon name="chart" size={13} />
           <span>Chart added to the canvas</span>
+        </p>
+      )}
+      {!isUser && !visualIdOf(m) && visualUpdatedOf(m) && (
+        <p className="msg-note msg-note-quiet">
+          <Icon name="chart" size={12} />
+          Chart updated
         </p>
       )}
 
