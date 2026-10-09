@@ -6,13 +6,19 @@
  * show numbered citation chips with their sources, answers the documents don't support are set apart ("Not in
  * your documents"), and answers cut off by a barge-in show what was actually heard.
  *
+ * What the router decided (lib/route.ts, `route` of each agent message) shapes the rest: general-knowledge and mixed
+ * answers carry a quiet label saying where they come from, short acknowledgements are light bubbles without a source
+ * list, a clarifying question says it asked one, and a user message the router read differently shows
+ * "Understood as: …" (hidden until hovered or focused). The summary's unanswered questions scroll to a message here
+ * (`focus`, loading earlier pages when it isn't loaded yet) and highlight it.
+ *
  * Questions asked on this page ("turns", lib/chat-turns.ts) follow the saved messages: the question, a quiet
  * "Searching your documents…" until sources arrive, the answer streaming in with a caret, then the saved answer.
  * Failures show inline on their turn with Retry. While you're at the bottom the view follows new text; scroll up
  * and it stays where you are, with a button to jump back to the latest.
  */
 
-import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import {
   BackendError,
@@ -28,6 +34,7 @@ import type { Turn } from "@/lib/chat-turns";
 import { citedIds, toSourceRefs, type SourceRef } from "@/lib/citations";
 import { clockTime, dayKey, dayLabel, fullDateTime, plural } from "@/lib/format";
 import { cutNote, cutReasonOf, stoppedNote } from "@/lib/interruption";
+import { BASIS_LABEL, answerKindOf, basisOf, isBrief, showsSources, understoodAsByUser, type Basis } from "@/lib/route";
 
 import { AnswerText, CitationPopoverProvider, SourceList } from "./Citations";
 import { Icon } from "./Icon";
@@ -77,9 +84,17 @@ interface TranscriptProps {
   voiceMessages?: Message[];
   /** The voice turn in progress, before it is saved: what the user is saying, what the agent has written so far. */
   voice?: { userText: string | null; agentText: string | null; sources: SourcesPayload | null } | null;
+  /**
+   * Scroll to the message with this `seq` and highlight it (loading earlier pages until it is there). `n` tells one
+   * request from the next; `onFocusDone` is called with it once the message was shown, or can't be found.
+   */
+  focus?: { seq: number; n: number } | null;
+  onFocusDone?: (n: number, found: boolean) => void;
 }
 
 const NO_MESSAGES: Message[] = [];
+/** How long a message jumped to from the summary stays highlighted. */
+const FLASH_MS = 2200;
 
 export function Transcript({
   chat,
@@ -89,6 +104,8 @@ export function Transcript({
   busy = false,
   voiceMessages = NO_MESSAGES,
   voice = null,
+  focus = null,
+  onFocusDone,
 }: TranscriptProps) {
   const { api, config } = useBackend();
   const [s, setS] = useState<TranscriptState>(INITIAL);
@@ -257,6 +274,49 @@ export function Transcript({
     return () => io.disconnect();
   }, [canAutoLoad]);
 
+  // A jump from the summary: scroll to the message, loading earlier pages until it is there, and flash it. Scrolls
+  // this view only (scrollIntoView would also move the clipped panel around it) and puts keyboard focus on the
+  // message, since the button that asked is no longer shown.
+  const [flashSeq, setFlashSeq] = useState<number | null>(null);
+  const onFocusDoneRef = useRef(onFocusDone);
+  useEffect(() => {
+    onFocusDoneRef.current = onFocusDone;
+  });
+  const handledFocus = useRef(0);
+  useEffect(() => {
+    if (!focus || handledFocus.current === focus.n || s.status !== "ready") return;
+    const root = scrollRef.current;
+    if (!root) return;
+    const done = (found: boolean) => {
+      handledFocus.current = focus.n;
+      onFocusDoneRef.current?.(focus.n, found);
+    };
+    const target = root.querySelector<HTMLElement>(`[data-seq="${focus.seq}"]`);
+    if (target) {
+      const box = root.getBoundingClientRect();
+      const at = target.getBoundingClientRect();
+      const top = root.scrollTop + (at.top - box.top) - Math.max(0, (root.clientHeight - at.height) / 2);
+      // A short way is scrolled smoothly; a long one (a message on an earlier page) jumps, so the view can't be pulled
+      // back to the end by the content that was just added above it while it is still under way.
+      const goal = Math.max(0, top);
+      const smooth = !window.matchMedia("(prefers-reduced-motion: reduce)").matches && Math.abs(goal - root.scrollTop) < root.clientHeight * 2;
+      pinned.current = false; // don't let the view snap back to the end
+      root.scrollTo({ top: goal, behavior: smooth ? "smooth" : "auto" });
+      target.focus({ preventScroll: true });
+      setFlashSeq(focus.seq);
+      done(true);
+    } else if (s.hasMore && !s.loadingEarlier && !s.earlierError) {
+      void loadEarlier(); // the effect runs again when the page arrives
+    } else if (!s.hasMore || s.earlierError) {
+      done(false);
+    }
+  }, [focus, s.status, s.items, s.hasMore, s.loadingEarlier, s.earlierError, loadEarlier]);
+  useEffect(() => {
+    if (flashSeq === null) return;
+    const timer = window.setTimeout(() => setFlashSeq(null), FLASH_MS);
+    return () => window.clearTimeout(timer);
+  }, [flashSeq]);
+
   // Messages saved by this page's turns are shown with their turn, not again from a page load.
   const turnMessageIds = useMemo(() => {
     const ids = new Set<string>();
@@ -272,6 +332,15 @@ export function Transcript({
     turnMessageIds.size || voiceIds.size
       ? s.items.filter((m) => !turnMessageIds.has(m.id) && !voiceIds.has(m.id))
       : s.items;
+  // "Understood as": what the router worked from when it isn't what was said, for the user messages it applies to.
+  const understood = useMemo(() => {
+    const all: Message[] = [...history, ...voiceMessages];
+    for (const t of turns) {
+      if (t.user) all.push(t.user);
+      if (t.agent) all.push(t.agent);
+    }
+    return understoodAsByUser(all);
+  }, [history, voiceMessages, turns]);
   const savedInTurns = turns.reduce((n, t) => n + (t.user ? 1 : 0) + (t.agent ? 1 : 0), 0);
   const remaining = Math.max(0, s.total - s.items.length);
   const total = remaining + history.length + savedInTurns + voiceMessages.length;
@@ -365,7 +434,13 @@ export function Transcript({
                       <span>{dayLabel(m.created_at)}</span>
                     </li>
                   )}
-                  <MessageItem message={m} docsById={docsById} showDebug={showDebug} />
+                  <MessageItem
+                    message={m}
+                    docsById={docsById}
+                    showDebug={showDebug}
+                    understood={understood.get(m.id)}
+                    flash={m.seq === flashSeq}
+                  />
                 </Fragment>
               ))}
               {tail.map((item) => {
@@ -380,7 +455,13 @@ export function Transcript({
                           <span>{dayLabel(m.created_at)}</span>
                         </li>
                       )}
-                      <MessageItem message={m} docsById={docsById} showDebug={showDebug} />
+                      <MessageItem
+                        message={m}
+                        docsById={docsById}
+                        showDebug={showDebug}
+                        understood={understood.get(m.id)}
+                        flash={m.seq === flashSeq}
+                      />
                     </Fragment>
                   );
                 }
@@ -396,7 +477,13 @@ export function Transcript({
                       </li>
                     )}
                     {t.user ? (
-                      <MessageItem message={t.user} docsById={docsById} showDebug={showDebug} />
+                      <MessageItem
+                        message={t.user}
+                        docsById={docsById}
+                        showDebug={showDebug}
+                        understood={understood.get(t.user.id)}
+                        flash={t.user.seq === flashSeq}
+                      />
                     ) : (
                       <PendingQuestion turn={t} />
                     )}
@@ -497,7 +584,7 @@ function useSources(text: string, citations: unknown, live: SourcesPayload | nul
   }, [text, citations, live, docsById]);
 }
 
-function MessageMeta({ m, isUser }: { m: Message; isUser: boolean }) {
+function MessageMeta({ m, isUser, extra }: { m: Message; isUser: boolean; extra?: ReactNode }) {
   return (
     <div className="msg-meta">
       <span className="msg-who">{isUser ? "You" : "Agent"}</span>
@@ -513,6 +600,7 @@ function MessageMeta({ m, isUser }: { m: Message; isUser: boolean }) {
       <time dateTime={m.created_at} title={fullDateTime(m.created_at)}>
         {clockTime(m.created_at)}
       </time>
+      {extra}
     </div>
   );
 }
@@ -522,18 +610,31 @@ const MessageItem = memo(function MessageItem({
   docsById,
   showDebug,
   live,
+  understood,
+  flash = false,
 }: {
   message: Message;
   docsById: Record<string, ProjectDocument>;
   showDebug: boolean;
   /** For an answer given on this page: what retrieval returned (fills in chips, says whether it abstained). */
   live?: SourcesPayload | null;
+  /**
+   * A user message the router understood differently (a correction, a follow-up, a word Whisper mis-heard): the
+   * question it worked from. Quiet by default: "Understood as: …" shows when the message is hovered or focused, and
+   * the toggle beside the time keeps it open; with no hover (touch) the toggle is always there, very small.
+   */
+  understood?: string;
+  /** Highlight it for a moment (it was jumped to from the summary). */
+  flash?: boolean;
 }) {
   const { map, listed } = useSources(m.text, m.citations, live, docsById);
+  // "Understood as: …" is hidden until the message is hovered or focused; the toggle in the meta row keeps it open.
+  const [understoodOpen, setUnderstoodOpen] = useState(false);
+  const understoodId = useId();
 
   if (m.role === "event") {
     return (
-      <li className="msg msg-event">
+      <li className="msg msg-event" data-seq={m.seq} tabIndex={-1} data-flash={flash || undefined}>
         <span>{m.text}</span>
         <time dateTime={m.created_at} title={fullDateTime(m.created_at)}>
           {clockTime(m.created_at)}
@@ -543,7 +644,13 @@ const MessageItem = memo(function MessageItem({
   }
 
   const isUser = m.role === "user";
-  const abstained = !isUser && (live?.abstained ?? abstainedFlag(m));
+  // What the router decided shapes the labels: general-knowledge and mixed answers say where they come from, a short
+  // acknowledgement is a light bubble with no sources, a clarifying question says it asked one.
+  const kind = isUser ? null : answerKindOf(m);
+  const basis = isUser ? null : basisOf(m, listed.length > 0);
+  const brief = isBrief(kind);
+  // The documents didn't cover it: "Not in your documents", unless it was answered from general knowledge on purpose.
+  const abstained = !isUser && !basis && (live?.abstained ?? abstainedFlag(m));
   const heard = m.heard_text;
   const cutOff = m.role === "agent" && heard !== null && heard !== m.text;
   // What was played, when it is the start of the answer; the rest is shown dimmed as not heard.
@@ -558,13 +665,34 @@ const MessageItem = memo(function MessageItem({
   // The connection dropped while the answer was going out and nothing says how much of it was heard.
   const droppedUnheard = !isUser && !stopped && reason === "disconnect" && heard === null;
 
+  const bubbleClass = ["bubble", abstained && "bubble-abstained", brief && "bubble-light"].filter(Boolean).join(" ");
+
   return (
-    <li className={`msg msg-${m.role}`}>
-      <MessageMeta m={m} isUser={isUser} />
+    <li className={`msg msg-${m.role}`} data-seq={m.seq} tabIndex={-1} data-flash={flash || undefined}>
+      <MessageMeta
+        m={m}
+        isUser={isUser}
+        extra={
+          isUser && understood ? (
+            <button
+              type="button"
+              className="understood-toggle"
+              aria-expanded={understoodOpen}
+              aria-controls={understoodId}
+              title="How this was understood"
+              onClick={() => setUnderstoodOpen((v) => !v)}
+            >
+              <Icon name="info" size={12} />
+              <span className="visually-hidden">How this was understood</span>
+            </button>
+          ) : undefined
+        }
+      />
 
       {!blank && (
-        <div className={abstained ? "bubble bubble-abstained" : "bubble"} lang={m.language ?? undefined}>
+        <div className={bubbleClass} lang={m.language ?? undefined}>
           {abstained && <AbstainLabel />}
+          {basis && <BasisLabel basis={basis} />}
           {heardPrefix !== null ? (
             <>
               {render(heardPrefix)}
@@ -594,7 +722,20 @@ const MessageItem = memo(function MessageItem({
         </p>
       )}
 
-      {!isUser && <SourceList sources={listed} />}
+      {isUser && understood && (
+        <p id={understoodId} className="understood-line" data-open={understoodOpen || undefined}>
+          Understood as: <q>{understood}</q>
+        </p>
+      )}
+
+      {kind === "clarification" && !blank && (
+        <p className="msg-note msg-note-quiet">
+          <Icon name="info" size={12} />
+          Asked to clarify
+        </p>
+      )}
+
+      {!isUser && showsSources(kind) && <SourceList sources={listed} />}
 
       {/* A cut voice answer already says how it was cut (and is usually complete, so "wasn't written" would be wrong). */}
       {!isUser && (stopped || droppedUnheard) && !cutOff && (
@@ -629,6 +770,16 @@ function AbstainLabel() {
     <span className="abstain-label">
       <Icon name="info" size={14} />
       Not in your documents
+    </span>
+  );
+}
+
+/** Where an answer's content comes from, when it isn't (only) the documents. Same quiet treatment as the abstention. */
+function BasisLabel({ basis }: { basis: Basis }) {
+  return (
+    <span className="abstain-label basis-label" data-basis={basis}>
+      <Icon name={basis === "mixed" ? "doc" : "info"} size={14} />
+      {BASIS_LABEL[basis]}
     </span>
   );
 }

@@ -20,6 +20,15 @@ export interface MenuItem {
   danger?: boolean;
   /** Draw a separator above this item. */
   separated?: boolean;
+  /**
+   * Items next to each other with the same group sit under one heading ("Export transcript" → "Markdown", "JSON"),
+   * indented. A screen reader hears the heading with each item's label.
+   */
+  group?: string;
+  /** Can't be chosen now (still focusable, so the keyboard sees why via `hint`). */
+  disabled?: boolean;
+  /** Tooltip, e.g. why the item is disabled. */
+  hint?: string;
 }
 
 interface MenuProps {
@@ -126,6 +135,7 @@ export function Menu({ label, items, className = "icon-btn", iconSize = 16 }: Me
   };
 
   const choose = (item: MenuItem) => {
+    if (item.disabled) return; // stays open: the item says why through its title
     // Focus goes back to the button first, so a dialog opened by the item returns focus there when it closes.
     close(true);
     item.onSelect();
@@ -169,26 +179,38 @@ export function Menu({ label, items, className = "icon-btn", iconSize = 16 }: Me
             style={pos ? { top: pos.top, left: pos.left } : { top: 0, left: 0, visibility: "hidden" }}
             onKeyDown={onMenuKey}
           >
-            {items.map((item, i) => (
-              <div key={item.id} role="none" className={item.separated ? "menu-sep" : undefined}>
-                <button
-                  ref={(el) => {
-                    itemRefs.current[i] = el;
-                  }}
-                  type="button"
-                  role="menuitem"
-                  tabIndex={i === focusIndex ? 0 : -1}
-                  className={item.danger ? "menu-item danger" : "menu-item"}
-                  onClick={() => choose(item)}
-                  onMouseMove={() => {
-                    if (focusIndex !== i) setFocusIndex(i);
-                  }}
-                >
-                  {item.icon && <Icon name={item.icon} />}
-                  {item.label}
-                </button>
-              </div>
-            ))}
+            {items.map((item, i) => {
+              const startsGroup = !!item.group && items[i - 1]?.group !== item.group;
+              return (
+                <div key={item.id} role="none" className={item.separated && i > 0 ? "menu-sep" : undefined}>
+                  {startsGroup && (
+                    <div className="menu-heading" aria-hidden="true">
+                      {item.icon && <Icon name={item.icon} />}
+                      {item.group}
+                    </div>
+                  )}
+                  <button
+                    ref={(el) => {
+                      itemRefs.current[i] = el;
+                    }}
+                    type="button"
+                    role="menuitem"
+                    tabIndex={i === focusIndex ? 0 : -1}
+                    className={["menu-item", item.danger && "danger", item.group && "menu-item-nested"].filter(Boolean).join(" ")}
+                    aria-label={item.group ? `${item.group}: ${item.label}` : undefined}
+                    aria-disabled={item.disabled || undefined}
+                    title={item.hint}
+                    onClick={() => choose(item)}
+                    onMouseMove={() => {
+                      if (focusIndex !== i) setFocusIndex(i);
+                    }}
+                  >
+                    {item.icon && !item.group && <Icon name={item.icon} />}
+                    {item.label}
+                  </button>
+                </div>
+              );
+            })}
           </div>,
           document.body,
         )}

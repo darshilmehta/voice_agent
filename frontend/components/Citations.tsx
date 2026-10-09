@@ -248,7 +248,7 @@ export function CitationPopoverProvider({ children }: { children: ReactNode }) {
             {source.snippet ? (
               <SnippetView snippet={source.snippet} />
             ) : (
-              <p className="cite-pop-empty">No passage was saved with this citation.</p>
+              <p className="cite-pop-empty">{source.note ?? "No passage was saved with this citation."}</p>
             )}
           </div>,
           document.body,

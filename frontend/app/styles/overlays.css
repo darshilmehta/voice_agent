@@ -132,6 +132,28 @@
   color: var(--bad);
 }
 
+.menu-item[aria-disabled="true"] {
+  color: var(--text-muted);
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* A heading over a few related items ("Export transcript" → Markdown, JSON). */
+.menu-heading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 28px;
+  padding: 0 10px;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.menu-item-nested {
+  padding-left: 36px;
+}
+
 .menu-sep {
   margin-top: 4px;
   padding-top: 4px;

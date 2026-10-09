@@ -10,6 +10,7 @@ import "./styles/shell.css";
 import "./styles/overlays.css";
 import "./styles/pages.css";
 import "./styles/chat.css";
+import "./styles/summary.css";
 import "./styles/voice.css";
 
 // BACKEND_URL is read per request on the server and handed to the client, never baked in at build time

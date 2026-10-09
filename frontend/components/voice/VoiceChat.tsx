@@ -5,7 +5,8 @@
  * revisiting and for when speaking isn't possible.
  *
  *   stage:  presence field · live captions · the current answer's sources · state label · mic controls · "Type instead"
- *   panel:  the transcript, beside the stage (or over it on narrow screens); the stage keeps its mic either way
+ *   panel:  the transcript and the summary ("Transcript | Summary" tabs, components/Summary.tsx), beside the stage (or
+ *           over it on narrow screens); the stage keeps its mic either way
  *
  * Keys: Space or Enter on the focused mic button starts and ends the conversation; Esc steps back one level (closes
  * the transcript when it covers the stage, else stops the answer in progress, else ends the conversation).
@@ -15,6 +16,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 
 import type { Chat, ProjectDocument, SourcesPayload } from "@/lib/api";
 import { citedIds, toSourceRefs, type SourceRef } from "@/lib/citations";
+import { answerKindOf, basisOf, showsSources } from "@/lib/route";
 import { consumeAutoStart } from "@/lib/voice/autostart";
 import { MIC_ERROR_TEXT, voiceSupport, type MicErrorKind } from "@/lib/voice/capture";
 import type { VoiceSession, VoiceSnapshot } from "@/lib/voice/session";
@@ -59,16 +61,26 @@ const STAGE_TITLE: Record<string, string> = {
 
 // ------------------------------------------------------------------ sources of the current answer
 
-/** The sources the current answer cites: chips appear as the text that cites them is announced, then the saved ones. */
+/**
+ * The sources the current answer cites: chips appear as the text that cites them is announced, then the saved ones.
+ * Only an answer that draws on the documents has any: once the saved answer says it is a general-knowledge answer, an
+ * acknowledgement or a clarifying question (`route.answer`, lib/route.ts) there are no chips, whatever retrieval found
+ * for it, so the sources of the previous question can't stay on screen under an answer that doesn't use them. The
+ * same goes for "Not in your documents": an answer given from general knowledge on purpose isn't an abstention.
+ */
 function useAnswerSources(turn: VoiceSnapshot["turn"], docsById: Record<string, ProjectDocument>): {
   refs: SourceRef[];
   abstained: boolean;
 } {
   return useMemo(() => {
     if (!turn) return { refs: [], abstained: false };
-    const abstained = turn.sources?.abstained ?? false;
+    const message = turn.message;
+    const kind = message ? answerKindOf(message) : null;
+    if (message && !showsSources(kind)) return { refs: [], abstained: false };
+    const general = !!message && basisOf(message, true) === "general";
+    const abstained = !general && (turn.sources?.abstained ?? false);
     const live: SourcesPayload["sources"] = turn.sources?.sources ?? [];
-    const saved = turn.message ? toSourceRefs(turn.message.citations, docsById) : [];
+    const saved = message ? toSourceRefs(message.citations, docsById) : [];
     if (saved.length > 0) return { refs: saved, abstained };
     const text = turn.message?.text ?? (turn.chunks.length ? turn.chunks.map((c) => c.text).join(" ") : turn.deltaText);
     const byId = new Map(toSourceRefs(live, docsById).map((r) => [r.sourceId, r] as const));
@@ -94,8 +106,10 @@ export interface VoiceChatProps {
   onTypeOpenChange: (open: boolean) => void;
   /** Messages in the transcript, for the toggle's badge. */
   messageCount: number;
-  /** The transcript view (shown in the panel). */
-  transcript: ReactNode;
+  /** The panel's body: the transcript and the summary (components/Summary.tsx). */
+  panel: ReactNode;
+  /** The panel header's tabs ("Transcript | Summary"). */
+  panelTabs: ReactNode;
   /** The text composer (shown under "Type instead"). */
   composer: ReactNode;
   /** Language of the conversation, for captions. */
@@ -113,7 +127,8 @@ export function VoiceChat({
   typeOpen,
   onTypeOpenChange,
   messageCount,
-  transcript,
+  panel,
+  panelTabs,
   composer,
   language,
 }: VoiceChatProps) {
@@ -122,7 +137,7 @@ export function VoiceChat({
   const slotRef = useRef<HTMLDivElement>(null);
   const micRef = useRef<HTMLButtonElement>(null);
   const panelToggleRef = useRef<HTMLButtonElement>(null);
-  const panelHeadingRef = useRef<HTMLHeadingElement>(null);
+  const panelRef = useRef<HTMLElement>(null);
   const typeToggleRef = useRef<HTMLButtonElement>(null);
   const panelId = useId();
   const typeId = useId();
@@ -202,7 +217,9 @@ export function VoiceChat({
   const wasOpen = useRef(panelOpen);
   useEffect(() => {
     // Focus follows the panel: into it when opened by the button, back to the button when closed.
-    if (panelOpen && !wasOpen.current) panelHeadingRef.current?.focus({ preventScroll: true });
+    if (panelOpen && !wasOpen.current) {
+      panelRef.current?.querySelector<HTMLElement>("[role=tab][aria-selected=true]")?.focus({ preventScroll: true });
+    }
     if (!panelOpen && wasOpen.current && rootRef.current?.contains(document.activeElement)) {
       panelToggleRef.current?.focus({ preventScroll: true });
     }
@@ -412,16 +429,14 @@ export function VoiceChat({
         </div>
       </section>
 
-      <aside id={panelId} className="vc-panel" aria-label="Conversation transcript" hidden={!panelOpen}>
+      <aside ref={panelRef} id={panelId} className="vc-panel" aria-label="Transcript and summary" hidden={!panelOpen}>
         <div className="vc-panel-head">
-          <h2 ref={panelHeadingRef} tabIndex={-1}>
-            Transcript
-          </h2>
+          {panelTabs}
           <button type="button" className="icon-btn" aria-label="Close the transcript" onClick={() => onPanelOpenChange(false)}>
             <Icon name="close" size={16} />
           </button>
         </div>
-        <div className="vc-panel-body">{panelMounted && transcript}</div>
+        <div className="vc-panel-body">{panelMounted && panel}</div>
       </aside>
     </div>
   );

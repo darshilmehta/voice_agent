@@ -2,15 +2,19 @@
 
 /**
  * Everything a user can do to a project, chat or document, in one place, so the sidebar, page headers and lists
- * offer the same actions with the same dialogs and feedback. Dialogs: new project, rename, delete (confirm). Pin and
- * archive act at once and report through a toast (archive offers Undo).
+ * offer the same actions with the same dialogs and feedback. Dialogs: new project, rename, delete (confirm), and
+ * replacing a title the user chose. Pin and archive act at once and report through a toast (archive offers Undo), as do
+ * regenerating a title and exporting a transcript; "Summarise" asks the chat page to open its Summary view.
  */
 
 import { useParams, useRouter } from "next/navigation";
-import { createContext, useCallback, useContext, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 
-import { errorMessage, type Chat, type Project, type ProjectDocument } from "@/lib/api";
+import { BackendError, errorMessage, type Chat, type ExportFormat, type Project, type ProjectDocument } from "@/lib/api";
+import { useBackend } from "@/lib/backend-context";
+import { fallbackFilename, saveBlob } from "@/lib/download";
 import { plural } from "@/lib/format";
+import { requestSummary } from "@/lib/summary-request";
 import { requestAutoStart } from "@/lib/voice/autostart";
 import { useWorkspace, useWorkspaceActions } from "@/lib/workspace";
 
@@ -25,6 +29,8 @@ type DialogState =
   | { kind: "deleteProject"; project: Project }
   | { kind: "renameChat"; chat: Chat }
   | { kind: "deleteChat"; chat: Chat }
+  /** The title was chosen by the user: ask before replacing it. */
+  | { kind: "replaceTitle"; chat: Chat }
   | { kind: "deleteDocument"; document: ProjectDocument };
 
 export interface EntityActions {
@@ -38,6 +44,14 @@ export interface EntityActions {
   deleteChat: (c: Chat) => void;
   setChatPinned: (c: Chat, pinned: boolean) => Promise<void>;
   setChatArchived: (c: Chat, archived: boolean) => Promise<void>;
+  /** Write a new automatic title; a title the user chose is only replaced after a confirmation. */
+  regenerateTitle: (c: Chat) => Promise<void>;
+  /** Open the chat's Summary view and write the summary (unless a current one exists). */
+  summariseChat: (c: Chat) => void;
+  /** Download the transcript as Markdown or JSON. */
+  exportTranscript: (c: Chat, format: ExportFormat) => Promise<void>;
+  /** The chat whose new title is being written (it takes a few seconds). */
+  regeneratingTitleId: string | null;
   deleteDocument: (d: ProjectDocument) => void;
   /** The "⋯" menu items for a project / chat. */
   projectMenu: (p: Project) => MenuItem[];
@@ -47,15 +61,27 @@ export interface EntityActions {
 
 const ActionsContext = createContext<EntityActions | null>(null);
 
+/** What went wrong with a title, a summary or an export request, in words for a toast. */
+function requestProblem(err: unknown, empty: string): string {
+  if (err instanceof BackendError) {
+    if (err.status === 404) return "This chat no longer exists.";
+    if (err.status === 422) return empty;
+    if (err.status === 503) return "The language model isn't available right now. Try again in a moment.";
+  }
+  return errorMessage(err);
+}
+
 export function ActionsProvider({ children }: { children: ReactNode }) {
   const ws = useWorkspaceActions();
   const state = useWorkspace();
   const toast = useToast();
+  const { api } = useBackend();
   const { pick: pickFiles } = useUploads();
   const router = useRouter();
   const params = useParams<{ projectId?: string; chatId?: string }>();
   const [dialog, setDialog] = useState<DialogState | null>(null);
   const [creatingChatIn, setCreatingChatIn] = useState<string | null>(null);
+  const [regeneratingTitleId, setRegeneratingTitleId] = useState<string | null>(null);
 
   const activeChatId = params.chatId ?? null;
   const activeProjectId = params.projectId ?? (activeChatId ? state.chats[activeChatId]?.project_id : undefined) ?? null;
@@ -120,6 +146,64 @@ export function ActionsProvider({ children }: { children: ReactNode }) {
     [ws, toast],
   );
 
+  const regenerateTitle = useCallback(
+    async (c: Chat) => {
+      setRegeneratingTitleId(c.id);
+      // Writing a title takes a few seconds on the local model: say so, unless the answer comes straight back (the
+      // title is the user's own, 409).
+      const slow = window.setTimeout(() => toast({ message: "Writing a new title…" }), 600);
+      try {
+        const updated = await ws.regenerateTitle(c.id);
+        toast({ message: `New title: “${updated.title}”` });
+      } catch (err) {
+        if (err instanceof BackendError && err.conflict) {
+          // The user chose this title: only replace it when they say so.
+          setDialog({ kind: "replaceTitle", chat: c });
+        } else {
+          toast({
+            tone: "error",
+            message: `Couldn't write a new title: ${requestProblem(err, "Ask a question first: the title is written from the first message.")}`,
+          });
+        }
+      } finally {
+        window.clearTimeout(slow);
+        setRegeneratingTitleId((id) => (id === c.id ? null : id));
+      }
+    },
+    [ws, toast],
+  );
+
+  const activeChatRef = useRef(activeChatId);
+  useEffect(() => {
+    activeChatRef.current = activeChatId;
+  });
+  const summariseChat = useCallback(
+    (c: Chat) => {
+      requestSummary(c.id); // the chat page opens its Summary view, now or when it has mounted
+      if (activeChatRef.current !== c.id) router.push(`/chats/${c.id}`);
+    },
+    [router],
+  );
+
+  const exportTranscript = useCallback(
+    async (c: Chat, format: ExportFormat) => {
+      try {
+        const { blob, filename } = await api.exportChat(c.id, format);
+        // The server names the file (including a Hindi title, `filename*=UTF-8''…`); a browser can't read that
+        // header across origins unless the backend exposes it, and then the title is the next best name.
+        const name = filename ?? fallbackFilename(c.title, format);
+        saveBlob(blob, name);
+        toast({ message: `Exported ${name}` });
+      } catch (err) {
+        toast({
+          tone: "error",
+          message: `Couldn't export the transcript: ${requestProblem(err, "This chat has no messages to export yet.")}`,
+        });
+      }
+    },
+    [api, toast],
+  );
+
   const newChat = useCallback(
     async (projectId: string) => {
       setCreatingChatIn(projectId);
@@ -153,6 +237,10 @@ export function ActionsProvider({ children }: { children: ReactNode }) {
       deleteChat,
       setChatPinned,
       setChatArchived,
+      regenerateTitle,
+      summariseChat,
+      exportTranscript,
+      regeneratingTitleId,
       deleteDocument: (document) => setDialog({ kind: "deleteDocument", document }),
       creatingChatIn,
       projectMenu: (p) => [
@@ -172,19 +260,72 @@ export function ActionsProvider({ children }: { children: ReactNode }) {
         },
         { id: "delete", label: "Delete…", icon: "trash", danger: true, separated: true, onSelect: () => deleteProject(p) },
       ],
-      chatMenu: (c) => [
-        { id: "rename", label: "Rename…", icon: "pencil", onSelect: () => renameChat(c) },
-        { id: "pin", label: c.pinned ? "Unpin" : "Pin to sidebar", icon: "star", onSelect: () => void setChatPinned(c, !c.pinned) },
-        {
-          id: "archive",
-          label: c.archived ? "Restore from archive" : "Archive",
-          icon: c.archived ? "unarchive" : "archive",
-          onSelect: () => void setChatArchived(c, !c.archived),
-        },
-        { id: "delete", label: "Delete…", icon: "trash", danger: true, separated: true, onSelect: () => deleteChat(c) },
-      ],
+      chatMenu: (c) => {
+        // Nothing to summarise, title or export before the first message.
+        const empty = c.message_count === 0;
+        const emptyHint = empty ? "This chat has no messages yet" : undefined;
+        return [
+          { id: "rename", label: "Rename…", icon: "pencil", onSelect: () => renameChat(c) },
+          { id: "pin", label: c.pinned ? "Unpin" : "Pin to sidebar", icon: "star", onSelect: () => void setChatPinned(c, !c.pinned) },
+          {
+            id: "summarise",
+            label: "Summarise",
+            icon: "list",
+            separated: true,
+            disabled: empty,
+            hint: emptyHint,
+            onSelect: () => summariseChat(c),
+          },
+          {
+            id: "regenerate-title",
+            label: "Regenerate title",
+            icon: "sparkle",
+            disabled: empty || regeneratingTitleId === c.id,
+            hint: emptyHint,
+            onSelect: () => void regenerateTitle(c),
+          },
+          {
+            id: "export-md",
+            label: "Markdown (.md)",
+            icon: "download",
+            group: "Export transcript",
+            disabled: empty,
+            hint: emptyHint,
+            onSelect: () => void exportTranscript(c, "md"),
+          },
+          {
+            id: "export-json",
+            label: "JSON (.json)",
+            icon: "download",
+            group: "Export transcript",
+            disabled: empty,
+            hint: emptyHint,
+            onSelect: () => void exportTranscript(c, "json"),
+          },
+          {
+            id: "archive",
+            label: c.archived ? "Restore from archive" : "Archive",
+            icon: c.archived ? "unarchive" : "archive",
+            separated: true,
+            onSelect: () => void setChatArchived(c, !c.archived),
+          },
+          { id: "delete", label: "Delete…", icon: "trash", danger: true, separated: true, onSelect: () => deleteChat(c) },
+        ];
+      },
     };
-  }, [setProjectPinned, setProjectArchived, newChat, setChatPinned, setChatArchived, creatingChatIn, pickFiles]);
+  }, [
+    setProjectPinned,
+    setProjectArchived,
+    newChat,
+    setChatPinned,
+    setChatArchived,
+    regenerateTitle,
+    summariseChat,
+    exportTranscript,
+    regeneratingTitleId,
+    creatingChatIn,
+    pickFiles,
+  ]);
 
   return (
     <ActionsContext value={value}>
@@ -216,6 +357,17 @@ export function ActionsProvider({ children }: { children: ReactNode }) {
           onSubmit={async (title) => {
             await ws.updateChat(dialog.chat.id, { title });
             closeDialog();
+          }}
+        />
+      )}
+      {dialog?.kind === "replaceTitle" && (
+        <ReplaceTitleDialog
+          chat={dialog.chat}
+          onClose={closeDialog}
+          onConfirm={async () => {
+            const updated = await ws.regenerateTitle(dialog.chat.id, true);
+            closeDialog();
+            toast({ message: `New title: “${updated.title}”` });
           }}
         />
       )}
@@ -444,6 +596,47 @@ function ChatRenameDialog({
           </button>
         </div>
       </form>
+    </Dialog>
+  );
+}
+
+/** The title was set by the user (409): replacing it needs a yes. */
+function ReplaceTitleDialog({
+  chat,
+  onClose,
+  onConfirm,
+}: {
+  chat: Chat;
+  onClose: () => void;
+  onConfirm: () => Promise<void>;
+}) {
+  const { busy, error, run } = useSubmit(onConfirm);
+  return (
+    <Dialog
+      title="Replace your title?"
+      description={
+        <p>
+          You named this chat <strong>“{chat.title}”</strong>. A new title will be written from the conversation and
+          replace it. You can rename the chat again afterwards.
+        </p>
+      }
+      onClose={onClose}
+      busy={busy}
+      role="alertdialog"
+    >
+      {error && (
+        <p className="form-error" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="dialog-actions">
+        <button type="button" className="btn" onClick={onClose} disabled={busy} data-autofocus>
+          Keep my title
+        </button>
+        <button type="button" className="btn btn-primary" onClick={() => void run()} disabled={busy}>
+          {busy ? "Writing a title…" : "Replace title"}
+        </button>
+      </div>
     </Dialog>
   );
 }
