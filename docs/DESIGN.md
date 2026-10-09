@@ -692,18 +692,22 @@ poc_gibberlink/
 
 ## 8. Memory budget (16 GB unified, 12.7 GB GPU cap)
 
-| Component | When loaded | Approx. |
+| Component | When loaded | Measured (2026-10-10) |
 |---|---|---|
 | macOS + browser + editor | always | ~5 GB |
 | Docker VM (Qdrant) | always | ≤1.5 GB cap (Qdrant itself ~270 MB) |
-| qwen3:8b (+ 8k-context KV cache) | conversation | ~6 GB (qwen3:4b ~3.5 GB) |
-| BGE-M3 fp16 | conversation + ingestion | ~1.2 GB |
-| Reranker fp16 | conversation | ~1.1 GB |
-| Whisper | conversation | 0.5–1.6 GB |
-| Kokoro | conversation | ~0.3 GB |
-| Docling models | ingestion only, then unloaded | 1–2 GB |
+| Ollama runner, qwen3:4b-instruct, `num_ctx` 8192, q8_0 KV | conversation | weights 2.4 GB + KV 0.61 GB + compute 0.17 GB (`ollama ps`: 3.3 GB) |
+| … its prompt cache in RAM (llama-server `--cache-ram`) | grows with use | **up to 8 GiB by default** (measured 8.1 GB: 108 prompts); **≤ 1 GiB with `LLAMA_ARG_CACHE_RAM=1024`** (setup notes, §9) |
+| Backend, every conversation model loaded and used | conversation | **5.3 GB** (peak 6.1): BGE-M3 + reranker fp16 on MPS 2.2 GB, mlx-whisper small 0.46 GB + MLX buffer cache ≤ 256 MiB, Kokoro + G2P on the CPU ~0.7–0.9 GB, Python/torch the rest |
+| Docling models | ingestion only, released when ingestion drains | 1.7 GB peak |
 
-Measured (§9.5): with Safari/Chrome/Claude app open, the machine was already swapping before our stack loaded. **Demo rule: close browsers other than the app's tab and heavy apps.** Kokoro runs on CPU to keep GPU memory free.
+Measured (§9.5): with Safari/Chrome/Claude app open, the machine was already swapping before our stack loaded. **Demo rule: close browsers other than the app's tab and heavy apps.**
+
+**Where the memory went (final real-model run, 14.7 of 15.4 GB of swap in use).** The backend's footprint was 5.9 GB (peak 6.5) and Ollama's `llama-server` 9.3 GB while `ollama ps` said 3.3 GB. Not `OLLAMA_NUM_PARALLEL` (the runner runs with `-np 1`), not the KV cache (612 MiB at 8192 tokens, q8_0), not mmap accounting (the mapped weights aren't even in the footprint): it is llama-server's host prompt cache. Ollama 0.40 doesn't pass `--cache-ram`, so llama-server keeps the KV state of every distinct prompt it has served (~75 KB per token at q8_0, ~70 MB for a 1,000-token prompt) until 8 GiB; a voice turn makes 3–6 model calls (router, answer, warm-ups, titles, memory, the visual planner), so about 30 turns fill it, and it sits there, idle, pushing everything else into swap. Measured on a private `ollama serve` (same flags): +70 MB of footprint per distinct prompt with the default (3.5 GB after 40); with `LLAMA_ARG_CACHE_RAM=1024` the cache holds 15 prompts (873 MiB) and the footprint plateaus at 2.0–2.5 GB, while reusing a cached prefix is unaffected (the answer's prefix after 8 other prompts: first token 190 ms vs 254 ms). The app can't set this: it is the Ollama service's environment (setup notes). Unloading the model (`ollama stop`) frees it at once (swap 11.5 → 3.4 GB measured).
+
+**`num_ctx` 4096 vs 8192** (same server): KV 306 vs 612 MiB, compute buffers 79 vs 166 MiB, so 0.39 GB saved; first token identical (1,157-token prompt cold 3.26 s, cached prefix 122 ms, in both). But the prompts don't all fit: the largest prompt in a day of logs was 2,685 tokens (p99 1,767), and a typed answer may carry 3,000 tokens of evidence plus history and 768 output tokens; the summaries' map-reduce window (`num_ctx − 3000`, ×0.9) would shrink from 4,672 to 986 tokens, five times the calls. **Kept at 8192**: the prompt cache, not the context, was the memory.
+
+**Backend** (phys_footprint after each model's preload and some inference): mlx-whisper +1.5 GB, of which 751 MiB was MLX's cache of freed Metal buffers, kept without limit; capped at 256 MiB (`MLX_CACHE_LIMIT_BYTES`, +17 ms per transcription p50; 64 MiB cost +31 ms). Kokoro +0.7–0.9 GB on the CPU (weights, spaCy, misaki's lexicons); BGE-M3 +2.1–2.3 GB (1.1 GB on MPS, the rest CPU-side from loading), the reranker +1.3 GB. Docling is lazy and released after ingestion; nothing else can wait (the first spoken question needs VAD, STT, TTS, embedder and reranker). Whole stack: ~17.6 GB before (backend 5.9 + runner 9.3 + mapped weights 2.4) → ~10 GB with the setting (backend 5.3 + runner ≤ 2.5 + weights 2.4).
 
 ---
 
@@ -786,6 +790,22 @@ Findings → design changes:
 - faster-whisper is not viable on this Mac (CPU-only); it stays the CUDA/cloud provider.
 - **Pass audio as PCM arrays, never files**: faster-whisper's file path breaks on current PyAV (`metadata_errors` kwarg removed). The backend receives PCM over WebSocket anyway.
 - Finding for the Hindi eval: 4b-instruct translated राजस्व (revenue) as "tax" even from correct text.
+
+**Names: a vocabulary prompt per chat (2026-10-10).** Whisper small spelled the documents' names by sound ("Valmora" → "Mora's", "Vimora", "Vamora"; "Zephyra" → "Zephyr", "जफर"), and the wrong name spread into answers, titles, charts and web queries. `services/voice/vocabulary.py` builds an `initial_prompt` per language from the chat's READY documents, cached until they change: title phrases that contain a file-name word ("Valmora Industries"), table phrases ranked by how many tables use them (segments, facilities, people; the documents take turns; phrases whose words are each a single token of Whisper's tokenizer, i.e. words it knows, last), acronyms used across tables ("EBITDA"), ~110 tokens; the Hindi prompt puts the names, also in Devanagari (asked of the LLM once per name, the documents' own spelling preferred), in a short Devanagari frame with the Hindi documents' headings and first-column entries (a Latin-only prompt made Whisper write Hindi in Latin script; Devanagari terms alone didn't help the names). A lexicon of the names' unfamiliar words restores near misses Whisper still makes ("Vamora's" → "Valmora's", "Talaja" → "Taloja"; only a capitalised multi-token Latin word within 1–2 edits of exactly one entry). The prompted decode is one greedy pass capped by the audio's length; a repetition loop (Hindi prompts tipped Whisper into "ॐ ॐ ॐ…", and its temperature fallback then took 3.9–5.8 s), an echo of the prompt, a failed decode, or likely no speech ("Thank you." for noise, with a prompt) is decoded again without it. Barge-in checks stay unprompted. The transcript carries Whisper's `avg_logprob`, `no_speech_prob` and `compression_ratio` for the say-again check (`speech_text.transcript_garbled`): clear questions decode at −0.05 to −0.5, Hindi −0.2 to −0.6, garbled or wrong-language transcripts −0.7 to −1.0.
+
+| 64 clips with names (say Samantha/Daniel/Rishi/Lekha, Kokoro), mlx-whisper small | before | after |
+|---|---|---|
+| names right, all | 25/82 (30%) | **64/82 (78%)** |
+| English, say / Kokoro | 44% / 62% | 92% / 100% |
+| Hindi (Devanagari), say / Kokoro | 0% / 0% | 50% / 60% |
+| Hinglish (romanized Hindi read by Indian voices) | 0% | 40% |
+| WER (EN, name sentences), say / Kokoro | 0.142 / 0.067 | 0.040 / 0.000 |
+| CER (HI, name sentences), say / Kokoro | 0.53 / 0.50 | 0.33 / 0.26 |
+| 20 generic smoke clips: EN WER / HI CER | 0.059 / 0.147 | 0.059 / 0.192 (one clip: "रुको" heard as "रोगगार", pulled by "रोज़गार" in the scheme's title) |
+| 7 controls (hums, "okay", silence, noise, breath) with a name | 0 | 0 |
+| STT time (interleaved A/B, 60 clips) | — | +17 ms EN, +21 ms HI p50 |
+
+faster-whisper small (CPU int8): names 35% → 79% (English 44% → 95%). The answer side has a safety net for what still gets through (`subjects.misheard_names`); these numbers are the recognizer's alone.
 
 **TTS (Kokoro)** — offline from local files, EN `af_heart`, HI `hf_alpha`:
 
@@ -903,6 +923,24 @@ Expected after these: **~2.5–3 s** to the first content audio on this Mac. The
 
 Wall clock (same runs, Ollama otherwise idle): 3,313 → 1,452 ms p50. Per kind after: English document question 1.35 s, follow-up 1.2 s, routed fact 1.36 s, general 0.8 s, Hindi 1.85 s (Devanagari costs ~0.9 tokens per character), first turn of a chat ~2 s (no history yet, its evidence all new). No model reload in any run. Ollama 0.40.1 keeps at least five prompt prefixes cached at once (measured), so the router's call, titles and summaries don't evict the answer's prefix; another client's traffic on a shared Ollama can.
 
+**Voice latency, STT and memory round (2026-10-10).** The final real-model run measured a median of **5.4 s** from the end of speech to the first audio, with the Mac at 14.7 of 15.4 GB of swap (§8: Ollama's prompt cache): router 1.05–1.7 s, retrieval 1.2–2.1 s (rerank 0.55–0.97 s), LLM first token 2.0 s median, first delta to first chunk 1.0–1.2 s, and multi-second silences mid-answer. Re-measured without the swap (Ollama's prompt cache capped, a private server so no other client queues in front), on the tree with the shorter voice answers and the answer guard (#44): a harness like `test_voice_e2e.py` over the five eval documents, eight spoken questions per run (six English, two Hindi; `say` and Kokoro clips streamed in real time, nothing played), timing every model call:
+
+| ms after the end of speech (median, p90) | main (#44), 16 turns | this round, 24 turns |
+|---|---|---|
+| `user_message` (VAD 600 ms + speculative STT) | 901 (1,049) | 937 (1,263) |
+| router call (cancelled when the speculative retrieval is confident, §3.4) | 1,312 (2,334) | 1,234 (1,961) |
+| retrieval (rerank) | 1,455 (2,380) · rerank 638 | 1,240 (2,087) · rerank 640 |
+| LLM first token, the answer's own (prompt reading ~390 tokens/s) | 1,789 (3,758) | 1,712 (2,041) |
+| first `delta` | 4,071 (7,291) | 4,000 (7,032) |
+| first delta → first audio (TTS of the 5-word chunk: 660 → 520 ms) | 946 (1,418) | 774 (1,050) |
+| **first audio** | **5,094 (8,996)**; English 4,748, Hindi 8,404 | **4,860 (7,549)**; English 4,759, Hindi 7,350 |
+| silences mid-answer | 1 in 16 answers (907 ms) | 0 in 24 |
+
+- The swap was most of the final run's extra latency and all of its mid-answer silences: with it gone, the router and retrieval are ~1.2 s and the first token ~1.7 s. This round adds: long sentences synthesized in clauses (Kokoro on the CPU takes ~2.8 s for 20 words, ~0.5 s for 5), the MLX cache cap, and the vocabulary prompt (+20 ms of STT).
+- What remains is prompt reading: an answer reads ~650 new tokens (evidence and question) at ~390 tokens/s on this GPU, ~1.7 s; f16 instead of q8_0 KV reads no faster (388 vs 385 tokens/s, measured), and neither does `num_ctx` 4096. The router and retrieval run in parallel (~1.2 s) before it, so a document answer's first token comes ~2.9 s after the user message.
+- **Hindi answers wait for the answer guard** (#44): the first delta came 2.6 s after the model's first token (12 s once, on main), against ~0.2 s in English. That is the Hindi median's ~2.5 s extra.
+- Kokoro on MPS is 2–3× faster alone (5 words 234 ms, 20 words 954 ms) but slower in the loop, sharing the GPU with Ollama and the reranker (first delta → audio 0.91–1.23 s vs 0.85–0.90 s on the CPU, two rounds): it stays on the CPU. Torch threads (4, 6, 10) make no difference.
+
 Not done: an instant spoken acknowledgement ("Sure,") for slow routed turns. The protocol lets only the web search filler precede `sources` (§3.10), the acknowledgement would be spoken before the route is known (wrong for "stop", a backchannel or an abstention), and with the first token at ~1.4 s plus the router's ~1 s and the first chunk's TTS, the remaining wait is short enough to measure in the full voice run first.
 
 ### 9.6 Smoke test 12 results (network off)
@@ -923,11 +961,12 @@ Run 2026-10-08 21:51 with Wi-Fi off (`network: unreachable ✓`), `UV_OFFLINE=1`
 
 Also: onnxruntime threads abort during Python shutdown on macOS (`libc++abi … recursive_mutex`) after work completes; scripts exit with `os._exit()`; the backend should shut down OCR sessions explicitly.
 
-Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first audio (2 of 3 runs favour MPS). Config stays `cpu` to keep GPU memory for the LLM; revisit when tuning latency (MPS costs ~0.56 GB).
+Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first audio (2 of 3 runs favour MPS). Config stays `cpu` to keep GPU memory for the LLM; revisited in the voice loop (§9.5, 2026-10-10): MPS is slower there, sharing the GPU with Ollama and the reranker.
 
 ### Setup notes
 
 - Ollama runs as a brew service (`brew services start ollama`), bound to `127.0.0.1:11434`.
+- **Cap Ollama's prompt cache** (§8): llama-server keeps every distinct prompt's state in RAM up to 8 GiB by default, which pushed the 16 GB Mac into heavy swap. Set `LLAMA_ARG_CACHE_RAM=1024` (MiB) in the service's environment; Ollama passes its environment on to llama-server. Quick, until the next reboot: `launchctl setenv LLAMA_ARG_CACHE_RAM 1024 && brew services restart ollama`. Lasting: add the key to `EnvironmentVariables` in `~/Library/LaunchAgents/sh.brew.ollama.plist` (next to `OLLAMA_FLASH_ATTENTION` and `OLLAMA_KV_CACHE_TYPE`) and reload the service; `brew services` may rewrite that file on an upgrade. Check: the runner's footprint (`footprint $(pgrep -f 'llama-server.*--port')`) stays near 2–2.5 GB, and Ollama's log shows `cache state: … (limits: 1024.000 MiB …)`.
 - Docker Desktop memory is capped at 1.5 GB (Settings → Resources); only Qdrant runs in Docker.
 - Before going offline: install spaCy `en_core_web_sm` into the backend env (Kokoro's `misaki` otherwise fetches it at first run).
 

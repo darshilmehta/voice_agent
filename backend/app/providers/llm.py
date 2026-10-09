@@ -9,6 +9,11 @@ which costs seconds on this machine. Every request this provider makes (router, 
 warm-ups, and any later caller such as the canvas planner) takes ``num_ctx`` and ``keep_alive`` from one place,
 ``OllamaLLM.runtime_options``; callers can't pass their own. ``warm_up`` reads prompts once (one token each), so the
 prompt prefixes the first turns share are already in Ollama's cache.
+
+**Memory (§8).** That cache is llama-server's: it keeps the state of every distinct prompt in RAM (~70 MB per 1,000
+tokens), up to 8 GiB unless the Ollama service's environment sets ``LLAMA_ARG_CACHE_RAM`` (1024 is plenty for the
+router, answer and planner prefixes). It is not a request option, so nothing here can bound it; ``num_ctx`` stays 8192
+(4096 saves only 0.39 GB and doesn't fit typed answers or the summaries' windows).
 """
 
 from __future__ import annotations
