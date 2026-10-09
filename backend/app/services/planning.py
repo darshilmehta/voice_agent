@@ -26,8 +26,9 @@
     live data (§3.7, router.with_live_tools): a question with a live-data cue gets tools=["web_search"] when the
       tool is available, and the search query built from its English standalone question (live_data.web_query);
       no search otherwise (``live_hint``: the answer never guesses current figures); with web search turned on but
-      unavailable now, or no English question to search for, ``live_note`` lets the answer say so (turned off: no
-      note, nothing to apologise for)
+      unavailable now, ``live_note`` lets the answer say so (turned off: no note, nothing to apologise for); no
+      usable search query (a document question that merely contains a cue: "as of today, per the report…") → no
+      search and no note, only the hint, as with the tool off
 
 The speculative retrieval is handed to the turn when the route keeps its query (see ``SpeculativeRetrieval``) and
 discarded otherwise, so a document turn that agrees with the raw utterance pays for retrieval and the router once,
@@ -218,9 +219,10 @@ def policy(
 
 
 def live_search(decision: RouteDecision, req: RouteRequest) -> tuple[RouteDecision, str | None, LiveNote | None]:
-    """The web search a live question runs (its query), or why it runs none (§3.7): the tool isn't available, or
-    there is no English question to search for (a Hindi turn the router couldn't translate: the utterance itself
-    never leaves the machine)."""
+    """The web search a live question runs (its query), or why it runs none (§3.7): the tool isn't available (a
+    note, when it is turned on), or there is no usable search query (no note: a document question that merely
+    contains a cue, "as of today, how many employees… per the report?", or a Hindi turn the router couldn't
+    translate; the answer only gets the "never guess current figures" hint, as with the tool off)."""
     if decision.live is None:
         return decision, None, None
     route = decision.route
@@ -229,8 +231,8 @@ def live_search(decision: RouteDecision, req: RouteRequest) -> tuple[RouteDecisi
     english = route.query_en or route.rewritten_query or req.utterance
     query = web_query(english, documents=req.documents, utterance=req.utterance)
     if query is None:
-        overrides = (*decision.overrides, "web_search dropped: no English search query")
-        return replace(decision, route=route.model_copy(update={"tools": []}), overrides=overrides), None, "failed"
+        overrides = (*decision.overrides, "web_search dropped: no usable search query")
+        return replace(decision, route=route.model_copy(update={"tools": []}), overrides=overrides), None, None
     return decision, query, None
 
 

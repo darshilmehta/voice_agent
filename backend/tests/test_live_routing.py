@@ -582,8 +582,8 @@ def test_a_hindi_live_question_without_an_english_query_searches_nothing():
     d = with_live_tools(fallback_route(req, "router timed out"), req)
     assert d.route.tools == ["web_search"]
     dropped, query, note = live_search(d, req)
-    assert (query, note, dropped.route.tools) == (None, "failed", [])
-    assert "no English search query" in dropped.overrides[-1]
+    assert (query, note, dropped.route.tools) == (None, None, [])  # no notice either: only the prompt's hint
+    assert "no usable search query" in dropped.overrides[-1]
 
 
 @pytest.mark.parametrize("case", [c for c in CASES["cases"] if "tools" in c], ids=lambda c: c["id"])

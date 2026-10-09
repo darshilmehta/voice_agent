@@ -420,8 +420,26 @@ async def test_a_hindi_live_question_searches_in_english(world):
 async def test_a_hindi_live_question_the_router_couldnt_translate_sends_nothing(world):
     world.fakes.llm.route = None  # router fails: no English query
     _, agent = await ask(world, "आज डॉलर का रेट क्या है?")
-    assert world.web.queries == []
-    assert agent.text.startswith(LIVE_NOTICES["failed"]["hi"]) and agent.route["live_note"] == "failed"
+    assert world.web.queries == []  # nothing searched: as with the tool off, no notice, only the prompt's hint
+    assert agent.route["live_note"] is None  # the documents don't say: the abstention, without a live-data notice
+    assert agent.text == ABSTENTIONS["not_covered"]["hi"]
+
+
+async def test_a_document_question_with_a_live_cue_but_no_usable_search_query_gets_no_notice(world, monkeypatch):
+    """A near-empty search query (live_data.web_query → None: fewer than 2 content words and no live topic) means a
+    document question that merely contains a cue: no search, no "I couldn't get live data just now", only the
+    one-line "never guess current figures" hint, the same as when the tool is off."""
+    from app.services import planning
+
+    monkeypatch.setattr(planning, "web_query", lambda *a, **k: None)
+    world.fakes.llm.route = lambda messages: {"intent": "document_qa", "query": None}
+    events, agent = await ask(world, "Explain the real-time monitoring section of the report")
+    assert world.web.queries == [] and "tool:start" not in kinds(events)
+    assert not any(agent.text.startswith(n["en"]) for n in LIVE_NOTICES.values())
+    r = agent.route
+    assert (r["tools"], r["live_note"], r["web_search"]) == ([], None, None)
+    assert r["router"]["live_cue"] == "real-time" and "no usable search query" in r["router"]["overrides"][-1]
+    assert LIVE_HINT in answer_prompts(world)[0][0].content
 
 
 # ------------------------------------------------------------------ stopping
