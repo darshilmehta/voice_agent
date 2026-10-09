@@ -479,3 +479,31 @@ def test_C_an_acknowledgement_alone_is_never_answered_as_a_question(voice):
         assert agent["route"]["intent"] == "backchannel" and agent["route"]["abstained"] is False
         assert [ch["text"] for ch in of(items, "audio_chunk")] == [agent["text"]]  # a short reply, spoken
     assert voice.fakes.llm.calls == []  # neither the router model nor the answer model was asked
+
+
+def test_D_an_interruption_confirmed_after_a_resumed_barge_in_uses_the_current_playback_position(voice):
+    """Found in the combined browser run: "No (pause) wait, I meant the EBITDA margin" was resumed at the deadline (the
+    pause: only a hum had been transcribed), the answer played on at full volume, and when the sentence ended and
+    stopped the answer, `heard_text` still came from the old barge_in_start: 3 words of an answer heard in full."""
+    voice.fakes.llm.reply = (  # 3.3 s of speech: the answer isn't over when the interruption ends
+        "The EBITDA margin was 18.2% in the last fiscal year [S1]. Revenue grew 34% over the same period according to "
+        "the table [S2]. The board approved a dividend of two rupees per share."
+    )
+    voice.fakes.stt.scripts[SAID] = lambda ms: "Mm." if ms < 700 else "No wait, I meant the EBITDA margin"
+    with voice.connect() as ws:
+        c = VoiceClient(ws)
+        c.start()
+        c.say(QUESTION)
+        c.until("agent_message")
+        c.send("barge_in_start", turn_id=1, played_ms=50)
+        paced(c, speech_audio(300, SAID) + silence(250))  # a pause in the sentence when the 700 ms deadline falls
+        assert c.until("barge_in")[-1]["decision"] == "resume"
+        c.send("playback", turn_id=1, played_ms=200)  # the answer went on playing
+        paced(c, speech_audio(700, SAID) + silence(800))
+        items = c.until("agent_message", timeout=5)
+        assert one(items, "barge_in") == {"type": "barge_in", "turn_id": 1, "decision": "stop"}
+        stopped = one(items, "agent_message")["message"]
+    # 200 ms reported plus the 1.3 s or so that have passed since: 6+ words of the answer, not the 0 of the old 50 ms
+    assert stopped["route"]["interrupted"] == "barge_in"
+    assert len(stopped["heard_text"].split()) >= 6
+    assert stopped["heard_text"].startswith("The EBITDA margin was 18.2%")
