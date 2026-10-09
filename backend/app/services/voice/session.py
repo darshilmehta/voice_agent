@@ -998,6 +998,10 @@ class VoiceSession:
         if verdict == "stop":  # the decision is sent by the settle, after the turn is muted
             await self._interrupt(pending.agent, "barge_in", pending.played_ms, decision=True)
         else:
+            # The answer goes on at full volume: if this speech turns out to be an interruption after all (its final
+            # transcript has real words), what was heard is whatever has been played by then (the playback reports),
+            # not what had been played when the speech began.
+            pending.agent.barge_in_ms = pending.agent.barge_in_at = None
             await self._send({"type": "barge_in", "turn_id": pending.agent.id, "decision": "resume"})
 
     # -------------------------------------------------------------- observability
