@@ -28,6 +28,9 @@ TABLES = {
     "chat_summaries",
     "chat_states",
     "document_tables",
+    "table_datasets",
+    "canvas_visuals",
+    "project_overviews",
 }
 
 

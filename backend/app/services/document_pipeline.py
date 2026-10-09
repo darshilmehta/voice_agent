@@ -4,9 +4,10 @@
             → object store (generated key, never the uploaded filename) → document PENDING + job QUEUED → job queue
     job:    temp copy from the object store → IngestionService.ingest_file (parse, chunk, embed, index)
             → tables saved as datasets (§12.1) + document READY with counts, or FAILED with the error
+            → listeners told (the canvas types the tables and rebuilds the project overview)
             → when the long lane drains, the parser releases its models (§8: Docling is loaded only for ingestion)
     delete: vectors first (a document must never stay searchable without its record), then rows (chat scopes
-            pruned), then stored files
+            pruned, canvas visuals built from it removed), then stored files, then listeners told
 
 Ingestions run in the job queue's long lane, one at a time; the short lane (chat titles) is separate, so a title never
 waits for a conversion or for the startup model preload that ``wait_before_ingesting`` holds a long-lane worker on.
@@ -26,11 +27,11 @@ import zipfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import partial
-from typing import BinaryIO
+from typing import BinaryIO, Protocol
 
 from ..db.types import new_id
 from ..domain.projects import Document
-from ..providers.ingestion import IngestionError
+from ..providers.ingestion import Chunk, IngestionError, ParsedDocument
 from ..providers.models import ModelUnavailableError
 from ..providers.registry import Container
 from ..providers.retrieval import VectorStore
@@ -152,6 +153,16 @@ def describe_failure(e: BaseException) -> str:
 # ------------------------------------------------------------------ pipeline
 
 
+class DocumentListener(Protocol):
+    """Follows documents through the pipeline (the canvas, §12.1). Must not raise: errors are its own to log."""
+
+    async def document_ready(
+        self, project_id: str, document_id: str, version: int, *, parsed: ParsedDocument, chunks: list[Chunk]
+    ) -> object: ...
+
+    async def document_deleted(self, project_id: str, document_id: str) -> None: ...
+
+
 class DocumentPipeline:
     """Long-lived (one per app): owns the upload lock and registers the queue's idle hook."""
 
@@ -176,6 +187,8 @@ class DocumentPipeline:
         # Awaited before each ingestion starts (the app passes the startup model preload): a long conversion must not
         # hold off the preload's model loads, and the questions queued behind them (models.TorchGate).
         self.wait_before_ingesting: Callable[[], Awaitable[None]] | None = None
+        # Told when a document becomes READY and after one is deleted (the canvas types tables, rebuilds overviews).
+        self.listeners: list[DocumentListener] = []
 
     @classmethod
     def from_container(cls, container: Container) -> DocumentPipeline:
@@ -287,6 +300,13 @@ class DocumentPipeline:
         if not saved:  # deleted while ingesting: drop what was just indexed
             await self._purge_vectors(doc_id)
             return
+        for listener in self.listeners:
+            try:  # listeners must not raise; a bug in one must never fail a document that is already READY
+                await listener.document_ready(
+                    target.project_id, doc_id, target.version, parsed=result.document, chunks=result.chunks
+                )
+            except Exception:
+                log.exception("listener %r failed after document %s became READY", listener, doc_id)
         t = result.timings
         log.info(
             "document %s READY: %s pages, %d chunks, %d tables in %.1fs (parse %.1fs, embed %.1fs)",
@@ -316,6 +336,11 @@ class DocumentPipeline:
         await self._delete_vectors(partial(self.vectors.delete_document, document_id), f"document {document_id}")
         await self.documents.delete(document_id)
         await self._delete_files(f"{files.project_id}/{document_id}", files.storage_keys)
+        for listener in self.listeners:
+            try:
+                await listener.document_deleted(files.project_id, document_id)
+            except Exception:
+                log.exception("listener %r failed after document %s was deleted", listener, document_id)
 
     async def delete_project(self, project_id: str) -> None:
         """Delete a project: its vectors, rows (documents, chats, messages, summaries cascade) and stored files."""

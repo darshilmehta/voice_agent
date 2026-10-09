@@ -175,6 +175,14 @@
   "strict_offline_exceptions": [],
   "strict_offline_local_hosts": [],
 
+  "canvas": {
+    "planner_timeout_ms": 8000,
+    "planner_max_tokens": 200,
+    "planner_candidates": 4,
+    "max_panels": 12,
+    "overview_panels": 3
+  },
+
   "job_queue": { "provider": "in_process", "url": null, "concurrency": 1 },
   "session_store": { "provider": "in_memory", "url": null, "ttl_s": 86400 },
   "event_bus": { "provider": "in_process", "url": null },

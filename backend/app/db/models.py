@@ -20,6 +20,7 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -168,6 +169,61 @@ class DocumentTable(Base):
     markdown: Mapped[str] = mapped_column(Text)
     cells: Mapped[list[dict[str, Any]]] = mapped_column(default=list)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class TableDataset(Base):
+    """A table typed as a dataset (§12.1, workstream 1): one per ``document_tables`` row, deleted with it.
+
+    ``data`` is the ``domain.datasets.TypedDataset`` (columns, rows, every value with its unit and the grid position of
+    its cell, chartability, the text around the table); the columns beside it are for queries. ``typer_version``
+    changes when typing improves, so a backfill can re-type older datasets."""
+
+    __tablename__ = "table_datasets"
+
+    id: Mapped[str] = mapped_column(ID, primary_key=True, default=lambda: new_id("ds"))
+    table_id: Mapped[str] = mapped_column(ID, _parent("document_tables"), unique=True)
+    document_id: Mapped[str] = mapped_column(ID, _parent("documents"), index=True)
+    version: Mapped[int]
+    typer_version: Mapped[str] = mapped_column(String(16))
+    chart_kind: Mapped[str] = mapped_column(String(16))
+    chart_confidence: Mapped[float] = mapped_column(Float)
+    data: Mapped[dict[str, Any]]
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class CanvasVisual(Base):
+    """A visual on a chat's canvas (``chat_id`` set) or on the project overview (``chat_id`` NULL), §12.1.
+
+    ``visual`` is the contract's ``Visual`` as built (its numbers and CellRefs are a snapshot of the cells);
+    ``position`` and ``pinned`` are kept here and override the stored copy. ``document_ids`` are the documents its
+    cells come from: deleting one of them deletes the visual (``DocumentService.delete``); projects and chats cascade.
+    """
+
+    __tablename__ = "canvas_visuals"
+    __table_args__ = (Index("ix_canvas_visuals_project_id_chat_id_position", "project_id", "chat_id", "position"),)
+
+    id: Mapped[str] = mapped_column(ID, primary_key=True, default=lambda: new_id("vis"))
+    project_id: Mapped[str] = mapped_column(ID, _parent("projects"))
+    chat_id: Mapped[str | None] = mapped_column(ID, _parent("chats"), index=True)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    pinned: Mapped[bool] = mapped_column(default=False)
+    kind: Mapped[str] = mapped_column(String(16))
+    document_ids: Mapped[list[str]] = mapped_column(default=list)
+    spec: Mapped[dict[str, Any]]
+    visual: Mapped[dict[str, Any]]
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class ProjectOverview(Base):
+    """When the project's overview was last built, and from which datasets (``fingerprint``), so it is rebuilt
+    only when the documents' datasets change."""
+
+    __tablename__ = "project_overviews"
+
+    project_id: Mapped[str] = mapped_column(ID, _parent("projects"), primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    built_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
 class Chat(Base):

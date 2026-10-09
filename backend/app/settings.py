@@ -257,6 +257,17 @@ class ToolsSection(Section):
     web_search: WebSearchSection
 
 
+class CanvasSection(Section):
+    """The live visual canvas (§12.1). The planner is one JSON call to ``llm.router_model``, bounded by
+    ``planner_max_tokens`` and ``planner_timeout_ms`` (it runs beside the spoken answer and never delays it)."""
+
+    planner_timeout_ms: int = Field(gt=0)
+    planner_max_tokens: int = Field(gt=0)
+    planner_candidates: int = Field(gt=0, le=8)  # datasets offered to the planner per question
+    max_panels: int = Field(gt=0)  # per chat; adding one more removes the oldest unpinned panel
+    overview_panels: int = Field(ge=0, le=6)  # panels on a project's overview (0: no overview)
+
+
 class JobQueueSection(Section):
     provider: str
     url: str | None
@@ -309,6 +320,7 @@ class Settings(Section):
     voice: VoiceSection
     audio_transport: AudioTransportSection
     tools: ToolsSection
+    canvas: CanvasSection
     job_queue: JobQueueSection
     session_store: SessionStoreSection
     event_bus: EventBusSection

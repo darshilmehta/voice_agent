@@ -414,3 +414,31 @@ async def test_storage_failure_after_put_removes_the_file(db, load_local, tmp_pa
     assert not any(f.is_file() for f in uploads_dir(tmp_path).rglob("*"))
     with pytest.raises(ObjectNotFound):
         await store.get(storage_key(project.id, "doc_x", 1, ".txt"))
+
+
+def test_a_failing_document_listener_never_fails_the_document(api):
+    """Listeners (the canvas) must not raise; if one does anyway, the document stays READY and deletes still work."""
+
+    class Broken:
+        async def document_ready(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+        async def document_deleted(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    api.app.state.document_pipeline.listeners.append(Broken())
+    project = api.post("/api/projects", json={"name": "P"}).json()
+    r = api.post(
+        f"/api/projects/{project['id']}/documents", files={"file": ("a.pdf", b"%PDF-1.4 fake", "application/pdf")}
+    )
+    assert r.status_code in (200, 201, 202)
+    doc_id = r.json()["id"]
+    for _ in range(200):
+        doc = api.get(f"/api/documents/{doc_id}").json()
+        if doc["status"] in ("READY", "FAILED"):
+            break
+        import time
+
+        time.sleep(0.01)
+    assert doc["status"] == "READY"
+    assert api.delete(f"/api/documents/{doc_id}").status_code in (200, 204)
