@@ -117,6 +117,8 @@ QUESTION_CHARS = 300  # an unanswered question as listed in the summary
 MESSAGE_CHARS = 1000  # one message as shown to the summarizer
 
 NO_ANSWER_LINE = "(no answer: the documents did not cover this)"
+# An answer the user cut off (B7): what was heard of it is a fragment, never a source of facts.
+INTERRUPTED_LINE = "(cut off by the user before it finished: incomplete, not an answer)"
 
 
 _SOURCE_NUMBER = re.compile(r"\[?\s*S?\s*(\d{1,6})\s*\]?", re.IGNORECASE)
@@ -188,15 +190,29 @@ def summary_system_prompt(language: Language) -> str:
         f"{_SUMMARY_FORMAT}\n"
         "Rules:\n"
         "1. Use only what the conversation says. Never add facts, figures or citation numbers that are not in it.\n"
-        f"2. Lines saying {NO_ANSWER_LINE} are questions the documents could not answer: make no key point from "
-        "them.\n"
-        f"3. {_SUMMARY_LANGUAGE_RULE[language]}"
+        f"2. Lines saying {NO_ANSWER_LINE} are questions the documents could not answer, and lines saying "
+        f"{INTERRUPTED_LINE} are answers the user cut off: make no key point from either.\n"
+        "3. Each fact once: never two key points that say the same thing.\n"
+        f"4. {_SUMMARY_LANGUAGE_RULE[language]}"
     )
 
 
-def summary_user_prompt(lines: Sequence[str], legend: Sequence[str]) -> str:
+def summary_user_prompt(lines: Sequence[str], legend: Sequence[str], language: Language = "en") -> str:
     sources = "\n".join(legend) if legend else "(none: no answer in this part cites a document)"
-    return "Conversation:\n" + "\n".join(lines) + "\n\nSources:\n" + sources
+    return "Conversation:\n" + "\n".join(lines) + "\n\nSources:\n" + sources + _language_reminder(language)
+
+
+def _language_reminder(language: Language) -> str:
+    """The summary's language once more, last (B8: a Hindi summary of a mostly English conversation kept its key
+    points in English when only the system prompt asked for Hindi)."""
+    return f"\n\n({_SUMMARY_LANGUAGE_RULE[language]})" if language == "hi" else ""
+
+
+# One more try when a Hindi summary came out in English (B8).
+SUMMARY_LANGUAGE_INSISTENCE = (
+    "IMPORTANT: write the overview, every key point and every follow-up in Hindi, in Devanagari script, even though "
+    "the conversation is in English. महत्वपूर्ण: सारांश, हर मुख्य बिंदु और हर आगे का प्रश्न हिंदी (देवनागरी) में लिखें।"
+)
 
 
 def reduce_system_prompt(language: Language) -> str:
@@ -205,16 +221,17 @@ def reduce_system_prompt(language: Language) -> str:
         "assistant into a single summary.\n"
         f"{_SUMMARY_FORMAT}\n"
         "Rules:\n"
-        "1. Use only what the partial summaries say. Merge duplicates; keep the most important points.\n"
+        "1. Use only what the partial summaries say. Merge duplicates (points that say the same thing in other words "
+        "are duplicates); keep the most important points.\n"
         "2. Keep each key point's citation numbers exactly as given; never add numbers that are not in the partial "
         "summaries.\n"
         f"3. {_SUMMARY_LANGUAGE_RULE[language]}"
     )
 
 
-def reduce_user_prompt(parts: Sequence[str], legend: Sequence[str]) -> str:
+def reduce_user_prompt(parts: Sequence[str], legend: Sequence[str], language: Language = "en") -> str:
     sources = "\n".join(legend) if legend else "(none)"
-    return "Partial summaries:\n\n" + "\n\n".join(parts) + "\n\nSources:\n" + sources
+    return "Partial summaries:\n\n" + "\n\n".join(parts) + "\n\nSources:\n" + sources + _language_reminder(language)
 
 
 def render_partial(index: int, draft: SummaryDraft) -> str:

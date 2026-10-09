@@ -118,7 +118,7 @@ from .prompts import (
 )
 from .retrieval import Confidence, RetrievalResult, RetrievalService, SpeculationOutcome
 from .router import LLMTurnRouter, RouteRequest, TurnRouter, heard
-from .sources import Source, build_sources, finalize_answer, strip_markers, trim_open_marker
+from .sources import Source, build_sources, finalize_answer, says_not_covered, strip_markers, trim_open_marker
 from .web_search import ToolEvent, WebSearchRun, WebSource
 
 log = logging.getLogger(__name__)
@@ -786,7 +786,13 @@ class ChatTurnService:
             return
         if (p.sources or p.web_sources) and not citations:
             log.info("chat %s: answer cites no source", chat.id)
-        route = self._route(turn, p, abstained=False, reason=None)
+        if plan.mode == "grounded" and not citations and not p.web_sources and says_not_covered(answer):
+            # The documents passed the gate but the answer says they don't cover it (B9): it is an abstention, listed
+            # among the summary's unanswered questions, not an answer.
+            p.abstained, p.reason = True, "not_covered"
+        route = self._route(turn, p, abstained=p.abstained, reason=p.reason)
+        if p.abstained:
+            route["abstained_by"] = "answer"  # the gate let it through; the answer itself said so
         latency = self._latency(clock, p, first_delta_ms=p.first_delta_ms, llm_ms=llm_ms)
         async for event in self._save_answer(turn, answer, citations, route, latency, p):
             yield event

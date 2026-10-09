@@ -205,6 +205,32 @@ async def test_b1_b9_document_questions_routed_general_are_searched_and_unanswer
     ]
 
 
+async def test_b9_an_answer_saying_the_documents_dont_cover_it_is_an_abstention(world):
+    """The gate let the question through (a passage scored above the threshold) but the answer itself says the
+    documents don't cover it: saved as abstained (``abstained_by: "answer"``), so the summary lists it as unanswered."""
+    question = "What is the EBITDA margin target?"
+    world.fakes.llm.route = routes({question: {"intent": "document_qa", "query": None}})
+    world.fakes.llm.reply = replies("The documents do not specify an EBITDA margin target.")
+    _, agent = await say(world, question)
+    r = agent.route
+    assert (r["abstained"], r["abstain_reason"], r["abstained_by"], r["basis"]) == (True, "not_covered", "answer", [])
+    world.fakes.llm.reply = replies("The EBITDA margin was 18.2% in FY24 [S1]. The documents give no target.")
+    _, agent = await say(world, question)
+    assert agent.route["abstained"] is False  # it answers something from the documents (it cites a source)
+
+
+def test_b7_the_memory_summary_keeps_no_fragment_of_a_cut_off_answer():
+    from app.services.memory import transcript
+    from app.services.revisit_prompts import INTERRUPTED_LINE
+
+    from .test_routing import msg
+
+    cut = msg("agent", "Product X depends on a single supplier [S1].", heard="Product", seq=2)
+    unheard = msg("agent", "Revenue grew 34% [S1].", heard="", seq=4)
+    lines = transcript([msg("user", "Which product?", seq=1), cut, msg("user", "And revenue?", seq=3), unheard])
+    assert lines == f"User: Which product?\nAssistant: {INTERRUPTED_LINE}\nUser: And revenue?"
+
+
 async def test_acknowledgements_and_thanks_get_short_fixed_replies_never_an_abstention(world):
     _, first = await say(world, "okay")
     assert (first.role, first.text, first.route["intent"], first.route["answer"]) == (

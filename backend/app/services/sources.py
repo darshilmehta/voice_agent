@@ -175,6 +175,26 @@ def compact_tables(text: str) -> str:
     return "\n".join(lines)
 
 
+# An answer that says the documents don't have it: "The documents do not specify Valmora's EBITDA margin for FY25.",
+# "The report doesn't provide…", "not mentioned in the sources", "इस बारे में जानकारी नहीं दी गई है".
+_NOT_COVERED = re.compile(
+    r"\b(?:documents?|sources?|report|deck|minutes|filing|file|provided\s+(?:sources|information|text|documents))\b"
+    r"[^.!?।]{0,60}?\b(?:do(?:es)?\s*n[o'\u2019]?t|did\s*n[o'\u2019]?t|cannot|can't)\s+(?:cover|mention|provide|specify|include|"
+    r"contain|state|say|give|list|disclose|show|have)\b"
+    r"|\bnot\s+(?:mentioned|specified|provided|available|covered|stated|given|disclosed|found|listed)\s+in\s+the\s+"
+    r"(?:documents?|sources?|report|provided|deck|minutes)"
+    r"|\bno\s+(?:information|mention|data|details)\s+(?:about|on|of|regarding|in\s+the\s+(?:documents?|sources?|report))\b"
+    r"|\b(?:i\s+)?(?:couldn['\u2019]t|could\s+not|can['\u2019]t|cannot)\s+find\b"
+    r"|जानकारी\s+नहीं|उल्लेख\s+नहीं|नहीं\s+दी\s+गई|नहीं\s+दिया\s+गया|उपलब्ध\s+नहीं|नहीं\s+बताया|नहीं\s+मिल",
+    re.IGNORECASE,
+)
+
+
+def says_not_covered(text: str) -> bool:
+    """The text says the documents don't have the answer (a model's own non-answer, or a summary point about one)."""
+    return bool(_NOT_COVERED.search(text))
+
+
 _OPEN_MARKER = re.compile(r"\s*\[[^\]]{0,24}$")
 
 

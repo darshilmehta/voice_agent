@@ -30,6 +30,7 @@ from .base import NotFound, Service
 from .conversation import loop_local
 from .messages import MessageService
 from .prompts import MEMORY_PROMPT_VERSION, memory_system_prompt, memory_user_prompt
+from .revisit_prompts import INTERRUPTED_LINE
 from .router import heard
 from .sources import estimate_tokens, strip_markers
 from .summaries import SummaryService
@@ -121,6 +122,11 @@ def transcript(messages: list[Message]) -> str:
     """Messages as "User: …" / "Assistant: …" lines for the summary prompt, with the pages answers cited."""
     lines = []
     for m in messages:
+        if m.role == "agent" and m.heard_text is not None:
+            # Cut off (B7): a fragment ("Product…") isn't a fact to remember, only that the answer was cut.
+            if m.heard_text.strip():
+                lines.append(f"Assistant: {INTERRUPTED_LINE}")
+            continue
         text = " ".join(strip_markers(heard(m)).split())
         if not text:  # an answer nobody heard
             continue
@@ -132,8 +138,6 @@ def transcript(messages: list[Message]) -> str:
             web = sorted({f"web: {c.site or c.url}" for c in m.citations if c.kind == "web"})  # live data, §3.7
             if cited or web:
                 text += f" (sources: {', '.join([*cited, *web])})"
-            if m.heard_text is not None:
-                text += " (interrupted)"
         lines.append(f"{'User' if m.role == 'user' else 'Assistant'}: {text}")
     return "\n".join(lines)
 

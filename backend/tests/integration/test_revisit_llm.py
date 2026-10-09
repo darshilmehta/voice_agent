@@ -104,6 +104,42 @@ async def test_title_and_summary_of_a_scripted_chat(real, script, language):
         assert DEVANAGARI.search(summary.overview)
 
 
+async def test_b7_b8_a_hindi_summary_of_a_mixed_chat_with_a_cut_off_answer(real):
+    """Found in the real run: a Hindi summary kept its key points in English, repeated them, put a page chip on a
+    "report does not provide" point, and turned a heard "Product…" fragment into "no product depends on a single
+    supplier". The chat: an answer cut off after "Product", a document answer, an uncovered question, a Hindi answer."""
+    db, settings, llm = real
+    project = await ProjectService(db).create("Annual report FY24")
+    chat = await ChatService(db).create(project.id)
+    m = MessageService(db)
+    say = [
+        ("user", "Which product depends on a single supplier?", None, None, []),
+        ("agent", "Fluoropolymer resin depends on a single supplier in Japan [S1].", ANSWERED, "Product", [REPORT_P3]),
+        ("user", "What was the EBITDA margin in FY24?", None, None, []),
+        ("agent", "The EBITDA margin in FY24 was 18.2%, up from 16.9% in FY23 [S1].", ANSWERED, None, [REPORT_P2]),
+        ("user", "What is the CEO's salary?", None, None, []),
+        ("agent", "The report does not provide the CEO's salary.", {**ABSTAINED, "abstained_by": "answer"}, None, []),
+        ("user", "राजस्व कितना बढ़ा?", None, None, []),
+        ("agent", "राजस्व में साल-दर-साल 34% की वृद्धि हुई [S1]।", ANSWERED, None, [DECK_P7]),
+    ]
+    for role, text, route, heard, citations in say:
+        language = "hi" if DEVANAGARI.search(text) else "en"
+        await m.append(
+            chat.id, role=role, text=text, language=language, citations=citations, route=route, heard_text=heard,
+            modality="voice",
+        )  # fmt: skip
+    t0 = time.perf_counter()
+    summary = await ChatSummarizer(db, llm=llm, settings=settings).generate(chat.id, language="hi")
+    METRICS["summary [hi, mixed chat, cut-off answer]"] = f"{time.perf_counter() - t0:.1f}s\n{summary.content}"
+    texts = [p.text for p in summary.key_points]
+    assert DEVANAGARI.search(summary.overview) and all(DEVANAGARI.search(t) for t in texts), texts
+    assert not any("supplier" in t.casefold() or "आपूर्तिकर्ता" in t or "Fluoropolymer" in t for t in texts), texts
+    assert len(set(texts)) == len(texts)
+    assert [q.question for q in summary.unanswered_questions] == ["What is the CEO's salary?"]
+    cited = {(r.filename, r.page_start) for p in summary.key_points for r in p.sources}
+    assert cited <= {("annual_report.pdf", 2), ("investor_deck.pdf", 7)}  # never the cut-off answer's page 3
+
+
 async def test_map_reduce_with_the_real_model(real):
     """The same chat in tiny windows, so the reduce prompt (combining partial summaries) runs on the real model too."""
     db, settings, llm = real

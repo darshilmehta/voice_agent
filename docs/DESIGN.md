@@ -376,6 +376,8 @@ Audio itself is **not** stored by default (privacy and disk); a later `chats.sto
 
 Long chats are summarised in chunks and then combined (map-reduce) to fit the model's context. The summary is cached with the message it covers up to; when new messages arrive it shows "out of date — update". This is separate from the internal memory summary that keeps prompts short (§3.5), though both come from the same messages.
 
+What counts (quality round): an answer the user cut off is never a source of facts, in the summary or the memory: the summarizer sees "(cut off by the user before it finished: incomplete, not an answer)" instead of what was heard (a heard "Product…" had become "no product depends on a single supplier"). "Questions the documents couldn't answer" lists abstained turns: the gate's (`route.abstained`), mixed answers the documents didn't cover, and grounded answers that passed the gate but say the documents don't cover it (`route.abstained_by: "answer"`, B9); since B1 also routes misrouted document questions to the documents, they show up there too. Key points that only say something isn't covered are dropped (they came with a page chip), repeats are merged with their sources, and a Hindi summary written in English is asked for once more, insisting on Hindi (the language is also asked for last, in the conversation's message).
+
 **Data model (SQLite now, Postgres later via SQLAlchemy).**
 
 ```text
