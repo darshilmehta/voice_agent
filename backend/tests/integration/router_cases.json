@@ -1,5 +1,5 @@
 {
-  "about": "Labelled router turns (docs/DESIGN.md §3.4) for tests/integration/test_router_eval.py. Each case: the utterance, a short history ([role, text] or [role, text, heard_text] for an interrupted answer), the conversation state's topics, the expected intent (plus acceptable alternatives) and words the standalone query / English query must contain (any of each inner list). Live-data cases (§3.7) also give the expected tools (decided by application code from live-data cues, checked without the model in tests/test_live_routing.py) and words the web search query must contain.",
+  "about": "Labelled router turns (docs/DESIGN.md §3.4) for tests/integration/test_router_eval.py. Each case: the utterance, a short history ([role, text] or [role, text, heard_text] for an interrupted answer), the conversation state's topics, the expected intent (plus acceptable alternatives) and words the standalone query / English query must contain (any of each inner list). Live-data cases (§3.7) also give the expected tools (decided by application code from live-data cues, checked without the model in tests/test_live_routing.py) and words the web search query must contain. B1 cases give `documents_match`, the reranker's best score for the question against the documents: a \"general\" proposal for a question about facts is checked against it (services/planning.py), and the turn must then search the documents (or, with `final: \"general\"`, stay a general answer).",
   "documents": ["annual_report.pdf"],
   "cases": [
     {"id": "doc-fresh-margin", "utterance": "What was the EBITDA margin in FY24?", "intent": "document_qa"},
@@ -127,6 +127,19 @@
     {"id": "nolive-latest-report", "utterance": "What does the latest annual report say about debt?", "intent": "document_qa", "tools": []},
     {"id": "nolive-report-share-price", "utterance": "What does the report say about the share price?", "intent": "document_qa", "tools": []},
     {"id": "hi-nolive-so-far", "utterance": "अभी तक कंपनी ने कितना निवेश किया है?", "intent": "document_qa", "also": ["mixed"], "tools": []},
-    {"id": "hinglish-nolive-debt", "utterance": "FY24 mein net debt kitna tha?", "intent": "document_qa", "tools": [], "query_en": [["debt"]]}
+    {"id": "hinglish-nolive-debt", "utterance": "FY24 mein net debt kitna tha?", "intent": "document_qa", "tools": [], "query_en": [["debt"]]},
+    {"id": "b1-employees-year-end", "utterance": "How many employees did the company have at year end?", "intent": "document_qa", "documents_match": 0.85},
+    {"id": "b1-employees-after-general", "utterance": "How many employees did the company have at year end?", "intent": "document_qa", "history": [["user", "What's the capital of France?"], ["agent", "The capital of France is Paris."]], "documents_match": 0.85},
+    {"id": "b1-supplier-after-general", "utterance": "Which product depends on a single supplier?", "intent": "document_qa", "also": ["mixed"], "history": [["user", "How do I make masala chai?"], ["agent", "Boil water with tea leaves, milk, sugar and spices."]], "documents_match": 0.8},
+    {"id": "b1-employees-uncovered", "utterance": "How many employees did the company have at year end?", "intent": "document_qa", "documents_match": 0.01},
+    {"id": "b1-auditor-after-general", "utterance": "Who are the statutory auditors?", "intent": "document_qa", "history": [["user", "Who won the cricket world cup in 2011?"], ["agent", "India won the 2011 Cricket World Cup."]], "documents_match": 0.7},
+    {"id": "b1-ebitda-definition", "utterance": "What is EBITDA?", "intent": "general_qa", "also": ["mixed", "document_qa"], "documents_match": 0.9, "final": "general"},
+    {"id": "b1-general-fact", "utterance": "Who won the cricket world cup in 2011?", "intent": "general_qa", "documents_match": 0.0, "final": "general"},
+    {"id": "hi-profit", "utterance": "कंपनी का मुनाफा कितना था?", "intent": "document_qa", "query_en": [["profit"]], "documents_match": 0.8},
+    {"id": "hi-revenue-fy24", "utterance": "वित्त वर्ष 2024 में कंपनी का राजस्व कितना था?", "intent": "document_qa", "query_en": [["revenue"]], "documents_match": 0.8},
+    {"id": "hi-profit-after-general", "utterance": "और कंपनी का शुद्ध लाभ कितना रहा?", "intent": "document_qa", "history": [["user", "भारत की राजधानी क्या है?"], ["agent", "भारत की राजधानी नई दिल्ली है।"]], "query_en": [["profit"]], "documents_match": 0.8},
+    {"id": "hinglish-profit", "utterance": "company ka net profit kitna tha?", "intent": "document_qa", "query_en": [["profit"]], "documents_match": 0.8},
+    {"id": "lang-english-please", "utterance": "answer in English please", "intent": "correction", "also": ["conversation", "document_qa"], "history": [["user", "FY24 mein revenue kitna tha?"], ["agent", "FY24 में राजस्व ₹ 7,365 करोड़ था।"]], "topic": "revenue"},
+    {"id": "lang-hindi-please", "utterance": "हिंदी में बताइए", "intent": "correction", "also": ["conversation", "document_qa"], "history": [["user", "What was revenue in FY24?"], ["agent", "Revenue was ₹ 7,365 crore in FY24."]], "topic": "revenue"}
   ]
 }

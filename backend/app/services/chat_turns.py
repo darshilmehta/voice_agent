@@ -839,7 +839,11 @@ class ChatTurnService:
     # -------------------------------------------------------------- helpers
 
     async def _retrieve(self, plan: TurnPlan, p: _Progress, chat: Chat) -> RetrievalResult:
-        """The plan's retrieval: the speculative one when the route kept its query, else a new one."""
+        """The plan's retrieval: the one already run while routing (B1), the speculative one when the route kept its
+        query, else a new one."""
+        if plan.prefetched is not None:
+            result, p.speculation = await plan.prefetched
+            return result
         if plan.speculation is not None:
             result, p.speculation = await plan.speculation.result_for(plan.query, plan.query_en)
             return result

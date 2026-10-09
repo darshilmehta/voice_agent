@@ -8,6 +8,11 @@
         ├─ a standalone question whose speculative retrieval is confident before the router answers
         │     → document question, router call cancelled (no model wait)
         ├─ the router's proposal, validated (services/router.py)
+        │     "general" or "conversation" for a question about facts, in a chat with READY documents (B1): wait for
+        │     the speculative retrieval (at most ``FACT_WAIT_S`` more); it passes the confidence gate → a document
+        │     question (strong match, or the question names the documents' subject) or a mixed one; it doesn't, but
+        │     the question is about the documents' subject ("the company", "FY24") → a document question that
+        │     abstains; otherwise general, as proposed. Definitions and how-tos ("What is EBITDA?") stay general.
         └─ timeout / invalid JSON / model down → fallback: a document question on the raw utterance (phase 1)
     retrieval policy (application code, from intent + state):
       document_qa, correction of a document question, resume with a question  → search, grounded answer
@@ -26,7 +31,8 @@
 
 The speculative retrieval is handed to the turn when the route keeps its query (see ``SpeculativeRetrieval``) and
 discarded otherwise, so a document turn that agrees with the raw utterance pays for retrieval and the router once,
-in parallel, not one after the other.
+in parallel, not one after the other. A retrieval waited for to check a "general" proposal is handed to the turn
+too (``TurnPlan.prefetched``): it is never run twice.
 """
 
 from __future__ import annotations
@@ -43,13 +49,17 @@ from ..settings import Language
 from .language import message_language
 from .live_data import LiveNote, web_query
 from .prompts import AckKind, AnswerMode, GeneralNote
-from .retrieval import RetrievalService, SpeculativeRetrieval
+from .retrieval import RetrievalResult, RetrievalService, SpeculationOutcome, SpeculativeRetrieval
 from .router import (
+    CONFIDENCE,
     InterruptedAnswer,
     RouteDecision,
     RouteRequest,
     RouterProposal,
     TurnRouter,
+    about_the_documents,
+    asks_about_facts,
+    asks_for_judgement,
     fallback_route,
     fast_route,
     retrieval_route,
@@ -63,6 +73,11 @@ log = logging.getLogger(__name__)
 # A standalone question whose speculative retrieval scores at least this (reranker, 0-1) is a document question
 # without waiting for the router; well above the abstention threshold, so only clear matches skip the model.
 FAST_ACCEPT_SCORE = 0.6
+# A "general" proposal for a question about facts waits at most this long after the router for the speculative
+# retrieval (B1): measured under load, retrieval takes 1.0-2.5 s and the router 0.9-1.4 s.
+FACT_WAIT_S = 1.5
+
+Prefetched = asyncio.Future[tuple[RetrievalResult, SpeculationOutcome]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +102,9 @@ class TurnPlan:
     # answer may say so (``ChatTurnService`` decides when). None when web search is turned off.
     live_note: LiveNote | None = None
     live_hint: bool = False  # the question wants live data and gets no search: never guess current figures
+    # The turn's retrieval, already started (or done) while the route was decided (B1): awaited instead of searching
+    # again. Cancelled with the plan when the route needs no retrieval.
+    prefetched: Prefetched | None = None
 
     @property
     def route(self) -> TurnRoute | None:
@@ -170,15 +188,13 @@ def policy(
     *,
     has_documents: bool,
     retrieval_enabled: bool,
-    speculation: SpeculativeRetrieval | None = None,
-    fast_accept: float = FAST_ACCEPT_SCORE,
 ) -> Policy:
-    """Retrieval policy: the answer mode and whether to search, from the validated route and the chat's state."""
+    """Retrieval policy: the answer mode and whether to search, from the validated route and the chat's state. (A
+    "general" proposal for a question about facts was checked against the documents before, ``TurnPlanner``.)"""
     route = decision.route
     intent = route.intent
     mode, search = _MODES[intent]
     ack: AckKind | None = None
-    overrides: list[str] = []
     if intent == "backchannel":
         last = req.last_answer
         if last is not None and (last.route or {}).get("answer") == "ack":
@@ -192,19 +208,13 @@ def policy(
     elif intent == "correction":
         mode = _corrected_mode(req.history)
         search = mode != "general"
-    elif intent == "general_qa" and speculation is not None and route.rewritten_query is None:
-        ranked = speculation.peek()  # only if already there: never wait for it here
-        if ranked is not None and ranked.confidence is not None and ranked.confidence.top_score >= fast_accept:
-            mode, search = "mixed", True
-            overrides.append(f"general_qa→mixed: documents match ({ranked.confidence.top_score:.2f})")
     note: GeneralNote | None = None
     if search and not retrieval_enabled:
         mode, search, note = "general", False, "retrieval_off"
     elif search and not has_documents and mode == "mixed":
         mode, search, note = "general", False, "no_documents"
     route = route.model_copy(update={"needs_retrieval": search})
-    decision = replace(decision, route=route, overrides=decision.overrides + tuple(overrides))
-    return Policy(decision, mode, note, ack)
+    return Policy(replace(decision, route=route), mode, note, ack)
 
 
 def live_search(decision: RouteDecision, req: RouteRequest) -> tuple[RouteDecision, str | None, LiveNote | None]:
@@ -232,11 +242,13 @@ class TurnPlanner:
         *,
         timeout_s: float,
         fast_accept: float = FAST_ACCEPT_SCORE,
+        fact_wait_s: float = FACT_WAIT_S,
     ) -> None:
         self.retrieval = retrieval
         self.router = router
         self.timeout_s = timeout_s
         self.fast_accept = fast_accept
+        self.fact_wait_s = fact_wait_s
 
     async def plan(
         self,
@@ -258,25 +270,26 @@ class TurnPlanner:
             speculation = SpeculativeRetrieval(
                 self.retrieval, query, project_id=project_id, document_ids=list(ready), rerank=rerank
             )
+        prefetched: Prefetched | None = None
         try:
             if decision is None:
                 decision = await self._ask_router(req, speculation)
+                decision, prefetched = await self._check_facts(decision, req, speculation)
             decision = with_live_tools(decision, req)
-            p = policy(
-                decision,
-                req,
-                has_documents=bool(ready),
-                retrieval_enabled=retrieval_enabled,
-                speculation=speculation,
-                fast_accept=self.fast_accept,
-            )
+            p = policy(decision, req, has_documents=bool(ready), retrieval_enabled=retrieval_enabled)
         except BaseException:
+            if prefetched is not None:
+                prefetched.cancel()
             if speculation is not None:
                 speculation.discard()
             raise
         route = p.decision.route
-        if speculation is not None and not route.needs_retrieval:
-            speculation.discard()
+        if not route.needs_retrieval:
+            if prefetched is not None:
+                prefetched.cancel()
+                prefetched = None
+            if speculation is not None:
+                speculation.discard()
         decision, query, note = live_search(p.decision, req)
         return TurnPlan(
             query=route.rewritten_query or req.utterance,
@@ -295,7 +308,60 @@ class TurnPlanner:
             web_query=query,
             live_note=note,
             live_hint=decision.live is not None and query is None,
+            prefetched=prefetched,
         )
+
+    async def _check_facts(
+        self, decision: RouteDecision, req: RouteRequest, speculation: SpeculativeRetrieval | None
+    ) -> tuple[RouteDecision, Prefetched | None]:
+        """A "general" (or "conversation") proposal for a question about facts, in a chat with READY documents: the
+        documents may well answer it (the 4B router labels "How many employees did the company have at year end?"
+        general), so wait for the speculative retrieval, at most ``fact_wait_s`` (module docstring, B1). Returns the
+        decision (upgraded or not) and the retrieval to hand to the turn."""
+        route, proposal = decision.route, decision.proposal
+        if (
+            decision.source != "llm"
+            or proposal is None
+            or route.intent not in ("general_qa", "conversation")
+            or speculation is None
+            or not asks_about_facts(req.utterance)
+            or req.live_cue(route.rewritten_query, proposal.query) is not None  # live data: the web search decides
+        ):
+            return decision, None
+        about = about_the_documents(req.utterance, req.documents) or (
+            route.rewritten_query is not None and about_the_documents(route.rewritten_query, req.documents)
+        )
+        searched = validate(proposal.model_copy(update={"intent": "document_qa"}), req, llm_ms=decision.llm_ms)
+        query = searched.route.rewritten_query or req.utterance
+        t0 = time.perf_counter()
+        lookup: Prefetched = asyncio.ensure_future(speculation.result_for(query, searched.route.query_en))
+        try:
+            await asyncio.wait({lookup}, timeout=self.fact_wait_s)
+        except BaseException:
+            lookup.cancel()
+            raise
+        waited = round((time.perf_counter() - t0) * 1000, 1)
+        found = lookup.done() and not lookup.cancelled() and lookup.exception() is None
+        confidence = lookup.result()[0].confidence if found else None
+        score = f"{confidence.top_score:.2f}" if confidence is not None else "none"
+        was = route.intent
+        intent: Intent
+        if confidence is not None and confidence.above_threshold:
+            strong = about or confidence.top_score >= self.fast_accept
+            intent = "document_qa" if strong and not asks_for_judgement(req.utterance) else "mixed"
+            why = f"{was}→{intent}: the documents match ({score})"
+        elif about:  # about the documents' subject: searched, and if they don't say, the answer abstains
+            intent = "document_qa"
+            found_part = f"best match {score}" if lookup.done() else "retrieval still running"
+            why = f"{was}→document_qa: asks about the documents' subject ({found_part})"
+        else:
+            lookup.cancel()
+            kept = f"{was} kept: " + ("the documents don't match" if lookup.done() else "retrieval too slow")
+            overrides = (*decision.overrides, f"{kept} ({score})")
+            return replace(decision, overrides=overrides, retrieval_wait_ms=waited), None
+        upgraded = searched.route.model_copy(update={"intent": intent, "confidence": CONFIDENCE["llm_overridden"]})
+        overrides = (*decision.overrides, *searched.overrides, why)
+        return replace(searched, route=upgraded, overrides=overrides, retrieval_wait_ms=waited), lookup
 
     async def _ask_router(self, req: RouteRequest, speculation: SpeculativeRetrieval | None) -> RouteDecision:
         """The router model's validated proposal, raced against a confident speculative retrieval for standalone

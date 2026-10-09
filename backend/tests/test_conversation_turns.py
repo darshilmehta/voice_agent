@@ -170,6 +170,41 @@ async def test_an_unrelated_question_skips_retrieval_and_says_so(world):
     assert "not about the user's documents" in system and "Never claim" in system and "[S1]" in system
 
 
+async def test_b1_b9_document_questions_routed_general_are_searched_and_unanswered_ones_abstain(world):
+    """B1: the 4B router labels document questions "general"; they are checked against the documents. B9: one the
+    documents can't answer abstains, and the summary lists it among the unanswered questions."""
+    from app.services.chat_summary import prepare
+
+    world.fakes.llm.route = routes(
+        {
+            "Which segment drove the revenue growth?": {"intent": "general_qa", "query": None},
+            "How many employees did the company have at year end?": {"intent": "general_qa", "query": None},
+            "What's the capital of France?": {"intent": "general_qa", "query": None},
+        }
+    )
+    events, agent = await say(world, "Which segment drove the revenue growth?")
+    r = agent.route
+    assert (r["intent"], r["answer"], r["abstained"]) == ("document_qa", "grounded", False)
+    assert agent.citations and agent.text.startswith("Revenue grew 34%")
+    assert r["router"]["overrides"][-1].startswith("general_qa→document_qa: the documents match")
+    assert r["router"]["retrieval_wait_ms"] is not None and r["speculation"] == "used"
+    events, agent = await say(world, "How many employees did the company have at year end?")
+    r = agent.route
+    assert (r["intent"], r["answer"], r["abstained"], r["abstain_reason"]) == (
+        "document_qa",
+        "grounded",
+        True,
+        "not_covered",
+    )
+    assert sources_of(events).abstained
+    _, agent = await say(world, "What's the capital of France?")  # truly general: not searched, not unanswered
+    assert (agent.route["answer"], agent.route["abstained"]) == ("general", False)
+    messages = (await MessageService(world.db).list(world.chat_id)).items
+    assert [q.question for q in prepare(messages).unanswered] == [
+        "How many employees did the company have at year end?"
+    ]
+
+
 async def test_acknowledgements_and_thanks_get_short_fixed_replies_never_an_abstention(world):
     _, first = await say(world, "okay")
     assert (first.role, first.text, first.route["intent"], first.route["answer"]) == (

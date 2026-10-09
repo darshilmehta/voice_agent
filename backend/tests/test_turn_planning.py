@@ -1,9 +1,11 @@
 """Planning a turn (services/planning.py) on fake retrieval and a scripted router model: the fast path, speculative
 retrieval used / reused / discarded, the race against a confident retrieval, timeouts and failures falling back to a
-document question, and the retrieval policy."""
+document question, the retrieval policy, and (B1) "general" proposals for questions about facts checked against the
+documents."""
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +14,7 @@ from app.domain.conversation import ConversationState
 from app.providers.llm import LLMUnavailableError
 from app.providers.retrieval import IndexedChunk
 from app.services.planning import TurnPlanner, interrupted_answer, policy
-from app.services.retrieval import Confidence, RetrievalService
+from app.services.retrieval import RetrievalService
 from app.services.router import LLMTurnRouter, RouteDecision, RouteRequest, validate
 
 from .fakes import FakeEmbedder, FakeLLM, FakeReranker, FakeStore, keyword_scorer, make_chunk, vector_for
@@ -212,14 +214,120 @@ async def test_a_validation_bug_falls_back_instead_of_ending_the_turn(world, mon
     assert p.decision.source == "fallback" and "validation failed: KeyError" in p.decision.error
 
 
-def test_a_general_question_the_documents_answer_well_becomes_mixed():
-    ranked = SimpleNamespace(confidence=Confidence(0.9, 0.5, 0.8, True))
-    speculation = SimpleNamespace(peek=lambda: ranked)
-    r = req("What is an EBITDA margin?")
-    decision = validate(proposal("general_qa"), r)
-    p = policy(decision, r, has_documents=True, retrieval_enabled=True, speculation=speculation)  # type: ignore[arg-type]
-    assert (p.mode, p.decision.route.needs_retrieval) == ("mixed", True)
-    assert p.decision.overrides == ("general_qa→mixed: documents match (0.90)",)
+# ------------------------------------------------------------------ B1: "general" questions about facts
+
+
+class SlowReranker(FakeReranker):
+    """Retrieval under load: the reranker takes ``delay`` seconds (the router model is faster)."""
+
+    def __init__(self, delay: float) -> None:
+        super().__init__(keyword_scorer)
+        self.delay = delay
+
+    async def score(self, query, passages):
+        await asyncio.sleep(self.delay)
+        return await super().score(query, passages)
+
+
+EMPLOYEES = "How many employees did the company have at year end?"
+
+
+@pytest.fixture
+async def b1(world):
+    """The world with a headcount passage and a reranker slower than the router (the B1 race)."""
+    text = "The company had 9,842 employees at year end, up from 9,310."
+    await world.store.upsert([IndexedChunk(make_chunk(9, text=text, page_start=12, page_end=12), vector_for(text))])
+    world.reranker = SlowReranker(0.3)
+    world.planner.retrieval.reranker = world.reranker
+    world.llm.json_delay = 0.05
+    return world
+
+
+async def test_b1_a_fact_question_routed_general_waits_for_retrieval_and_is_answered_from_the_documents(b1):
+    b1.llm.route = {"intent": "general_qa", "query": None}
+    p = await plan(b1, req(EMPLOYEES))
+    assert (p.intent, p.mode, p.needs_retrieval) == ("document_qa", "grounded", True)
+    assert p.decision.overrides[-1].startswith("general_qa→document_qa: the documents match (")
+    wait = p.decision.retrieval_wait_ms
+    assert 150 < wait < 600 and p.decision.record()["retrieval_wait_ms"] == wait  # the reranker's 0.3 s, not more
+    result, outcome = await p.prefetched  # the turn's retrieval: not run again
+    assert outcome == "used" and result.chunks[0].chunk.text.startswith("The company had 9,842 employees")
+    assert len(b1.reranker.calls) == 1
+
+
+async def test_b1_no_wait_when_retrieval_finished_first(b1):
+    b1.reranker.delay, b1.llm.json_delay = 0.0, 0.3
+    b1.planner.fast_accept = 1.1  # no shortcut: the router answers, then its proposal is checked
+    b1.llm.route = {"intent": "general_qa", "query": None}
+    p = await plan(b1, req(EMPLOYEES))
+    assert p.intent == "document_qa" and p.decision.retrieval_wait_ms < 50
+
+
+async def test_b1_the_wait_is_bounded(b1):
+    b1.planner.fact_wait_s, b1.reranker.delay = 0.1, 0.5
+    b1.llm.route = {"intent": "general_qa", "query": None}
+    p = await plan(b1, req(EMPLOYEES))  # about the documents' subject ("the company"): searched anyway
+    assert p.intent == "document_qa" and "retrieval still running" in p.decision.overrides[-1]
+    assert 90 < p.decision.retrieval_wait_ms < 250 and not p.prefetched.done()
+    result, _ = await p.prefetched  # the turn waits for the rest of it, without searching again
+    assert result.chunks and len(b1.reranker.calls) == 1
+    p = await plan(b1, req("Who won the cricket world cup in 2011?"))  # nothing points at the documents
+    assert (p.intent, p.mode, p.prefetched) == ("general_qa", "general", None)
+    assert p.decision.overrides[-1] == "general_qa kept: retrieval too slow (none)"
+
+
+async def test_b1_definitions_and_how_tos_stay_general_without_waiting(b1):
+    text = "EBITDA means earnings before interest, tax, depreciation and amortisation."
+    await b1.store.upsert([IndexedChunk(make_chunk(10, text=text), vector_for(text))])
+    b1.reranker.scorer = lambda q, passage: 0.95  # the glossary matches very well
+    for utterance in ("What is EBITDA?", "What does EBITDA stand for?", "How is EBITDA calculated?"):
+        b1.llm.route = {"intent": "general_qa", "query": None}
+        p = await plan(b1, req(utterance))
+        assert (p.mode, p.needs_retrieval, p.prefetched) == ("general", False, None), utterance
+        assert p.decision.retrieval_wait_ms is None
+
+
+async def test_b1_a_general_fact_the_documents_dont_match_stays_general(b1):
+    b1.reranker.delay = 0.05
+    b1.llm.route = {"intent": "general_qa", "query": None}
+    p = await plan(b1, req("Who won the cricket world cup in 2011?"))
+    assert (p.intent, p.mode, p.needs_retrieval, p.prefetched) == ("general_qa", "general", False, None)
+    assert p.decision.overrides[-1].startswith("general_qa kept: the documents don't match")
+
+
+async def test_b1_a_weaker_match_without_the_documents_subject_is_mixed(b1):
+    b1.reranker.scorer = lambda q, passage: 0.3 if "supplier" in passage else 0.0
+    text = "Fluoropolymer resin depends on a single supplier in Japan."
+    await b1.store.upsert([IndexedChunk(make_chunk(11, text=text), vector_for(text))])
+    b1.llm.route = {"intent": "conversation", "query": None}
+    p = await plan(b1, req("Which product depends on a single supplier?"))
+    assert (p.intent, p.mode, p.needs_retrieval) == ("mixed", "mixed", True)
+    assert p.decision.overrides[-1] == "conversation→mixed: the documents match (0.30)"
+
+
+async def test_b1_a_hindi_profit_question_routed_general_searches_in_english(b1):
+    hindi = "कंपनी का मुनाफा कितना था?"
+    text = "Profit after tax was 871 crore in FY24."
+    await b1.store.upsert([IndexedChunk(make_chunk(12, text=text), vector_for(text))])
+    b1.llm.route = {"intent": "general_qa", "query": "What was the company's profit after tax?"}
+    p = await plan(b1, req(hindi, language="hi"))
+    assert (p.intent, p.mode, p.query, p.query_en) == (
+        "document_qa",
+        "grounded",
+        hindi,
+        "What was the company's profit after tax?",
+    )
+    result, outcome = await p.prefetched
+    assert outcome == "reused_search" and result.rerank_query == p.query_en
+    assert result.chunks[0].chunk.text == text
+
+
+async def test_b1_a_question_about_the_company_the_documents_dont_answer_abstains(b1):
+    b1.reranker.scorer = lambda q, passage: 0.0
+    b1.llm.route = {"intent": "general_qa", "query": None}
+    p = await plan(b1, req("Who was the company's statutory auditor in FY24?"))
+    assert (p.intent, p.mode, p.needs_retrieval) == ("document_qa", "grounded", True)
+    assert p.decision.overrides[-1] == "general_qa→document_qa: asks about the documents' subject (best match 0.00)"
 
 
 def test_a_second_acknowledgement_in_a_row_gets_nothing():
