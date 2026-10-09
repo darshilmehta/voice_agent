@@ -301,9 +301,12 @@ class DocumentPipeline:
             await self._purge_vectors(doc_id)
             return
         for listener in self.listeners:
-            await listener.document_ready(
-                target.project_id, doc_id, target.version, parsed=result.document, chunks=result.chunks
-            )
+            try:  # listeners must not raise; a bug in one must never fail a document that is already READY
+                await listener.document_ready(
+                    target.project_id, doc_id, target.version, parsed=result.document, chunks=result.chunks
+                )
+            except Exception:
+                log.exception("listener %r failed after document %s became READY", listener, doc_id)
         t = result.timings
         log.info(
             "document %s READY: %s pages, %d chunks, %d tables in %.1fs (parse %.1fs, embed %.1fs)",
@@ -334,7 +337,10 @@ class DocumentPipeline:
         await self.documents.delete(document_id)
         await self._delete_files(f"{files.project_id}/{document_id}", files.storage_keys)
         for listener in self.listeners:
-            await listener.document_deleted(files.project_id, document_id)
+            try:
+                await listener.document_deleted(files.project_id, document_id)
+            except Exception:
+                log.exception("listener %r failed after document %s was deleted", listener, document_id)
 
     async def delete_project(self, project_id: str) -> None:
         """Delete a project: its vectors, rows (documents, chats, messages, summaries cascade) and stored files."""
