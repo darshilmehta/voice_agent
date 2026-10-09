@@ -36,11 +36,81 @@ _WORD = re.compile(r"\S+")
 _BRACKETED = re.compile(r"\[[^\]]*\]")
 
 
-def spoken_text(raw: str) -> str:
-    """What TTS should say for a piece of answer text: no [S#] markers, no markdown, single spaces. Empty if nothing
-    speakable (only punctuation or markers) remains."""
-    text = _SPACE.sub(" ", _MARKDOWN.sub("", strip_markers(raw))).strip()
+def spoken_text(raw: str, *, sentence_start: bool = True) -> str:
+    """What TTS should say for a piece of answer text: [S#] / [W#] markers dropped, or said as "a web source" / "one
+    source" where the sentence uses them as a word (``speakable_markers``), no markdown, single spaces. Empty if
+    nothing speakable (only punctuation or markers) remains. ``sentence_start``: the piece starts a sentence (a marker
+    that opens it is said with a capital letter)."""
+    text = speakable_markers(raw, sentence_start=sentence_start)
+    text = _SPACE.sub(" ", _MARKDOWN.sub("", strip_markers(text))).strip()
     return text if any(ch.isalnum() for ch in text) else ""
+
+
+# Citation markers as words (quality round, item 6): "[W1] mentions that the rupee rose" was spoken "However,
+# mentions that…". A marker group ("[W1]", "[S1][S2]", "[W1] and [W2]") that is the subject of its clause (it opens
+# the clause and a word follows) or the object of a preposition ("according to [W1]", "as reported by [S2]", Hindi
+# "[W1] के अनुसार") is said as what it is; anywhere else it is dropped, with the space before it.
+_MARKER_GROUP = re.compile(
+    r"(\s*)\[\s*[SW]\d+(?:\s*[,;]\s*[SW]\d+)*\s*\](?:(?:\s*(?:,|and|और)?\s*)\[\s*[SW]\d+(?:\s*[,;]\s*[SW]\d+)*\s*\])*",
+    re.IGNORECASE,
+)
+_MARKER_ID = re.compile(r"([SW])\d+", re.IGNORECASE)
+_CLAUSE_OPENERS = {"and", "but", "however", "while", "whereas", "also", "though", "although", "so", "then", "yet"}
+_PREPOSITIONS = {
+    "to",
+    "per",
+    "by",
+    "from",
+    "in",
+    "on",
+    "see",
+    "cites",
+    "cite",
+    "citing",
+    "as",
+    "than",
+    "at",
+    "under",
+    "with",
+}
+_POSTPOSITIONS = {"के", "की", "का", "में", "ने", "से", "पर", "द्वारा", "अनुसार", "को"}
+_SPOKEN_SOURCE = {
+    # (language, web, several) → words
+    ("en", True, False): "a web source",
+    ("en", True, True): "web sources",
+    ("en", False, False): "one source",
+    ("en", False, True): "the sources",
+    ("hi", True, False): "एक स्रोत",
+    ("hi", True, True): "कुछ स्रोत",
+    ("hi", False, False): "एक स्रोत",
+    ("hi", False, True): "कुछ स्रोत",
+}
+
+
+def speakable_markers(text: str, *, sentence_start: bool = True) -> str:
+    """``text`` with each citation marker group that is used as a word replaced by words ("a web source", "one source",
+    "एक स्रोत"), the others left for ``strip_markers``."""
+    hindi = any("ऀ" <= ch <= "ॿ" for ch in text)
+
+    def replace(m: re.Match[str]) -> str:
+        before = text[: m.start()].rstrip()
+        after = text[m.end() :].lstrip()
+        prev = re.sub(r"[^\wऀ-ॿ]", "", before.split()[-1]).casefold() if before.split() else ""
+        nxt = re.sub(r"[^\wऀ-ॿ]", "", after.split()[0]) if after.split() else ""
+        opens = (not before and (sentence_start or after)) or before[-1:] in ".!?।,;:—" or prev in _CLAUSE_OPENERS
+        subject = opens and bool(nxt) and nxt[:1].isalpha() and nxt.casefold() not in {"and", "or"}
+        objected = (prev in _PREPOSITIONS and before[-1:].isalnum()) or nxt in _POSTPOSITIONS
+        if not (subject or objected):
+            return m.group(0)  # a citation after a fact: dropped by strip_markers
+        kinds = {k.upper() for k in _MARKER_ID.findall(m.group(0))}
+        several = len(_MARKER_ID.findall(m.group(0))) > 1
+        words = _SPOKEN_SOURCE[("hi" if hindi else "en", kinds == {"W"}, several)]
+        at_start = (not before and sentence_start) or before[-1:] in ".!?।"
+        if at_start and not hindi:
+            words = words[:1].upper() + words[1:]
+        return m.group(1) + words
+
+    return _MARKER_GROUP.sub(replace, text)
 
 
 def _mask_brackets(text: str) -> str:
@@ -76,6 +146,7 @@ class SpeechChunker:
     def __init__(self, *, max_sentences: int | None = None) -> None:
         self._buffer = ""
         self._first = True
+        self._sentence_start = True  # the next chunk starts a sentence
         self._sentences = 0
         self.max_sentences = max_sentences
         self.spoken: list[str] = []  # every chunk returned, in order
@@ -105,7 +176,8 @@ class SpeechChunker:
     def _emit(self, raw: str, sentence: bool, out: list[str]) -> None:
         if self.exhausted:
             return
-        text = spoken_text(raw)
+        text = spoken_text(raw, sentence_start=self._sentence_start)
+        self._sentence_start = sentence
         if not text:
             return
         self._first = False

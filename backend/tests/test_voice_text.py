@@ -217,3 +217,39 @@ def test_fillers_are_only_non_lexical_sounds():
     assert is_filler("Hmm.") and is_filler("Mm-hmm") and is_filler("uh, um")
     assert not is_filler("Okay.") and not is_filler("") and not is_filler("hmm what")
     assert real_words("No wait") == 2 and real_words("M M") == 0 and real_words("you") == 0
+
+
+# ------------------------------------------------------------------ citation markers as words (quality round, item 6)
+
+
+@pytest.mark.parametrize(
+    ("raw", "said"),
+    [
+        ("[W1] mentions that the rupee rose 0.3% today.", "A web source mentions that the rupee rose 0.3% today."),
+        ("However, [W1] mentions that the rupee rose.", "However, a web source mentions that the rupee rose."),
+        ("According to [W1], the rupee rose.", "According to a web source, the rupee rose."),
+        ("The rupee rose, as reported by [W2].", "The rupee rose, as reported by a web source."),
+        ("[S1][S2] show that revenue grew.", "The sources show that revenue grew."),
+        ("[W1] and [W2] say the market fell.", "Web sources say the market fell."),
+        (
+            "The report says margins rose [S1], while [W1] notes the stock fell.",
+            "The report says margins rose, while a web source notes the stock fell.",
+        ),
+        ("Revenue was 18.2% [S1]. EBITDA rose [S1][S2].", "Revenue was 18.2%. EBITDA rose."),  # citations: dropped
+        ("Revenue rose 12% [S1] and profit fell 5% [S2].", "Revenue rose 12% and profit fell 5%."),
+        ("[W1] के अनुसार रुपया मज़बूत हुआ।", "एक स्रोत के अनुसार रुपया मज़बूत हुआ।"),
+        ("[W1] बताता है कि रुपया मज़बूत हुआ।", "एक स्रोत बताता है कि रुपया मज़बूत हुआ।"),
+        ("राजस्व 7,365 करोड़ रुपये था [S1]।", "राजस्व 7,365 करोड़ रुपये था।"),
+    ],
+)
+def test_a_citation_used_as_a_word_is_said_and_any_other_dropped(raw, said):
+    assert spoken_text(raw) == said
+
+
+def test_a_marker_opening_a_chunk_mid_sentence_is_said_in_lower_case():
+    chunks = chunk_stream("However, [W1] mentions that the rupee rose 0.3% today. [W2] adds that it closed higher.")
+    assert chunks == [
+        "However, a web source mentions that the rupee",
+        "rose 0.3% today.",
+        "A web source adds that it closed higher.",
+    ]
