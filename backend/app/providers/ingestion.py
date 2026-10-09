@@ -209,6 +209,14 @@ def document_label(source_name: str, title: str | None) -> str:
     return name
 
 
+def split_document_label(label: str) -> tuple[str, str]:
+    """A document label as (file name words, title): ``"valmora annual report fy24: Valmora Industries Limited"`` →
+    (``"valmora annual report fy24"``, ``"Valmora Industries Limited"``). The title is empty when the label has none
+    (the chunk sits under the title, or the document has none)."""
+    name, sep, title = label.partition(": ")
+    return (name.strip(), title.strip()) if sep else (label.strip(), "")
+
+
 def chunk_id(document_id: str, version: int, index: int) -> str:
     return f"{document_id}:v{version}:{index:04d}"
 

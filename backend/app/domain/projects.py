@@ -120,6 +120,7 @@ class DocumentTable(Record):
 
 
 SNIPPET_CHARS = 300
+SECTION_SEPARATOR = " > "  # joins a heading path into ``Citation.section``
 
 
 CitationKind = Literal["document", "web"]
@@ -136,6 +137,7 @@ class CitationJSON(TypedDict):
     page_end: int | None
     chunk_id: str
     snippet: str
+    section: NotRequired[str | None]
     kind: NotRequired[CitationKind]
     url: NotRequired[str | None]
     title: NotRequired[str | None]
@@ -151,7 +153,12 @@ class Citation(BaseModel):
     Web citations carry ``kind: "web"``, ``url``, ``title``, ``site`` (host) and ``published`` (when the engine gave
     a date); their ``filename`` is the site, ``document_id`` and ``chunk_id`` are empty and there are no pages.
     Document citations serialize exactly as before web search existed (no ``kind`` or web fields): a citation without
-    ``kind`` is a document passage."""
+    ``kind`` is a document passage.
+
+    ``section`` is the cited chunk's heading path ("4. Travel > 4.2 Domestic > 4.2.1 Hotels"), None for a chunk
+    without headings (and for web results, which leave it out of their JSON). It is what a DOCX, MD or TXT passage
+    is located by, since those have no pages (Docling gives DOCX none); where a page exists the page wins in every
+    label, and the section stays available as detail."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -162,6 +169,7 @@ class Citation(BaseModel):
     page_end: int | None
     chunk_id: str
     snippet: str
+    section: str | None = None
     kind: CitationKind = "document"
     url: str | None = None
     title: str | None = None
@@ -174,6 +182,8 @@ class Citation(BaseModel):
         if self.kind == "document":
             for name in _WEB_FIELDS:
                 data.pop(name, None)
+        else:
+            data.pop("section", None)
         return data
 
     @classmethod
@@ -199,6 +209,7 @@ class Citation(BaseModel):
             page_end=end if end is not None else (start if start is not None else page),
             chunk_id=str(value.get("chunk_id") or ""),
             snippet=str(value.get("snippet") or value.get("text") or "")[:SNIPPET_CHARS],
+            section=None if web else _str_or_none(value.get("section")),
             **web,
         )
 

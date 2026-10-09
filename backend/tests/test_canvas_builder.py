@@ -498,5 +498,6 @@ def test_contract_shape():
         "page_end",
         "chunk_id",
         "snippet",
+        "section",
     }
     assert set(Calculation.model_fields) == {"label", "op", "value", "unit", "inputs", "formula_text"}

@@ -27,6 +27,7 @@ from ..providers.llm import LLMClient, LLMMessage
 from ..providers.storage import MetadataDB
 from ..settings import Settings
 from .base import NotFound, Service
+from .chat_sources import section_label
 from .conversation import loop_local
 from .messages import MessageService
 from .prompts import MEMORY_PROMPT_VERSION, memory_system_prompt, memory_user_prompt
@@ -133,8 +134,17 @@ def transcript(messages: list[Message]) -> str:
         if len(text) > MESSAGE_CHARS:
             text = text[: MESSAGE_CHARS - 1] + "…"
         if m.role == "agent":
-            pages = [c for c in m.citations if c.kind == "document" and c.page_start is not None]
-            cited = sorted({f"{c.filename} p.{c.page_start}" for c in pages})
+            docs = [c for c in m.citations if c.kind == "document"]
+            # A page wins; a document without pages (DOCX) is located by its section.
+            cited = sorted(
+                {
+                    f"{c.filename} p.{c.page_start}"
+                    if c.page_start is not None
+                    else f"{c.filename} {section_label(c.section)}"
+                    for c in docs
+                    if c.page_start is not None or c.section
+                }
+            )
             web = sorted({f"web: {c.site or c.url}" for c in m.citations if c.kind == "web"})  # live data, §3.7
             if cited or web:
                 text += f" (sources: {', '.join([*cited, *web])})"

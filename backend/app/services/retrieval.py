@@ -8,13 +8,16 @@
 
 ``search`` and ``rerank`` are public so the voice loop can start retrieval speculatively on the raw utterance and
 rerank once the router's English query arrives (§3.3 d, §9.5). Deciding to answer or abstain is the caller's job,
-with ``Confidence.above_threshold`` as the gate: the best reranker score reaches ``min_rerank_score`` and the best
-passage states every fiscal year the question names (tuned on the phase-2 eval set, docs/DESIGN.md §9.2).
+with ``Confidence.above_threshold`` as the gate: the best reranker score reaches ``min_rerank_score``, the best
+passage states every fiscal year the question names (tuned on the phase-2 eval set, docs/DESIGN.md §9.2) and, in a
+chat of several documents, it is about the company or entity the question names (``subjects.py``: a question about
+Valmora is not answered from Zephyra's deck).
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 from collections.abc import Sequence
@@ -25,8 +28,12 @@ from ..providers.ingestion import Chunk
 from ..providers.registry import Container
 from ..providers.retrieval import Embedder, Reranker, RetrievalFilters, SearchHit, VectorStore
 from ..settings import RetrievalSection
+from .subjects import NamedDocuments, named_documents
+
+log = logging.getLogger(__name__)
 
 RRF_K = 60  # the usual reciprocal-rank-fusion constant (also Qdrant's)
+LABEL_TTL_S = 300.0  # how long a document's label is remembered (it changes only when the document is re-indexed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,10 +50,14 @@ class Confidence:
     top_score: float  # reranker score of the best passage
     gap: float  # top score minus runner-up's (the top score itself when there is a single candidate)
     dense_similarity: float | None  # cosine(query, best passage)
-    # The gate: answer only when this is True. top_score ≥ retrieval.min_rerank_score, and the best passage states
-    # every fiscal period the question names (``missing_periods`` empty).
+    # The gate: answer only when this is True. top_score ≥ retrieval.min_rerank_score, the best passage states
+    # every fiscal period the question names (``missing_periods`` empty) and is about the document the question names
+    # (``missing_subjects`` empty).
     above_threshold: bool
     missing_periods: tuple[int, ...] = ()  # fiscal years (FY24 → 24) asked about but absent from the best passage
+    # Names (lower case, "valmora") the question is about that none of the passages found are about: the question
+    # names one company's documents, and only another's came back (see ``prefer_named_documents``).
+    missing_subjects: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,10 +105,16 @@ def rank_by_scores(hits: Sequence[SearchHit], scores: Sequence[float]) -> list[R
 
 
 def confidence_of(
-    ranked: Sequence[RankedChunk], min_score: float, *, queries: Sequence[str | None] = ()
+    ranked: Sequence[RankedChunk],
+    min_score: float,
+    *,
+    queries: Sequence[str | None] = (),
+    missing_subjects: tuple[str, ...] = (),
 ) -> Confidence | None:
     """The confidence signals of a reranked list and the gate's decision. ``queries``: the question as asked and its
-    English query; the fiscal periods they name must be stated by the best passage (see ``missing_periods``)."""
+    English query; the fiscal periods they name must be stated by the best passage (see ``missing_periods``).
+    ``missing_subjects``: from ``prefer_named_documents``; a question that names a document nothing found is about
+    is never answered."""
     if not ranked:
         return None
     top = ranked[0]
@@ -107,9 +124,37 @@ def confidence_of(
         top_score=top.rerank_score,
         gap=top.rerank_score - runner_up,
         dense_similarity=top.dense_score,
-        above_threshold=top.rerank_score >= min_score and not missing,
+        above_threshold=top.rerank_score >= min_score and not missing and not missing_subjects,
         missing_periods=missing,
+        missing_subjects=missing_subjects,
     )
+
+
+# ------------------------------------------------------------------ the documents a question names
+
+
+def prefer_named_documents(
+    ranked: Sequence[RankedChunk], named: NamedDocuments | None
+) -> tuple[list[RankedChunk], tuple[str, ...]]:
+    """Reranked passages restricted to what the question names: (passages, missing subjects).
+
+    The reranker scores relevance, not whose figure it is: "How many electric vehicles does Valmora run?" scored
+    Zephyra's fleet 0.61 (phase-2 eval) and the answer step quoted it as Valmora's. When the question names documents
+    (``subjects.named_documents``) and the best passage is neither from one of them nor mentions the name, only the
+    passages that are (from a named document, or saying the name) are kept, best first. When none is, nothing found is
+    about what was asked: the list is returned as it was, with the names as the missing subjects, which the gate
+    treats as not covered. A best passage that is about the question's subject, a question naming no document and a
+    single-document chat change nothing."""
+    if named is None or not ranked:
+        return list(ranked), ()
+
+    def about(r: RankedChunk) -> bool:
+        return r.chunk.document_id in named.document_ids or named.mentioned_in(r.chunk.embed_text)
+
+    if about(ranked[0]):
+        return list(ranked), ()
+    kept = [r for r in ranked if about(r)]
+    return (kept, ()) if kept else (list(ranked), named.names)
 
 
 # ------------------------------------------------------------------ fiscal periods (near-miss abstention)
@@ -179,6 +224,7 @@ class RetrievalService:
         self.reranker = reranker
         self.store = store
         self.config = config
+        self._labels: dict[str, tuple[float, str]] = {}  # document id → (when fetched, its label)
 
     @classmethod
     def from_container(cls, container: Container) -> RetrievalService:
@@ -203,14 +249,36 @@ class RetrievalService:
     async def _search(
         self, query: str, *, project_id: str, document_ids: Sequence[str] | None, query_en: str | None
     ) -> tuple[list[SearchHit], dict[str, float]]:
-        filters = RetrievalFilters(project_id, tuple(document_ids) if document_ids is not None else None)
+        filters = scope_of(project_id, document_ids)
         t0 = time.perf_counter()
         vectors = await self.embedder.embed(_queries(query, query_en))  # one forward pass for both queries
         t1 = time.perf_counter()
-        lists = await asyncio.gather(*(self.store.hybrid_search(v, filters) for v in vectors))
+        # The documents' labels are fetched beside the search (and remembered), so ranking finds them ready.
+        lists, _ = await asyncio.gather(
+            asyncio.gather(*(self.store.hybrid_search(v, filters) for v in vectors)), self.document_labels(filters)
+        )
         t2 = time.perf_counter()
         hits = fuse_hit_lists(lists, limit=self.config.prefetch_k)
         return hits, {"embed": _ms(t1 - t0), "search": _ms(t2 - t1)}
+
+    async def document_labels(self, filters: RetrievalFilters) -> dict[str, str]:
+        """document id → label (file name and title) of the documents in ``filters``, for ``subjects.named_documents``.
+        Only for a scope of several named documents (a chat's); remembered for ``LABEL_TTL_S``. A store that can't
+        tell, or one that fails, gives no labels: retrieval then simply doesn't check whose passage it found."""
+        ids = filters.document_ids
+        if ids is None or len(ids) < 2:
+            return {}
+        now = time.monotonic()
+        stale = [d for d in ids if d not in self._labels or now - self._labels[d][0] > LABEL_TTL_S]
+        if stale:
+            try:
+                fetched = await self.store.document_labels(RetrievalFilters(filters.project_id, tuple(stale)))
+            except Exception as e:  # a missing label only turns the subject check off
+                log.warning("document labels unavailable (%s): %s", type(e).__name__, e)
+                fetched = {}
+            for d, label in fetched.items():
+                self._labels[d] = (now, label)
+        return {d: self._labels[d][1] for d in ids if d in self._labels and self._labels[d][1]}
 
     async def rerank(
         self, query: str, hits: Sequence[SearchHit], *, native_query: str | None = None
@@ -245,7 +313,8 @@ class RetrievalService:
     ) -> RetrievalResult:
         t0 = time.perf_counter()
         hits, timings = await self._search(query, project_id=project_id, document_ids=document_ids, query_en=query_en)
-        return await self.rank(query, hits, query_en=query_en, timings=timings, started=t0)
+        scope = scope_of(project_id, document_ids)
+        return await self.rank(query, hits, query_en=query_en, timings=timings, started=t0, scope=scope)
 
     async def search_timed(
         self,
@@ -266,19 +335,26 @@ class RetrievalService:
         query_en: str | None = None,
         timings: dict[str, float] | None = None,
         started: float | None = None,
+        scope: RetrievalFilters | None = None,
     ) -> RetrievalResult:
         """Rerank search hits and build the result (the second half of ``retrieve``): the reranker scores
-        ``query_en`` when given. ``started`` (a ``perf_counter`` value) is when the search began, for the total."""
+        ``query_en`` when given. ``started`` (a ``perf_counter`` value) is when the search began, for the total.
+        ``scope``: where the hits were searched; with several documents in it, a question that names one company's
+        documents is answered from those (``prefer_named_documents``). Without it passages are taken as they come."""
         t1 = time.perf_counter()
         rerank_query = (query_en or "").strip() or query
         ranked = await self.rerank(rerank_query, hits, native_query=query if rerank_query != query else None)
+        named = named_documents((query, query_en), await self.document_labels(scope)) if scope is not None else None
+        ranked, missing_subjects = prefer_named_documents(ranked, named)
         t2 = time.perf_counter()
         return RetrievalResult(
             query=query,
             rerank_query=rerank_query,
             chunks=ranked[: self.config.rerank_top_n],
             candidate_count=len(hits),
-            confidence=confidence_of(ranked, self.config.min_rerank_score, queries=(query, query_en)),
+            confidence=confidence_of(
+                ranked, self.config.min_rerank_score, queries=(query, query_en), missing_subjects=missing_subjects
+            ),
             timings_ms={
                 **(timings or {}),
                 "rerank": _ms(t2 - t1),
@@ -289,6 +365,10 @@ class RetrievalService:
 
 def _ms(seconds: float) -> float:
     return round(seconds * 1000, 1)
+
+
+def scope_of(project_id: str, document_ids: Sequence[str] | None) -> RetrievalFilters:
+    return RetrievalFilters(project_id, tuple(document_ids) if document_ids is not None else None)
 
 
 # ------------------------------------------------------------------ speculative retrieval
@@ -342,9 +422,13 @@ class SpeculativeRetrieval:
             if task is not None:
                 task.add_done_callback(_ignore_failure)
 
+    @property
+    def scope(self) -> RetrievalFilters:
+        return scope_of(self.project_id, self.document_ids)
+
     async def _rank(self) -> RetrievalResult:
         hits, timings = await asyncio.shield(self._search)
-        return await self.service.rank(self.query, hits, timings=timings, started=self.started)
+        return await self.service.rank(self.query, hits, timings=timings, started=self.started, scope=self.scope)
 
     @property
     def reranks(self) -> bool:
@@ -377,7 +461,8 @@ class SpeculativeRetrieval:
             if self._ranked is not None:
                 return await self._ranked, "used"
             hits, timings = await self._search
-            return await self.service.rank(query, hits, timings=timings, started=self.started), "used"
+            ranked = await self.service.rank(query, hits, timings=timings, started=self.started, scope=self.scope)
+            return ranked, "used"
         if self._ranked is not None:
             self._ranked.cancel()  # scored the wrong query; the reranker should score the English one
         hits, timings = await self._search
@@ -385,7 +470,9 @@ class SpeculativeRetrieval:
         en_hits = await self.service.search(en, project_id=self.project_id, document_ids=self.document_ids)
         fused = fuse_hit_lists([hits, en_hits], limit=self.service.config.prefetch_k)
         timings = {**timings, "search_en": _ms(time.perf_counter() - t0)}
-        result = await self.service.rank(query, fused, query_en=en, timings=timings, started=self.started)
+        result = await self.service.rank(
+            query, fused, query_en=en, timings=timings, started=self.started, scope=self.scope
+        )
         return result, "reused_search"
 
     def discard(self) -> None:

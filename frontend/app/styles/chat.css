@@ -699,6 +699,17 @@
   font-weight: 650;
 }
 
+/* A section stands in for the page of a document that has none (DOCX): the last heading, cut when long (the whole
+   path is its tooltip). */
+.cite-section {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .msg-event {
   flex-direction: row;
   align-self: center;

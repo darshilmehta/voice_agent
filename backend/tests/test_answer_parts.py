@@ -73,6 +73,7 @@ def test_sources_are_numbered_grouped_by_section_and_cite_their_chunk():
         page_end=2,
         chunk_id=a0.chunk_id,
         snippet="table: EBITDA margin 18.2%",
+        section="Results",
     )
 
 

@@ -292,6 +292,7 @@ async def test_json_schema(story):
         "page_end": 2,
         "chunk_id": "doc_report:v1:S1:2",
         "snippet": "EBITDA margin improved to 18.2% from 16.9%.",
+        "section": None,
     }
     assert [c["ref"] for c in agent["citations"]] == [1, 2]
     assert (hindi_user["text"], hindi_user["language"]) == ("और राजस्व?", "hi")
@@ -308,6 +309,7 @@ async def test_json_schema(story):
             "page_end": 2,
             "snippet": "EBITDA margin improved to 18.2% from 16.9%.",
             "cited_by": [2],
+            "section": None,
         },
         {
             "ref": 2,
@@ -317,6 +319,7 @@ async def test_json_schema(story):
             "page_end": 3,
             "snippet": "Margins by segment.",
             "cited_by": [2],
+            "section": None,
         },
         {
             "ref": 3,
@@ -326,6 +329,7 @@ async def test_json_schema(story):
             "page_end": 7,
             "snippet": "Revenue +34%.",
             "cited_by": [4],
+            "section": None,
         },
     ]
 

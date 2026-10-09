@@ -260,7 +260,10 @@ def inline_citation(refs: Sequence[SourceRef], language: Language = "en") -> str
     """ "(annual_report.pdf, p. 2; investor_deck.pdf, p. 7)"; a web result's title is text from the web, escaped."""
     return (
         "("
-        + "; ".join(escape_inline(ref_label(r, language)) if r.kind == "web" else ref_label(r, language) for r in refs)
+        + "; ".join(
+            escape_inline(ref_label(r, language)) if r.kind == "web" else ref_label(r, language, escape=escape_inline)
+            for r in refs
+        )
         + ")"
     )
 

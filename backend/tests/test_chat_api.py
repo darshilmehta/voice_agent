@@ -104,7 +104,16 @@ def test_answer_streams_in_contract_order_and_cites_only_what_it_uses(app, fakes
     assert sources["confidence"]["above_threshold"] is True
     assert [s["source_id"] for s in sources["sources"]] == [f"S{i}" for i in range(1, len(sources["sources"]) + 1)]
     for s in sources["sources"]:
-        assert set(s) == {"source_id", "document_id", "filename", "page_start", "page_end", "chunk_id", "snippet"}
+        assert set(s) == {
+            "source_id",
+            "document_id",
+            "filename",
+            "page_start",
+            "page_end",
+            "chunk_id",
+            "snippet",
+            "section",
+        }
         assert s["document_id"] == doc_id and s["filename"] == "annual_report.txt" and len(s["snippet"]) <= 300
 
     table, sentence = source_with(events, "| EBITDA margin"), source_with(events, "improved to 18.2%")
@@ -378,6 +387,7 @@ def test_legacy_free_form_citations_are_read_tolerantly(app):
             "page_end": 46,
             "chunk_id": "c9",
             "snippet": "",
+            "section": None,
         },
         {
             "source_id": "S3",
@@ -387,5 +397,6 @@ def test_legacy_free_form_citations_are_read_tolerantly(app):
             "page_end": 2,
             "chunk_id": "",
             "snippet": "",
+            "section": None,
         },
     ]

@@ -166,7 +166,13 @@ function sourceRefs(sources: SummarySource[], docsById: Record<string, ProjectDo
     const ref = s.web
       ? toSourceRef({ kind: "web", filename: s.filename, site: s.filename }, docsById)
       : toSourceRef(
-          { document_id: s.document_id ?? undefined, filename: s.filename, page_start: s.page_start, page_end: s.page_end },
+          {
+            document_id: s.document_id ?? undefined,
+            filename: s.filename,
+            page_start: s.page_start,
+            page_end: s.page_end,
+            section: s.section,
+          },
           docsById,
         );
     if (seen.has(ref.key)) continue;

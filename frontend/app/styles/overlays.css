@@ -265,6 +265,10 @@
   font-size: 12.5px;
 }
 
+.cite-pop-section {
+  overflow-wrap: anywhere;
+}
+
 .cite-pop-snippet {
   max-height: 220px;
   margin: 10px 0 0;

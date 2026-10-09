@@ -33,6 +33,7 @@ export function normalizeSummary(raw: unknown): ChatSummary {
             filename: str(so.filename, web ? "Web" : "Document") || (web ? "Web" : "Document"),
             page_start: pageStart,
             page_end: pageEnd,
+            section: web ? null : str(so.section).trim() || null,
             ...(web ? { web: true } : {}),
           };
         });

@@ -45,7 +45,13 @@ def test_two_web_results_from_one_site_stay_two_sources_in_summaries():
     assert sources.find(ref).number == 2
     assert ref.model_dump()["url"] == "https://livemint.com/b"
     doc = SourceRef(document_id="d", filename="report.pdf", page_start=2, page_end=2)
-    assert doc.model_dump() == {"document_id": "d", "filename": "report.pdf", "page_start": 2, "page_end": 2}
+    assert doc.model_dump() == {
+        "document_id": "d",
+        "filename": "report.pdf",
+        "page_start": 2,
+        "page_end": 2,
+        "section": None,
+    }
 
 
 def test_web_titles_and_links_are_escaped_in_the_markdown_export():

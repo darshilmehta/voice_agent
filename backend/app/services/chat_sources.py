@@ -5,6 +5,9 @@ chat-wide view needs its own: one number per distinct (document, page range), in
 markers are rewritten to those numbers (``[S2]`` → ``[3]``), which are then what the summary prompt, the summary's
 citations and the exported transcript's sources list all refer to.
 
+A passage without a page (DOCX, MD, TXT) is told apart by its section (``Citation.section``, the heading path), so
+two sections of one DOCX are two sources; where a page exists the page decides and the section is ignored.
+
 Live web results an answer cited (``[W1]``, ``kind: "web"``, §3.7) are numbered the same way, one number per URL,
 and keep their URL and title; as a ``SourceRef`` they are the site with no pages.
 """
@@ -12,11 +15,11 @@ and keep their URL and title; as a ``SourceRef`` they are the site with no pages
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
-from ..domain.projects import Citation
+from ..domain.projects import SECTION_SEPARATOR, Citation
 from ..domain.summaries import SourceRef
 from ..settings import Language
 
@@ -40,6 +43,7 @@ class SourceEntry:
     kind: Literal["document", "web"] = "document"
     url: str | None = None  # web results
     title: str | None = None  # web results
+    section: str | None = None  # documents without pages: the heading path of the first passage cited
 
     def ref(self) -> SourceRef:
         web = {"kind": "web", "url": self.url, "title": self.title} if self.kind == "web" else {}
@@ -48,16 +52,26 @@ class SourceEntry:
             filename=self.filename,
             page_start=self.page_start,
             page_end=self.page_end,
+            section=self.section,
             **web,
         )
 
 
-RefKey = tuple[str, str, int | None, int | None, str | None]
+RefKey = tuple[str, str, int | None, int | None, str | None, str | None]
 
 
 def ref_key(ref: SourceRef) -> RefKey:
-    """Documents by document and pages, web results by URL (two results from one site are two sources)."""
-    return ref.document_id, ref.filename, ref.page_start, ref.page_end, ref.url if ref.kind == "web" else None
+    """Documents by document and pages (a document without pages: by document and section), web results by URL (two
+    results from one site are two sources)."""
+    section = ref.section if ref.kind == "document" and ref.page_start is None else None
+    return (
+        ref.document_id,
+        ref.filename,
+        ref.page_start,
+        ref.page_end,
+        ref.url if ref.kind == "web" else None,
+        section,
+    )
 
 
 class ChatSources:
@@ -86,6 +100,7 @@ class ChatSources:
                 kind=ref.kind,
                 url=ref.url,
                 title=ref.title,
+                section=ref.section if ref.kind == "document" and ref.page_start is None else None,
             )
             self.entries.append(entry)
             self._by_key[ref_key(ref)] = entry
@@ -103,7 +118,11 @@ class ChatSources:
                 mapping[c.source_id.upper()] = self.add_web(c, cited_by=seq).number
                 continue
             ref = SourceRef(
-                document_id=c.document_id, filename=c.filename, page_start=c.page_start, page_end=c.page_end
+                document_id=c.document_id,
+                filename=c.filename,
+                page_start=c.page_start,
+                page_end=c.page_end,
+                section=c.section,
             )
             mapping[c.source_id.upper()] = self.add(ref, snippet=c.snippet, cited_by=seq).number
         return mapping
@@ -156,11 +175,27 @@ def pages_label(start: int | None, end: int | None, language: Language = "en", *
     return f"{'pages' if plural else 'page'} {span}"
 
 
-def ref_label(ref: SourceRef, language: Language = "en", *, short: bool = True) -> str:
-    """ "annual_report.pdf, p. 2"; a web result "web: livemint.com — Infosys share price"."""
+def section_label(section: str | None, *, short: bool = True, escape: Callable[[str], str] | None = None) -> str:
+    """ "§ 4.2.1 Hotels" (the last heading of the path; the whole path, "§ 4. Travel > 4.2 Domestic > 4.2.1 Hotels",
+    when not short). Empty without a section. ``escape`` is applied to each heading (Markdown output: a heading is the
+    document's own text and may hold ``*`` or ``_``)."""
+    parts = [p.strip() for p in (section or "").split(SECTION_SEPARATOR) if p.strip()]
+    if not parts:
+        return ""
+    shown = [escape(p) if escape else p for p in (parts[-1:] if short else parts)]
+    return f"§ {SECTION_SEPARATOR.join(shown)}"
+
+
+def ref_label(
+    ref: SourceRef, language: Language = "en", *, short: bool = True, escape: Callable[[str], str] | None = None
+) -> str:
+    """ "annual_report.pdf, p. 2"; a source without a page "travel_policy.docx, § 4.2.1 Hotels" (the whole heading
+    path when not short, each heading through ``escape``); a web result "web: livemint.com — Infosys share price"."""
     if ref.kind == "web":
         title = " ".join((ref.title or "").split())
         return f"web: {ref.filename}" + (f" {EM_DASH} {title}" if title else "")
-    pages = pages_label(ref.page_start, ref.page_end, language, short=short)
+    where = pages_label(ref.page_start, ref.page_end, language, short=short) or section_label(
+        ref.section, short=short, escape=escape
+    )
     name = ref.filename or "(unknown document)"
-    return f"{name}, {pages}" if pages else name
+    return f"{name}, {where}" if where else name

@@ -9,7 +9,10 @@ Both formats are built from the same ``TranscriptExport`` model, so they always 
   saved; ``messages[].citations[]`` maps each ``source_id`` to ``ref``, the number in the top-level ``sources`` list
   (and in the Markdown's ``[n]``).
 
-Source numbers are chat-wide: one per distinct document and page range, in order of first citation (``chat_sources``).
+Source numbers are chat-wide: one per distinct document and page range (a document without pages: document and
+section), in order of first citation (``chat_sources``). ``section`` is the heading path of the cited passage
+("4. Travel > 4.2 Domestic > 4.2.1 Hotels"): what locates a DOCX source, which has no pages; Markdown shows it where
+there is no page.
 Live web results (``[W#]``, §3.7) are sources too, one per URL: their citations and sources carry ``kind: "web"``,
 ``url`` and ``title`` (document entries are unchanged: no ``kind`` means a document), and Markdown lists them with
 their title and link.
@@ -30,7 +33,7 @@ from pydantic import BaseModel, SerializerFunctionWrapHandler, model_serializer
 from ..domain.projects import Chat, Message
 from ..domain.summaries import SourceRef, SummaryData, UnansweredQuestion, UserSummary
 from .base import Service
-from .chat_sources import EN_DASH, ChatSources, number_markers, pages_label
+from .chat_sources import EN_DASH, ChatSources, number_markers, pages_label, section_label
 from .chat_summary import render_summary_markdown, summary_view
 from .chats import ChatService
 from .markdown_text import escape_block_markers, escape_inline, safe_link
@@ -73,7 +76,8 @@ class ExportChat(BaseModel):
 
 
 class _WebFields(BaseModel):
-    """``kind``, ``url`` and ``title`` appear on web sources only: document entries stay as they were."""
+    """``kind``, ``url`` and ``title`` appear on web sources only: document entries stay as they were. ``section`` is
+    the other way round: documents only."""
 
     @model_serializer(mode="wrap")
     def _without_web_fields(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -81,6 +85,8 @@ class _WebFields(BaseModel):
         if data.get("kind") == "document":
             for name in ("kind", "url", "title"):
                 data.pop(name, None)
+        else:
+            data.pop("section", None)
         return data
 
 
@@ -93,6 +99,7 @@ class ExportCitation(_WebFields):
     page_end: int | None
     chunk_id: str
     snippet: str
+    section: str | None = None  # documents: the heading path of the cited passage
     kind: Literal["document", "web"] = "document"
     url: str | None = None
     title: str | None = None
@@ -121,6 +128,7 @@ class ExportSource(_WebFields):
     page_end: int | None
     snippet: str
     cited_by: list[int]  # seq of the messages that cite it
+    section: str | None = None  # documents without pages: the heading path of the first passage cited
     kind: Literal["document", "web"] = "document"
     url: str | None = None
     title: str | None = None
@@ -132,6 +140,7 @@ class ExportSummarySource(BaseModel):
     filename: str
     page_start: int | None
     page_end: int | None
+    section: str | None = None  # documents without pages: the heading path
 
 
 class ExportKeyPoint(BaseModel):
@@ -205,6 +214,7 @@ class ExportService(Service):
                     page_end=e.page_end,
                     snippet=e.snippet,
                     cited_by=e.cited_by,
+                    section=e.section,
                     kind=e.kind,
                     url=e.url,
                     title=e.title,
@@ -259,6 +269,7 @@ def _export_message(m: Message, sources: ChatSources) -> ExportMessage:
                 page_end=c.page_end,
                 chunk_id=c.chunk_id,
                 snippet=c.snippet,
+                section=c.section,
                 kind=c.kind,
                 url=c.url,
                 title=c.title,
@@ -287,6 +298,7 @@ def _export_summary(summary: UserSummary, sources: ChatSources) -> tuple[ExportS
                     filename=r.filename,
                     page_start=r.page_start,
                     page_end=r.page_end,
+                    section=r.section,
                 )
                 for r in p.sources
             ],
@@ -397,7 +409,8 @@ def _render_message(m: ExportMessage) -> list[str]:
 
 
 def _render_source(s: ExportSource) -> str:
-    pages = pages_label(s.page_start, s.page_end)
+    # A page wins; a source without one (DOCX) is located by its whole heading path, from the document's own text.
+    pages = pages_label(s.page_start, s.page_end) or section_label(s.section, short=False, escape=escape_inline)
     where = f"**{s.filename or '(unknown document)'}**" + (f", {pages}" if pages else "")
     snippet_text = _SPACE.sub(" ", s.snippet).strip()
     if s.kind == "web":  # a live web result: its title, the site and the link, all text from the web: escaped

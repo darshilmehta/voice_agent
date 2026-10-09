@@ -15,7 +15,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-from ..domain.projects import SNIPPET_CHARS, Citation
+from ..domain.projects import SECTION_SEPARATOR, SNIPPET_CHARS, Citation
 from ..providers.ingestion import Chunk
 from .retrieval import RankedChunk
 
@@ -24,6 +24,13 @@ _SPACE = re.compile(r"\s+")
 # [S1], [s2], [S1, S3], [S1; W2], [W1] — with the whitespace before it, so a removed marker leaves no gap.
 _MARKER = re.compile(r"(\s*)\[\s*([SW]\d+(?:\s*[,;]\s*[SW]\d+)*)\s*\]", re.IGNORECASE)
 _ID = re.compile(r"([SW])(\d+)", re.IGNORECASE)
+
+
+def section_of(heading_path: Sequence[str]) -> str | None:
+    """A chunk's heading path as one line ("4. Travel > 4.2 Domestic > 4.2.1 Hotels"), None without headings. Where a
+    passage has no page (DOCX, MD, TXT) this is how a citation says where in the document it is."""
+    parts = [_SPACE.sub(" ", h).strip() for h in heading_path]
+    return SECTION_SEPARATOR.join(p for p in parts if p) or None
 
 
 class Citable(Protocol):
@@ -62,6 +69,7 @@ class Source:
             page_end=self.chunk.page_end,
             chunk_id=self.chunk.chunk_id,
             snippet=snippet(self.chunk.text),
+            section=section_of(self.chunk.heading_path),
         )
 
 

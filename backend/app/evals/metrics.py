@@ -15,8 +15,9 @@ two pages in the top 3 scores 0.5); ``success@k`` is 1 when all targets are cove
 should be abstained are excluded from all of these; they feed the abstention metrics.
 
 The answer-or-abstain decision follows the pipeline's gate: answer when the best reranker score is at least the
-threshold and nothing vetoes the question (a fiscal year it names that the best passage doesn't state); nothing
-retrieved always abstains. ``gate=False`` gives the score gate alone, for comparison.
+threshold and nothing vetoes the question (a fiscal year it names that the best passage doesn't state, or a company
+it names that no passage found is about); nothing retrieved always abstains. ``gate=False`` gives the score gate
+alone, for comparison.
 """
 
 from __future__ import annotations
@@ -277,7 +278,7 @@ class GateSample:
     should_answer: bool  # the documents contain the answer
     language: str
     evidence_retrieved: bool = False  # answerable questions: the expected evidence is in the post-rerank top N
-    veto: bool = False  # the gate refuses it whatever the score (Confidence.missing_periods)
+    veto: bool = False  # the gate refuses it whatever the score (Confidence.missing_periods, missing_subjects)
     subtype: str | None = None  # unanswerable questions: near_miss_year, other_company, ...
 
 

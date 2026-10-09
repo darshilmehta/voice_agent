@@ -48,6 +48,7 @@ class FakeClient:
         self.dense_size = dense_size
         self.points = points or []
         self.raise_on_query: Exception | None = None
+        self.labels: dict[str, list[str]] = {}  # document id → the labels of its chunks, for ``scroll``
 
     def _record(self, op: str, /, **kw: Any) -> None:
         self.calls.append((op, kw))
@@ -85,6 +86,14 @@ class FakeClient:
         if self.raise_on_query:
             raise self.raise_on_query
         return SimpleNamespace(points=self.points)
+
+    async def scroll(self, name: str, **kw: Any) -> Any:
+        self._record("scroll", name=name, **kw)
+        if self.raise_on_query:
+            raise self.raise_on_query
+        document_id = kw["scroll_filter"].must[1].match.any[0]
+        points = [SimpleNamespace(payload={"document_label": label}) for label in self.labels.get(document_id, [])]
+        return points[: kw["limit"]], None
 
     async def delete(self, name: str, **kw: Any) -> None:
         self._record("delete", name=name, **kw)
@@ -260,6 +269,34 @@ def test_outdated_documents_have_no_chunks_or_chunks_of_another_chunking_version
     client = use(store, FakeClient(exists=False))  # no collection (new or dropped): everything must be indexed
     assert asyncio.run(store.outdated(["a", "b"], "v9")) == ["a", "b"]
     assert "count" not in client.names()
+
+
+def test_document_labels_are_the_longest_among_a_documents_chunks(store):
+    """Chunks under the title omit it from their label: the longest label of a sample has it."""
+    client = use(store, FakeClient())
+    client.labels = {
+        "d1": ["valmora report", "valmora report: Valmora Industries", "valmora report"],
+        "d2": ["zephyra deck"],
+        "d3": [""],  # indexed before labels existed
+    }
+    got = asyncio.run(store.document_labels(RetrievalFilters("proj1", ("d1", "d2", "d3", "d4"))))
+    assert got == {"d1": "valmora report: Valmora Industries", "d2": "zephyra deck"}
+    scrolls = [kw for n, kw in client.calls if n == "scroll"]
+    assert len(scrolls) == 4 and all(kw["with_vectors"] is False and kw["limit"] == 16 for kw in scrolls)
+    assert all(kw["with_payload"] == ["document_label"] for kw in scrolls)
+    assert scrolls[0]["scroll_filter"] == build_filter(RetrievalFilters("proj1", ("d1",)))  # one document at a time
+
+
+def test_document_labels_need_documents_and_survive_an_empty_index(store):
+    client = use(store, FakeClient())
+    assert asyncio.run(store.document_labels(RetrievalFilters("proj1"))) == {}  # every document: not asked for
+    assert asyncio.run(store.document_labels(RetrievalFilters("proj1", ()))) == {}
+    assert "scroll" not in client.names()
+    client.raise_on_query = not_found()  # nothing ingested yet
+    assert asyncio.run(store.document_labels(RetrievalFilters("proj1", ("d1", "d2")))) == {}
+    client.raise_on_query = RuntimeError("down")
+    with pytest.raises(RuntimeError):
+        asyncio.run(store.document_labels(RetrievalFilters("proj1", ("d1",))))
 
 
 def test_client_is_created_lazily_without_network(store):
