@@ -76,6 +76,15 @@ def test_placeholder_methods_raise_not_implemented(cloud_settings):
         c["object_store"].put  # noqa: B018  (attribute access is the call under test)
 
 
+@pytest.mark.parametrize("method", ["submit", "on_idle", "join"])
+def test_the_redis_job_queue_placeholder_has_the_lane_aware_interface(cloud_settings, method):
+    """The cloud placeholder stands in for every JobQueue method, including the ones that take a lane."""
+    queue = build_container(cloud_settings, allow_placeholders=True)["job_queue"]
+    assert queue.name == "redis" and isinstance(queue, PlaceholderProvider)
+    with pytest.raises(NotImplementedError, match=rf"placeholder: '{method}' is not implemented"):
+        getattr(queue, method)
+
+
 def test_unknown_provider_lists_alternatives(load_local):
     with pytest.raises(
         ConfigError, match=r"stt: unknown provider 'whisper_cpp' \(available: faster_whisper, mlx_whisper\)"

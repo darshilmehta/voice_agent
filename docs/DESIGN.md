@@ -317,7 +317,7 @@ So "session" now only means a live connection; anything persisted is a project, 
 **Behaviour.**
 
 - A chat answers from **its project's documents** (Qdrant filter on `project_id`), optionally narrowed to selected documents per chat. Documents never leak across projects.
-- New chats get an **automatic title** after the first answer (≤ 6 words, in the chat's language; a background job, off the answer's path; falls back to the first question; never replaces a title the user set).
+- New chats get an **automatic title** after the first answer (≤ 6 words, in the chat's language; a background job in the job queue's short lane, off the answer's path and never behind an ingestion; falls back to the first question; never replaces a title the user set).
 - **Pinning:** projects and chats can be pinned; pinned items appear at the top of the sidebar.
 - **Deleting** a chat removes its messages and summaries; deleting a project removes its documents, vectors, uploads, chats and summaries. Everything is local, so delete really deletes.
 
@@ -608,7 +608,7 @@ class SpeechSynthesizer(Protocol):    # kokoro | cloud(stub)
     def stream(self, sentences: AsyncIterator[str], language: str) -> AsyncIterator[AudioChunk]: ...
 class VoiceActivityDetector(Protocol):# silero
 class AudioTransport(Protocol):       # websocket | webrtc(stub)
-class JobQueue(Protocol):             # in_process | redis(stub)
+class JobQueue(Protocol):             # in_process | redis(stub); submit(name, job, lane=) with lanes "long" (ingestion, job_queue.concurrency workers) and "short" (titles)
 class SessionStore(Protocol):         # in_memory | redis(stub)
 class EventBus(Protocol):             # in_process | redis(stub)
 ```
