@@ -1,0 +1,41 @@
+{
+  "about": "Labelled visual-planner questions over the eval corpus (scripts/eval/build_corpus.py). kinds: acceptable visual kinds; datasets: acceptable tables as [document, title substring] (every dataset of the plan must match one); series: when given, a chosen series' label must contain one of these (case-insensitive). query_en: the English query the router gives for Hindi and Hinglish turns.",
+  "documents": {
+    "AR": "valmora_annual_report_fy24.pdf",
+    "DECK": "zephyra_investor_deck_q4fy24.pptx",
+    "POL": "valmora_travel_expense_policy.docx",
+    "HI": "suryodaya_yojana_soochna.docx"
+  },
+  "cases": [
+    {"id": "p01", "language": "en", "question": "Show me quarterly revenue for FY24", "kinds": ["line", "bar"], "datasets": [["AR", "Quarterly performance: FY24"]], "series": ["revenue"]},
+    {"id": "p02", "language": "en", "question": "How did the EBITDA margin move across the quarters of FY23?", "kinds": ["line", "bar"], "datasets": [["AR", "Quarterly performance: FY23"]], "series": ["ebitda margin"]},
+    {"id": "p03", "language": "en", "question": "Chart revenue by segment for FY24", "kinds": ["donut", "bar"], "datasets": [["AR", "Segment results"], ["AR", "Business overview"], ["DECK", "Segment overview"]], "series": ["revenue"]},
+    {"id": "p04", "language": "en", "question": "Compare segment EBITDA in FY23 and FY24", "kinds": ["grouped_bar", "bar", "stacked_bar", "table", "comparison"], "datasets": [["AR", "Segment results"]], "series": null},
+    {"id": "p05", "language": "en", "question": "Show the key financial highlights", "kinds": ["kpi", "table"], "datasets": [["AR", "Financial highlights"]], "series": null},
+    {"id": "p06", "language": "en", "question": "What does the shareholding pattern look like? Show it.", "kinds": ["donut", "bar"], "datasets": [["AR", "Shareholding pattern"]], "series": ["share of equity capital"]},
+    {"id": "p07", "language": "en", "question": "Show the cash flow bridge for FY24", "kinds": ["waterfall", "bar"], "datasets": [["AR", "cash flow statement"]], "series": null},
+    {"id": "p08", "language": "en", "question": "Plot Zephyra's revenue by segment", "kinds": ["donut", "bar", "grouped_bar", "stacked_bar"], "datasets": [["DECK", "Segment overview"]], "series": ["revenue"]},
+    {"id": "p09", "language": "en", "question": "Compare Valmora and Zephyra revenue in FY24", "kinds": ["comparison", "bar", "grouped_bar"], "datasets": [["AR", "Financial highlights"], ["DECK", "Zephyra at a glance"], ["AR", "Segment results"], ["DECK", "Segment overview"], ["DECK", "FY24 profit and loss summary"]], "series": ["revenue"]},
+    {"id": "p10", "language": "en", "question": "Show the balance sheet assets", "kinds": ["table", "bar", "stacked_bar", "donut", "grouped_bar"], "datasets": [["AR", "balance sheet as at 31 March 2024: assets"]], "series": null},
+    {"id": "p11", "language": "en", "question": "How have attrition and the share of women in the workforce changed? Show me.", "kinds": ["kpi", "bar", "grouped_bar", "table", "comparison", "line"], "datasets": [["AR", "People and culture"]], "series": ["attrition", "women"]},
+    {"id": "p12", "language": "en", "question": "Show Zephyra's Q4 results against last year", "kinds": ["kpi", "comparison", "bar", "grouped_bar", "table"], "datasets": [["DECK", "Q4 FY24 results"]], "series": null},
+    {"id": "p13", "language": "en", "question": "Graph the installed capacity of each plant", "kinds": ["bar", "table"], "datasets": [["AR", "Operations and manufacturing footprint"]], "series": ["installed capacity"]},
+    {"id": "p14", "language": "en", "question": "Show quarterly profit after tax for FY24", "kinds": ["line", "bar"], "datasets": [["AR", "Quarterly performance: FY24"]], "series": ["profit after tax"]},
+    {"id": "p15", "language": "en", "question": "Show the dividend per share for the last two years", "kinds": ["bar", "kpi", "table", "comparison", "line"], "datasets": [["AR", "Dividend"], ["AR", "Financial highlights"]], "series": ["dividend"]},
+    {"id": "p16", "language": "en", "question": "Chart Zephyra's network: branches, warehouses and trucks", "kinds": ["kpi", "bar", "grouped_bar", "table", "comparison"], "datasets": [["DECK", "Network and fleet"]], "series": null},
+    {"id": "p17", "language": "en", "question": "Show the hotel limits per night by grade", "kinds": ["bar", "grouped_bar", "table"], "datasets": [["POL", "Hotel limits"]], "series": null},
+    {"id": "p18", "language": "en", "question": "Show the important dates of the Suryodaya scheme", "kinds": ["timeline", "table"], "datasets": [["HI", "महत्वपूर्ण तिथियाँ"]], "series": null},
+    {"id": "p19", "language": "en", "question": "Show the business mix by segment", "kinds": ["donut", "bar"], "datasets": [["AR", "Business overview"], ["AR", "Segment results"]], "series": null},
+    {"id": "p20", "language": "en", "question": "Show borrowings at the end of FY24 against FY23", "kinds": ["bar", "grouped_bar", "table", "comparison", "stacked_bar", "kpi"], "datasets": [["AR", "Note 14: Borrowings"], ["AR", "equity and liabilities"]], "series": ["borrowings"]},
+    {"id": "p21", "language": "hi", "question": "FY24 की तिमाही आय का चार्ट दिखाओ", "query_en": "Show a chart of quarterly revenue in FY24", "kinds": ["line", "bar"], "datasets": [["AR", "Quarterly performance: FY24"]], "series": ["revenue"]},
+    {"id": "p22", "language": "hi", "question": "सेगमेंट के हिसाब से राजस्व दिखाइए", "query_en": "Show revenue by segment", "kinds": ["donut", "bar", "grouped_bar", "stacked_bar"], "datasets": [["AR", "Segment results"], ["AR", "Business overview"], ["DECK", "Segment overview"]], "series": ["revenue"]},
+    {"id": "p23", "language": "hi", "question": "mujhe quarterly EBITDA ka graph dikhao", "query_en": "Show me a graph of quarterly EBITDA", "kinds": ["line", "bar"], "datasets": [["AR", "Quarterly performance: FY24"], ["AR", "Quarterly performance: FY23"]], "series": ["ebitda"]},
+    {"id": "p24", "language": "hi", "question": "जिलेवार बजट दिखाओ", "query_en": "Show the budget by district", "kinds": ["bar", "donut"], "datasets": [["HI", "जिलेवार लक्ष्य"]], "series": ["बजट"]},
+    {"id": "p25", "language": "hi", "question": "पाठ्यक्रम के हिसाब से सीटें दिखाओ", "query_en": "Show seats by course", "kinds": ["bar", "donut"], "datasets": [["HI", "पाठ्यक्रम और सीटें"]], "series": ["सीटें"]},
+    {"id": "p26", "language": "hi", "question": "योजना की महत्वपूर्ण तिथियाँ दिखाइए", "query_en": "Show the important dates of the scheme", "kinds": ["timeline", "table"], "datasets": [["HI", "महत्वपूर्ण तिथियाँ"]], "series": null},
+    {"id": "p27", "language": "hi", "question": "shareholding pattern ka chart dikhao", "query_en": "Show the shareholding pattern as a chart", "kinds": ["donut", "bar"], "datasets": [["AR", "Shareholding"]], "series": null},
+    {"id": "p28", "language": "hi", "question": "Zephyra aur Valmora ka revenue compare karo", "query_en": "Compare the revenue of Zephyra and Valmora", "kinds": ["comparison", "bar", "grouped_bar"], "datasets": [["AR", "Financial highlights"], ["DECK", "Zephyra at a glance"], ["AR", "Segment results"], ["DECK", "Segment overview"], ["DECK", "FY24 profit and loss summary"]], "series": ["revenue"]},
+    {"id": "p29", "language": "hi", "question": "मुख्य वित्तीय आंकड़े दिखाओ", "query_en": "Show the key financial figures", "kinds": ["kpi", "table"], "datasets": [["AR", "Financial highlights"], ["DECK", "Zephyra at a glance"]], "series": null},
+    {"id": "p30", "language": "hi", "question": "FY24 ke cash flow ka waterfall dikhao", "query_en": "Show a waterfall of the FY24 cash flow", "kinds": ["waterfall", "bar"], "datasets": [["AR", "cash flow statement"]], "series": null}
+  ]
+}
