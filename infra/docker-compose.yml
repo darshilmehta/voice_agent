@@ -9,7 +9,28 @@
 # Profile "full": backend and frontend in containers too (config/docker.config.json: CPU devices,
 # faster-whisper). Ollama stays on the host and is reached at host.docker.internal; on Linux, start it
 # with OLLAMA_HOST=0.0.0.0 so the container can reach it. Don't run the native backend/frontend at the
-# same time: they use the same ports.
+# same time: they use the same ports. The backend image has the `ml` dependency group (CPU-only PyTorch)
+# but no model weights: run scripts/setup/download_models.sh first; ../data (with data/models) is mounted.
+#
+# MEMORY, profile "full". Models run on the CPU and the backend preloads all of them at startup:
+#
+#   BGE-M3 embedder              ~2.3 GB
+#   bge-reranker-v2-m3           ~2.3 GB
+#   Python, torch, FastAPI       ~0.7 GB    measured: the ML libraries alone are ~0.55 GB resident
+#   Kokoro-82M                   ~0.55 GB   docs/DESIGN.md §9; with the process it did not fit in an 800 MB container
+#   faster-whisper small, int8   ~0.4 GB    measured (0.65 GB while loading)
+#   Silero VAD                   ~0.05 GB
+#   Docling layout/table/OCR     ~1.7 GB    peak, only while a document is being ingested
+#
+#   Backend: ~6.5 GB steady, ~8 GB while a document is ingested. Qdrant ~0.3 GB (capped at 1 GB), frontend ~0.15 GB.
+#   Ollama (qwen3:4b-instruct, ~3 GB) is a host process and comes on top. Give Docker at least 10 GB.
+#
+#   A Docker Desktop VM capped at 1.5 GB, as on this project's Mac (only Qdrant fits), cannot run this profile: the
+#   models fail to load, and the VM's out-of-memory killer may end any process in it, Qdrant included. On a 16 GB Mac
+#   run the backend and frontend natively (README.md, "Run"): that needs less and uses the Apple GPU (MPS,
+#   mlx-whisper), which containers cannot. This profile is for Linux servers and larger machines.
+#   `docker compose ... --profile full config` shows the effective limits; BACKEND_MEM_LIMIT changes the backend's.
+#   Docker Desktop's own memory setting (Settings > Resources) is yours to change; nothing here touches it.
 
 name: poc_gibberlink
 
@@ -42,6 +63,11 @@ services:
     container_name: gibberlink-backend
     environment:
       APP_CONFIG_FILE: config/docker.config.json
+    # A ceiling, not a reservation: it keeps a runaway ingestion from taking the whole host (see MEMORY above).
+    # No swap beyond it, so hitting it kills the backend (restart: unless-stopped brings it back) instead of thrashing.
+    mem_limit: ${BACKEND_MEM_LIMIT:-10g}
+    memswap_limit: ${BACKEND_MEM_LIMIT:-10g}
+    stop_grace_period: 30s # at shutdown the app waits up to 10 s for answers still being saved
     volumes:
       - ../data:/app/data # models, uploads, SQLite; never baked into the image
     ports:
@@ -62,6 +88,7 @@ services:
     container_name: gibberlink-frontend
     environment:
       BACKEND_URL: http://localhost:8000 # as seen from the browser
+    mem_limit: 512m
     ports:
       - "127.0.0.1:3000:3000"
     depends_on:

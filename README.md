@@ -68,11 +68,26 @@ curl -s localhost:8000/health
 
 ## Run everything in Docker
 
-Qdrant, backend and frontend in containers (Ollama stays on the host); see [`config/README.md`](config/README.md):
+Qdrant, backend and frontend in containers; Ollama stays on the host. The backend image includes the `ml` dependency group with CPU-only PyTorch (no CUDA libraries) but no model weights: run `scripts/setup/download_models.sh all` first, and `data/models` is mounted into the container. Details in [`config/README.md`](config/README.md):
 
 ```bash
 docker compose -f infra/docker-compose.yml --profile full up -d --build
 ```
+
+**This needs far more memory than the 1.5 GB Docker Desktop cap this project is developed under (only Qdrant fits there).** The backend loads every model on the CPU at startup. Estimates (the process baseline and faster-whisper were measured in the container, the rest come from `docs/DESIGN.md` §9):
+
+| Process | Memory |
+|---|---|
+| BGE-M3 embedder | ~2.3 GB |
+| bge-reranker-v2-m3 | ~2.3 GB |
+| faster-whisper small (int8) | ~0.4 GB |
+| Kokoro-82M | ~0.55 GB |
+| Docling models | ~1.7 GB peak, only while a document is ingested |
+| Python, torch, transformers, FastAPI | ~0.7 GB |
+| **Backend** | **~6.5 GB steady, ~8 GB while ingesting** (capped at 10 GB by `BACKEND_MEM_LIMIT`) |
+| Qdrant, frontend | ~0.3 GB, ~0.15 GB |
+
+Give Docker at least 10 GB, and Ollama (about 3 GB for `qwen3:4b-instruct`) is on top. With less, the models fail to load or the out-of-memory killer ends processes in Docker's VM, Qdrant included. **On a Mac, run natively** (above): it needs less and uses the Apple GPU. Don't run the containers and the native backend/frontend together; they use the same ports.
 
 ## Voice UI prototype
 

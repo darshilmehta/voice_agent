@@ -11,7 +11,12 @@ WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
 COPY --from=deps /app/node_modules ./node_modules
 COPY frontend/ ./
-RUN npm run build
+# `npm run build` first runs `prebuild` (scripts/copy-vad-assets.mjs), which copies the browser VAD model and the ONNX
+# runtime from node_modules into public/vad/. Fail the build here if that didn't happen: without them the browser
+# cannot do barge-in detection and every /vad/* request would 404.
+RUN npm run build \
+ && test -s public/vad/silero_vad_v5.onnx \
+ && test -s public/vad/ort-wasm-simd-threaded.wasm
 
 FROM node:24-slim
 WORKDIR /app
@@ -20,8 +25,10 @@ ENV NODE_ENV=production \
     HOSTNAME=0.0.0.0 \
     PORT=3000 \
     BACKEND_URL=http://localhost:8000
+# Standalone output holds server.js and the traced node_modules only; static assets and public/ are copied beside it.
 COPY --from=build --chown=node:node /app/.next/standalone ./
 COPY --from=build --chown=node:node /app/.next/static ./.next/static
+COPY --from=build --chown=node:node /app/public ./public
 USER node
 EXPOSE 3000
 CMD ["node", "server.js"]
