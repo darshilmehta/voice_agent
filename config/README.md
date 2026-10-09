@@ -34,7 +34,23 @@ APP_CONFIG_FILE              (default: config/local.config.json)
 docker compose -f infra/docker-compose.yml --profile full up -d --build
 ```
 
-Qdrant, backend and frontend run in containers (ports published on `127.0.0.1` only); Ollama stays on the host. Models are mounted from `data/`, never baked into images. On macOS Docker has no Apple GPU, so models run on CPU: once the backend loads models (phase 1 onwards) raise Docker Desktop's memory limit accordingly (BGE-M3 alone needs about 2.3 GB on CPU) — or keep running natively, which is the recommended way on a Mac. On Linux, start Ollama with `OLLAMA_HOST=0.0.0.0` so the container can reach it.
+Qdrant, backend and frontend run in containers (ports published on `127.0.0.1` only); Ollama stays on the host. Models are mounted from `data/` (`/app/data/models` in the container, which is where `docker.config.json`'s relative `data/...` paths resolve with `APP_ROOT_DIR=/app`), never baked into images: run `scripts/setup/download_models.sh all` first. The backend image installs the `ml` group (Docling, BGE-M3, reranker, faster-whisper, Kokoro, Silero) with CPU-only PyTorch: on Linux `backend/pyproject.toml` takes `torch` and `torchvision` from PyTorch's CPU index, which leaves out several GB of CUDA libraries. On a CUDA server remove those two `tool.uv.sources` lines and run `uv lock` (and set the devices in your config to `cuda`). On Linux, start Ollama with `OLLAMA_HOST=0.0.0.0` so the container can reach it.
+
+**Memory.** On macOS Docker has no Apple GPU, so every model runs on the CPU, and the backend loads all of them at startup. Estimates: the process baseline and faster-whisper were measured in the container, the other models come from `docs/DESIGN.md` §9 (BGE-M3 and the reranker are 568M-parameter models in fp32 on the CPU).
+
+| Process | Estimated memory |
+|---|---|
+| BGE-M3 embedder | ~2.3 GB |
+| bge-reranker-v2-m3 | ~2.3 GB |
+| faster-whisper small (int8) | ~0.4 GB (0.65 GB while loading) |
+| Kokoro-82M | ~0.55 GB |
+| Silero VAD | < 0.1 GB |
+| Docling layout, table and OCR models | ~1.7 GB peak, only while a document is being ingested |
+| Python, torch, transformers, FastAPI | ~0.7 GB |
+| **Backend total** | **~6.5 GB steady, ~8 GB while ingesting** |
+| Qdrant / frontend | ~0.3 GB / ~0.15 GB |
+
+Give Docker at least 10 GB (Ollama's model, about 3 GB for `qwen3:4b-instruct`, runs on the host in addition). The Compose file caps the backend container at `BACKEND_MEM_LIMIT` (default `10g`, no swap) and the frontend at 512 MB. A Docker Desktop VM capped at 1.5 GB, as on the development Mac, can't hold this: models fail to load, and the VM's out-of-memory killer may end any container, Qdrant included. **On a Mac run the backend and frontend natively, which is the recommended way** (`README.md`, "Run"): it needs less memory and uses the Apple GPU (MPS, mlx-whisper). The `full` profile is for Linux servers and larger machines. Docker Desktop's memory setting is yours to change; nothing in this repo does.
 
 ## Deploying to a server
 

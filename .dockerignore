@@ -1,10 +1,12 @@
 # Build context is the repo root (images need backend/ or frontend/ plus config/).
 # Never send models, uploads or databases: data/ alone is many gigabytes.
-data/
+# A leading "/" anchors an entry to the repo root, so /scripts/ (setup and smoke tests) does not match
+# frontend/scripts/ (copy-vad-assets.mjs, which the frontend build runs as `prebuild`).
+/data/
 .git/
 .github/
-docs/
-scripts/
+/docs/
+/scripts/
 **/node_modules/
 **/.next/
 **/.venv/
@@ -14,6 +16,8 @@ scripts/
 **/*.tsbuildinfo
 frontend/next-env.d.ts
 frontend/AGENTS.md
+# Copied from node_modules by the build (prebuild); a stale host copy must not stand in for it.
+frontend/public/vad/
 .env
 .env.*
 **/.DS_Store

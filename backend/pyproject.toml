@@ -41,6 +41,7 @@ ml = [
   "silero-vad>=5.1",  # server-side VAD; the model ships inside the package
   "soundfile>=0.12",
   "torch>=2.14.1",
+  "torchvision>=0.29.1",  # docling's layout model needs it; direct, so it takes torch's CPU source below
   "transformers>=4.45",  # older releases make uv backtrack to a 2021 version that needs Rust (§9.3)
 ]
 
@@ -48,6 +49,19 @@ ml = [
 # docling depends on opencv-python-headless and rapidocr on opencv-python; both install into the
 # same cv2/ directory and removing either deletes it (docs/DESIGN.md §9.6). Keep only the headless build.
 override-dependencies = ["opencv-python; sys_platform == 'never'"]
+
+[tool.uv.sources]
+# On Linux, PyPI's torch depends on several GB of CUDA libraries (nvidia-*, cuda-toolkit, triton) that a CPU-only
+# container (infra/docker, docs/DESIGN.md §2) never uses. Take torch and torchvision from PyTorch's CPU index there.
+# macOS (MPS) and Windows keep PyPI's wheels, which are Metal / CPU builds already. On a CUDA host, delete these two
+# lines and run `uv lock`. uv applies `sources` to direct dependencies only, hence torchvision in the ml group.
+torch = { index = "pytorch-cpu", marker = "sys_platform == 'linux'" }
+torchvision = { index = "pytorch-cpu", marker = "sys_platform == 'linux'" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true  # used only by the sources above; every other package still comes from PyPI
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
