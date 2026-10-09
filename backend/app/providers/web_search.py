@@ -9,7 +9,8 @@
       search_api   a production search API (Brave, Tavily, …): placeholder
     WebSearch.fetch_page(url) → the page as plain text: http(s) on ports 80/443 only, public addresses only (no
       loopback, private, link-local or IPv6 forms of them; redirects checked too; the connection goes to the very
-      address that was checked, GuardedNetwork, so DNS rebinding can't redirect it), HTML or plain text only, at most
+      addresses that were checked, GuardedNetwork, so DNS rebinding can't redirect it; if one doesn't connect the next
+      checked address is tried, so an IPv6-first host works on an IPv4-only network), HTML or plain text only, at most
       PAGE_MAX_BYTES read and inflated (Accept-Encoding: identity; one gzip/deflate layer inflated by us with a cap;
       anything else refused), PAGE_TEXT_CHARS kept, parsed off the event loop
 
@@ -52,6 +53,7 @@ SNIPPET_MAX_CHARS = 400
 PAGE_MAX_BYTES = 400_000  # read at most this much of a page
 PAGE_TEXT_CHARS = 1_500  # keep at most this much of its text
 PAGE_MAX_REDIRECTS = 3
+CONNECT_ADDRESSES = 4  # at most this many of a host's (checked) addresses are tried for one connection
 UNHEALTHY_COOLDOWN_S = 30.0
 # A common browser's: nothing that names this project or ties the machine to an account.
 USER_AGENT = (
@@ -288,9 +290,11 @@ async def _read_capped(response: httpx.Response) -> bytes | None:
 
 
 class GuardedNetwork(httpcore.AsyncNetworkBackend):
-    """Page fetches connect only to the public address they were checked against: the host is resolved once,
-    every address must be public, and the connection goes to that IP (TLS still verifies, and SNI and Host still
-    name, the hostname). No DNS rebinding between the check and the connect, and ports 80/443 only."""
+    """Page fetches connect only to the public addresses they were checked against: the host is resolved once, every
+    address must be public, and the connection goes to one of those IPs (TLS still verifies, and SNI and Host still
+    name, the hostname). No DNS rebinding between the check and the connect, and ports 80/443 only. The checked
+    addresses are tried in the resolver's order, the connect timeout shared among those still to try, so a host that
+    lists an IPv6 address first still connects on an IPv4-only network."""
 
     def __init__(self, inner: httpcore.AsyncNetworkBackend, resolve: Callable[[str], Awaitable[list[str]]]) -> None:
         self.inner = inner
@@ -316,9 +320,25 @@ class GuardedNetwork(httpcore.AsyncNetworkBackend):
                 raise httpcore.ConnectError(f"{host} doesn't resolve: {describe(e)}") from e
         if not addresses or not all(public_address(a) for a in addresses):
             raise httpcore.ConnectError(f"{host} resolves to a non-public address: refused")
-        return await self.inner.connect_tcp(
-            addresses[0], port, timeout=timeout, local_address=local_address, socket_options=socket_options
-        )
+        candidates = list(dict.fromkeys(addresses))[:CONNECT_ADDRESSES]
+        started = time.monotonic()
+        failure: Exception | None = None
+        for i, address in enumerate(candidates):
+            attempt = timeout
+            if timeout is not None:  # what is left, shared among the addresses still to try
+                left = timeout - (time.monotonic() - started)
+                if left <= 0:
+                    break
+                attempt = left / (len(candidates) - i)
+            try:
+                return await self.inner.connect_tcp(
+                    address, port, timeout=attempt, local_address=local_address, socket_options=socket_options
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout, OSError) as e:
+                failure = e
+        if isinstance(failure, OSError):
+            raise httpcore.ConnectError(f"{host}: {describe(failure)}") from failure
+        raise failure or httpcore.ConnectTimeout(f"{host}: no time left to connect")
 
     async def connect_unix_socket(self, *args: Any, **kwargs: Any) -> httpcore.AsyncNetworkStream:
         raise httpcore.ConnectError("unix sockets refused")
@@ -327,12 +347,19 @@ class GuardedNetwork(httpcore.AsyncNetworkBackend):
         await self.inner.sleep(seconds)
 
 
-def guarded_transport(resolve: Callable[[str], Awaitable[list[str]]]) -> httpx.AsyncHTTPTransport:
+def guarded_transport(
+    resolve: Callable[[str], Awaitable[list[str]]], *, network: httpcore.AsyncNetworkBackend | None = None
+) -> httpx.AsyncHTTPTransport:
     """httpx's transport with its connection pool's network backend wrapped in ``GuardedNetwork``; no proxies or
-    environment settings (trust_env=False)."""
+    environment settings (trust_env=False). ``network``: the sockets under the guard (tests; default httpcore's).
+
+    httpx has no public way to give its pool a network backend, so this sets the pool's private ``_network_backend``
+    (httpx 0.28 / httpcore 1.0: both pinned below the next minor release in pyproject.toml). A release that stopped
+    reading it would leave the guard out silently: tests/test_web_search_provider.py therefore sends real requests
+    through the page client with the real sockets disabled, and fails unless they went through the guard."""
     transport = httpx.AsyncHTTPTransport(trust_env=False, retries=0)
-    pool = transport._pool  # httpx 0.28: the httpcore pool behind the transport
-    pool._network_backend = GuardedNetwork(pool._network_backend, resolve)
+    pool = transport._pool
+    pool._network_backend = GuardedNetwork(network if network is not None else pool._network_backend, resolve)
     return transport
 
 
@@ -352,6 +379,7 @@ class SearXNGSearch(WebSearch):
         self._down_reason = ""
         self._known: frozenset[str] | None = None  # the engines SearXNG has (from /config), once asked
         self.page_client: httpx.AsyncClient | None = None  # page fetches: no cookies kept (tests may set one)
+        self.page_network: httpcore.AsyncNetworkBackend | None = None  # the sockets under the guard (tests)
 
     @property
     def base_url(self) -> str:
@@ -502,7 +530,7 @@ class SearXNGSearch(WebSearch):
     def _pages(self) -> httpx.AsyncClient:
         if self.page_client is None:
             self.page_client = httpx.AsyncClient(
-                transport=guarded_transport(self.resolve),
+                transport=guarded_transport(self.resolve, network=self.page_network),
                 follow_redirects=False,
                 trust_env=False,
                 headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"},

@@ -19,6 +19,7 @@ import pytest
 from app.providers.base import HealthStatus, ProviderContext
 from app.providers.registry import build_container
 from app.providers.web_search import (
+    CONNECT_ADDRESSES,
     PAGE_MAX_BYTES,
     GuardedNetwork,
     SearXNGSearch,
@@ -512,10 +513,225 @@ async def test_only_web_ports_are_connected(port):
     assert inner.connects == []
 
 
-async def test_the_page_client_uses_the_guard_no_env_proxies_and_a_generic_agent(web_settings, searxng):
+# ---- the guard on the real page client
+#
+# GuardedNetwork is wired into httpx by setting its pool's private ``_network_backend``. A test that only checked
+# the type of that attribute would pass after an httpx/httpcore release that stopped reading it, with the guard
+# silently out of the path. These tests send real requests through the real page client (``fetch_page``: httpx, its
+# pool, the guard) over a fake socket layer under the guard, and fail unless every connection went through it. The
+# real socket layers are replaced by traps, so a bypass fails loudly and never touches the network.
+
+PAGE_BODY = b"<p>" + b"A real paragraph of page text that is long enough to be kept as the article. " * 3 + b"</p>"
+PAGE_TEXT = ("A real paragraph of page text that is long enough to be kept as the article. " * 3).strip()
+
+
+def reply(status: int, headers: dict[str, str], body: bytes = b"") -> bytes:
+    head = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+    return f"HTTP/1.1 {status} X\r\n{head}content-length: {len(body)}\r\n\r\n".encode() + body
+
+
+class Wire(httpcore.AsyncNetworkStream):
+    """One fake connection: parses the request line and Host header and answers from the fake network's pages."""
+
+    def __init__(self, net: FakeSockets, address: str) -> None:
+        self.net, self.address, self.pending = net, address, b""
+
+    async def write(self, buffer, timeout=None):  # type: ignore[override]
+        if buffer.startswith(b"GET "):
+            lines = buffer.split(b"\r\n\r\n")[0].decode("latin-1").split("\r\n")
+            host = next(line.split(":", 1)[1].strip() for line in lines if line.lower().startswith("host:"))
+            self.net.requests.append((self.address, lines[0], host))
+            self.pending += self.net.pages[host]
+
+    async def read(self, max_bytes, timeout=None):  # type: ignore[override]
+        data, self.pending = self.pending[:max_bytes], self.pending[max_bytes:]
+        return data
+
+    async def aclose(self):  # type: ignore[override]
+        pass
+
+    async def start_tls(self, ssl_context, server_hostname=None, timeout=None):  # type: ignore[override]
+        self.net.handshakes.append(server_hostname)
+        return self
+
+    def get_extra_info(self, info):  # type: ignore[override]
+        return None
+
+
+class FakeSockets(httpcore.AsyncNetworkBackend):
+    """The sockets under the guard: no network. Records every connect (address, port), TLS handshake (hostname) and
+    request (address it went to, request line, Host header); ``pages``: Host → the whole HTTP response."""
+
+    def __init__(self, pages: dict[str, bytes], unreachable: tuple[str, ...] = ()) -> None:
+        self.pages, self.unreachable = pages, set(unreachable)
+        self.connects: list[tuple[str, int]] = []
+        self.handshakes: list[str | None] = []
+        self.requests: list[tuple[str, str, str]] = []
+
+    async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):  # type: ignore[override]
+        self.connects.append((host, port))
+        if host in self.unreachable:
+            raise httpcore.ConnectError("[Errno 101] Network is unreachable")
+        return Wire(self, host)
+
+    async def connect_unix_socket(self, *args, **kwargs):  # type: ignore[override]
+        raise AssertionError
+
+    async def sleep(self, seconds):  # type: ignore[override]
+        pass
+
+
+@pytest.fixture
+def no_real_sockets(monkeypatch) -> None:
+    """Any connection through httpcore's own socket layer (anyio's, which its default backend uses under asyncio) is a
+    bypass of the guard: fail loudly."""
+
+    async def trap(self, *args, **kwargs):
+        raise AssertionError("a connection bypassed the guard (httpcore's own network backend was used)")
+
+    monkeypatch.setattr(httpcore.AnyIOBackend, "connect_tcp", trap)
+
+
+class DNS:
+    """What the (fake) resolver answers: one list per lookup, in order, the last one repeated."""
+
+    def __init__(self, *answers: list[str]) -> None:
+        self.answers, self.lookups = list(answers), []
+
+    async def __call__(self, host: str) -> list[str]:
+        self.lookups.append(host)
+        return self.answers[min(len(self.lookups), len(self.answers)) - 1]
+
+
+def guarded_provider(web_settings, searxng, sockets: FakeSockets, dns: DNS) -> SearXNGSearch:
+    p = provider(web_settings(), searxng)
+    p.resolve = dns  # type: ignore[method-assign]
+    p.page_network = sockets
+    return p
+
+
+@pytest.mark.usefixtures("no_real_sockets")
+async def test_a_page_fetch_connects_to_the_address_that_was_checked(web_settings, searxng):
+    """F7: through the real page client, the connection goes to the checked IP; TLS (SNI) and Host keep the name."""
+    sockets = FakeSockets({"news.example.com": reply(200, {"content-type": "text/html"}, PAGE_BODY)})
+    dns = DNS(["93.184.215.14"])
+    p = guarded_provider(web_settings, searxng, sockets, dns)
+    assert await p.fetch_page("https://news.example.com/a") == PAGE_TEXT
+    assert sockets.connects == [("93.184.215.14", 443)]
+    assert sockets.handshakes == ["news.example.com"]
+    assert sockets.requests == [("93.184.215.14", "GET /a HTTP/1.1", "news.example.com")]
+    assert dns.lookups == ["news.example.com"] * 2  # the URL check, and the guard's own lookup
+    await p.close()
+
+
+@pytest.mark.usefixtures("no_real_sockets")
+async def test_a_rebound_address_is_refused_at_connect_time(web_settings, searxng):
+    """F7: DNS answers the URL check with a public address and the connect with 127.0.0.1: nothing is connected."""
+    sockets = FakeSockets({"rebind.example": reply(200, {"content-type": "text/html"}, PAGE_BODY)})
+    p = guarded_provider(web_settings, searxng, sockets, DNS(["93.184.215.14"], ["127.0.0.1"]))
+    assert await p.fetch_page("https://rebind.example/a") is None
+    assert sockets.connects == [] and sockets.requests == []
+    await p.close()
+
+
+@pytest.mark.usefixtures("no_real_sockets")
+async def test_a_redirect_to_a_host_that_rebinds_is_refused_too(web_settings, searxng):
+    sockets = FakeSockets(
+        {
+            "a.example": reply(302, {"location": "http://b.example/y"}),
+            "b.example": reply(200, {"content-type": "text/html"}, PAGE_BODY),
+        }
+    )
+    answers = {"a.example": [["93.184.215.14"]] * 2, "b.example": [["93.184.215.15"], ["10.0.0.5"]]}
+
+    async def resolve(host: str) -> list[str]:
+        return answers[host].pop(0)
+
+    p = guarded_provider(web_settings, searxng, sockets, DNS())
+    p.resolve = resolve  # type: ignore[method-assign]
+    assert await p.fetch_page("http://a.example/x") is None
+    assert sockets.connects == [("93.184.215.14", 80)]  # the first hop only
+    await p.close()
+
+
+@pytest.mark.usefixtures("no_real_sockets")
+async def test_the_next_checked_address_is_tried_when_the_first_doesnt_connect(web_settings, searxng):
+    """An IPv6-first host on an IPv4-only network: the IPv6 connect fails, the IPv4 address (also checked) serves."""
+    sockets = FakeSockets(
+        {"dual.example": reply(200, {"content-type": "text/html"}, PAGE_BODY)}, unreachable=("2606:4700::1111",)
+    )
+    p = guarded_provider(web_settings, searxng, sockets, DNS(["2606:4700::1111", "93.184.215.14"]))
+    assert await p.fetch_page("https://dual.example/") == PAGE_TEXT
+    assert sockets.connects == [("2606:4700::1111", 443), ("93.184.215.14", 443)]
+    assert [address for address, _, _ in sockets.requests] == ["93.184.215.14"]
+    await p.close()
+
+
+@pytest.mark.usefixtures("no_real_sockets")
+async def test_when_no_address_connects_the_fetch_gives_up_inside_the_checked_set(web_settings, searxng):
+    sockets = FakeSockets({}, unreachable=("2606:4700::1111", "93.184.215.14"))
+    p = guarded_provider(web_settings, searxng, sockets, DNS(["2606:4700::1111", "93.184.215.14"]))
+    assert await p.fetch_page("https://dual.example/") is None
+    assert sockets.connects == [("2606:4700::1111", 443), ("93.184.215.14", 443)]  # nothing else is tried
+    await p.close()
+
+
+async def test_a_bypass_of_the_guard_fails_these_tests_loudly(no_real_sockets):
+    """The harness itself: a client that isn't wired through the guard reaches httpcore's own sockets, which trap."""
+    async with httpx.AsyncClient(trust_env=False) as unguarded:
+        with pytest.raises(AssertionError, match="bypassed the guard"):
+            await unguarded.get("http://news.example.com/")
+
+
+class Attempts(httpcore.AsyncNetworkBackend):
+    """Records each connect and its timeout; the addresses in ``failing`` raise ``error``."""
+
+    def __init__(self, failing: tuple[str, ...] = (), error: Exception | None = None) -> None:
+        self.failing, self.error = set(failing), error or httpcore.ConnectError("refused")
+        self.tried: list[tuple[str, float | None]] = []
+
+    async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):  # type: ignore[override]
+        self.tried.append((host, timeout))
+        if host in self.failing:
+            raise self.error
+        return Wire(FakeSockets({}), host)
+
+    async def connect_unix_socket(self, *args, **kwargs):  # type: ignore[override]
+        raise AssertionError
+
+    async def sleep(self, seconds):  # type: ignore[override]
+        pass
+
+
+async def test_the_connect_timeout_is_shared_among_the_addresses_still_to_try():
+    inner = Attempts(failing=("2606:4700::1111",), error=httpcore.ConnectTimeout("timed out"))
+    guard = GuardedNetwork(inner, DNS(["2606:4700::1111", "93.184.215.14"]))
+    stream = await guard.connect_tcp("dual.example", 443, timeout=2.0)
+    assert isinstance(stream, Wire) and stream.address == "93.184.215.14"
+    (first, t1), (second, t2) = inner.tried
+    assert (first, second) == ("2606:4700::1111", "93.184.215.14")
+    assert t1 == pytest.approx(1.0, abs=0.05)  # half of the budget for the first of two
+    assert t2 is not None and t2 > 1.5  # the rest, nearly all of it, for the last one
+
+
+async def test_every_address_must_be_public_before_any_is_tried():
+    inner = Attempts()
+    with pytest.raises(httpcore.ConnectError, match="non-public"):
+        await GuardedNetwork(inner, DNS(["93.184.215.14", "10.0.0.5"])).connect_tcp("mixed.example", 443)
+    assert inner.tried == []
+
+
+async def test_at_most_a_few_addresses_are_tried_and_the_last_error_is_raised():
+    addresses = [f"93.184.215.{i}" for i in range(10, 20)]
+    inner = Attempts(failing=tuple(addresses))
+    with pytest.raises(httpcore.ConnectError, match="refused"):
+        await GuardedNetwork(inner, DNS(addresses)).connect_tcp("many.example", 80, timeout=1.0)
+    assert [host for host, _ in inner.tried] == addresses[:CONNECT_ADDRESSES]
+
+
+async def test_the_page_client_uses_no_env_proxies_and_a_generic_agent(web_settings, searxng):
     p = provider(web_settings(), searxng)
     client = p._pages()
-    assert isinstance(client._transport._pool._network_backend, GuardedNetwork)  # type: ignore[attr-defined]
     assert client._trust_env is False
     agent = client.headers["user-agent"]
     assert "gibberlink" not in agent.casefold() and "github" not in agent.casefold() and agent.startswith("Mozilla/5.0")

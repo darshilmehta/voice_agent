@@ -758,9 +758,17 @@ class VoiceSession:
                 await self._send_for(agent, {"type": "sources", **event.payload()})
             case DeltaEvent(text=text):
                 agent.marks.setdefault("first_delta", time.perf_counter())
+                # After the answer is complete (answered()), a delta is a live-data continuation: one whole sentence
+                # (§3.7). It is queued for speech before it is sent, and flushed at once rather than at the turn's
+                # end, so the answer can't count as "heard" while a continuation is still unspoken.
+                continuation = agent.answer_queued
+                if continuation:
+                    for chunk in (*chunker.feed(text), *chunker.flush()):
+                        queue.put_nowait(chunk)
                 await self._send_for(agent, {"type": "delta", "turn_id": agent.id, "text": text})
-                for chunk in chunker.feed(text):
-                    queue.put_nowait(chunk)
+                if not continuation:
+                    for chunk in chunker.feed(text):
+                        queue.put_nowait(chunk)
             case AgentMessageEvent(message=message):
                 agent.message = message
             case ErrorEvent(stage=stage, detail=detail):
