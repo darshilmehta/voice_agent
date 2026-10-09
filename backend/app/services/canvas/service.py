@@ -595,9 +595,9 @@ class CanvasService:
             outcome = "done" if changed is not None else "cannot"
         elif edit.op in ("periods", "only"):
             available = _periods_of(spec, datasets)
-            asked = [p for p in edit.periods if p in available]
+            asked = match_periods(edit.periods, available)
             if asked and edit.op == "only":
-                changed = spec.model_copy(update={"periods": asked, "highlight": [], "calculations": []})
+                changed = _only_periods(spec, datasets, asked)
             elif asked:
                 shown = list(spec.periods) or list(available)
                 if all(p in shown for p in asked):
@@ -712,6 +712,38 @@ class CanvasService:
             if table is not None:
                 out.append((ds, table))
         return out
+
+
+def match_periods(asked: Sequence[str], available: Sequence[str]) -> list[str]:
+    """The periods of ``available`` (time order) that ``asked`` names: the period itself, or, for a fiscal year asked
+    for as a whole ("only FY24"), its quarters and halves ("Q1 FY24" … "Q4 FY24", "H1 FY24") when the table has them:
+    a quarterly table also has a "Full year FY24" row, but the chart on screen shows quarters, so "only FY24" keeps
+    those (the year's own column or row only when no quarter of it exists, as in a table of annual figures). The final
+    end-to-end run said "Done." to "Only FY24." on a quarterly chart and left both years on screen."""
+    named: set[str] = set()
+    for p in asked:
+        named.update([a for a in available if a.endswith(f" {p}")] or [a for a in available if a == p])
+    return [a for a in available if a in named]
+
+
+def _only_periods(spec: VisualSpec, datasets: dict[str, TypedDataset], periods: list[str]) -> VisualSpec:
+    """``spec`` keeping only ``periods``, and only the series (and tables) that have a number in them: a chart of two
+    quarterly tables (FY23's and FY24's) filtered to FY24 would otherwise keep the FY23 table's series, empty now, which
+    fails the build and silently falls back to the unfiltered chart."""
+    wanted = set(periods)
+
+    def has_period(ref_: str) -> bool:
+        ds = datasets.get(split_ref(ref_)[0])
+        return ds is not None and bool(
+            wanted & {p.label for p in [*(c.period for c in ds.columns), *(r.period for r in ds.rows)] if p}
+        )
+
+    series = [s for s in spec.series if has_period(s)] or list(spec.series)
+    used = {split_ref(s)[0] for s in series}
+    kept = [d for d in spec.datasets if d in used] or list(spec.datasets)
+    return spec.model_copy(
+        update={"periods": periods, "series": series, "datasets": kept, "highlight": [], "calculations": []}
+    )
 
 
 def _periods_of(spec: VisualSpec, datasets: dict[str, TypedDataset]) -> list[str]:

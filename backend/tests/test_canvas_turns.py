@@ -30,6 +30,7 @@ from .canvas_turn_helpers import (
     planner_calls,
     report_chat,
 )
+from .test_canvas_api import chat, drain, project, upload
 from .test_chat_api import names, parse_sse, payload
 
 SHOW = "Show me revenue by quarter"  # a confident draft: the line of quarterly revenue
@@ -325,6 +326,94 @@ def test_put_fy23_next_to_it_adds_the_period_from_the_same_table(app_with_report
     assert [r["x"] for r in canvas(api, chat_id)[0]["rows"]] == ["FY23", "FY24"]
     _, agent = edit(api, chat_id, "add FY24 too")
     assert agent["text"] == "That's already on the chart." and agent["route"]["canvas_edit"]["outcome"] == "already"
+
+
+def test_only_a_fiscal_year_keeps_its_quarters(app_with_report):
+    """Found in the final end-to-end run: "Only FY24." on a quarterly chart (labels "Q1 FY24" …) found no period called
+    "FY24", fell through to the planner and answered "Done." with the chart unchanged."""
+    api, chat_id, ds, fakes = app_with_report
+    q = ds["p3"]["id"]
+    line = add_visual(api, chat_id, kind="line", datasets=[q], series=[f"{q}:revenue"], periods=["Q1 FY24", "Q2 FY24"])
+    assert [r["x"] for r in line["rows"]] == ["Q1 FY24", "Q2 FY24"]
+    _, agent = edit(api, chat_id, "Only FY24.")
+    assert agent["text"] == "Done." and agent["route"]["canvas_edit"]["source"] == "rules"
+    assert [r["x"] for r in canvas(api, chat_id)[0]["rows"]] == ["Q1 FY24", "Q2 FY24", "Q3 FY24", "Q4 FY24"]
+    assert planner_calls(fakes.llm) == []  # the grammar read it: no model
+
+
+TWO_YEARS = (
+    "Valmora annual report FY24\n\nQuarterly results.\f"
+    "| Quarter | Revenue (₹ crore) | EBITDA (₹ crore) |\n"
+    "| Q1 FY23 | 1,512 | 285 |\n| Q2 FY23 | 1,598 | 312 |\n| Q3 FY23 | 1,661 | 331 |\n| Q4 FY23 | 1,711 | 355 |\n"
+    "| Q1 FY24 | 1,742 | 352 |\n| Q2 FY24 | 1,801 | 372 |\n| Q3 FY24 | 1,889 | 399 |\n| Q4 FY24 | 1,933 | 422 |\n"
+    "| Full year FY23 | 6,482 | 1,283 |\n| Full year FY24 | 7,365 | 1,545 |"
+).encode()
+
+
+def test_only_fy24_on_a_chart_of_both_years_keeps_the_four_quarters_not_the_full_year_row(make_app, fakes):
+    """The real report's quarterly table has a "Full year FY24" row (period FY24) as well as the quarters: matching the
+    year itself would have left one x value, which no line chart can show (the build falls back to unfiltered)."""
+    with make_app() as api:
+        p = project(api)
+        upload(api, p, "two_years.txt", TWO_YEARS)
+        drain(api)
+        chat_id = chat(api, p)
+        q = api.get(f"/api/projects/{p}/datasets").json()["items"][0]["id"]
+        line = add_visual(api, chat_id, kind="line", datasets=[q], series=[f"{q}:revenue"])
+        assert len(line["rows"]) == 8  # the quarters; the "Full year" rows are another granularity
+        _, agent = edit(api, chat_id, "Only FY24.")
+        assert agent["text"] == "Done." and agent["route"]["canvas_edit"]["source"] == "rules"
+        assert [r["x"] for r in canvas(api, chat_id)[0]["rows"]] == ["Q1 FY24", "Q2 FY24", "Q3 FY24", "Q4 FY24"]
+        _, agent = edit(api, chat_id, "put FY23 next to it")
+        assert [r["x"] for r in canvas(api, chat_id)[0]["rows"]][:5] == [
+            "Q1 FY23",
+            "Q2 FY23",
+            "Q3 FY23",
+            "Q4 FY23",
+            "Q1 FY24",
+        ]
+        assert planner_calls(fakes.llm) == []
+
+
+TWO_TABLES = (
+    "Valmora annual report FY24\n\nQuarterly results.\f"
+    "| Quarter | Revenue (₹ crore) | EBITDA (₹ crore) |\n"
+    "| Q1 FY24 | 1,742 | 352 |\n| Q2 FY24 | 1,801 | 372 |\n| Q3 FY24 | 1,889 | 399 |\n| Q4 FY24 | 1,933 | 422 |\n"
+    "| Full year FY24 | 7,365 | 1,545 |\f"
+    "| Quarter | Revenue (₹ crore) | EBITDA (₹ crore) |\n"
+    "| Q1 FY23 | 1,512 | 285 |\n| Q2 FY23 | 1,598 | 312 |\n| Q3 FY23 | 1,661 | 331 |\n| Q4 FY23 | 1,711 | 355 |\n"
+    "| Full year FY23 | 6,482 | 1,283 |"
+).encode()
+
+
+def test_only_fy24_on_a_chart_built_from_the_two_years_tables_drops_the_other_years_series(make_app, fakes):
+    """The real report prints FY24's and FY23's quarters in two tables, and the chart on screen takes both. Filtered to
+    FY24, the FY23 table's series had nothing left, the build failed and fell back to the unfiltered chart ("Done.",
+    both years still there)."""
+    with make_app() as api:
+        p = project(api)
+        upload(api, p, "two_tables.txt", TWO_TABLES)
+        drain(api)
+        chat_id = chat(api, p)
+        a, b = (d["id"] for d in api.get(f"/api/projects/{p}/datasets").json()["items"])
+        both = add_visual(api, chat_id, kind="line", datasets=[a, b], series=[f"{a}:revenue", f"{b}:revenue"])
+        assert len(both["rows"]) == 8
+        _, agent = edit(api, chat_id, "Only FY24.")
+        assert agent["text"] == "Done." and agent["route"]["canvas_edit"]["source"] == "rules"
+        assert [r["x"] for r in canvas(api, chat_id)[0]["rows"]] == ["Q1 FY24", "Q2 FY24", "Q3 FY24", "Q4 FY24"]
+        assert planner_calls(fakes.llm) == []
+
+
+def test_match_periods_prefers_the_quarters_of_a_year_and_falls_back_to_the_year_itself():
+    from app.services.canvas.service import match_periods
+
+    quarters = ["Q1 FY23", "Q2 FY23", "Q1 FY24", "Q2 FY24", "H1 FY24"]
+    assert match_periods(["FY24"], quarters) == ["Q1 FY24", "Q2 FY24", "H1 FY24"]
+    assert match_periods(["FY24", "Q1 FY23"], quarters) == ["Q1 FY23", "Q1 FY24", "Q2 FY24", "H1 FY24"]
+    assert match_periods(["Q2 FY23"], quarters) == ["Q2 FY23"]
+    assert match_periods(["FY25"], quarters) == []
+    assert match_periods(["FY24"], ["Q1 FY24", "Q2 FY24", "FY24"]) == ["Q1 FY24", "Q2 FY24"]  # the "Full year" row
+    assert match_periods(["FY24"], ["FY23", "FY24"]) == ["FY24"]  # annual figures: the year itself
 
 
 def test_an_edit_the_rules_cant_read_goes_to_the_planner_and_keeps_the_visual(app_with_report):
