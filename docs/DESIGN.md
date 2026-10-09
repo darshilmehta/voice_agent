@@ -886,11 +886,12 @@ Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first
 | 0 Skeleton | ✅ done | PRs #1–#3 (hygiene, backend skeleton, frontend shell), #5 (CI), #8 (Docker images + `full` profile, `docker.config.json`, `strict_offline_local_hosts`) |
 | 1 Projects + text document chat | ✅ done | #10 persistence (SQLite + Alembic, projects/chats/messages/pins API), #11 ingestion + hybrid retrieval, #12 sidebar, project and chat pages, transcript view, #16 upload + background ingestion + streamed cited chat (transport-agnostic `ChatTurnService`), #14 upload UI + streaming composer + citation popovers. Verified end to end on the real models: FY24 EBITDA 18.2% cited p.2 in EN and HI, out-of-document question abstains, transcript survives reload |
 | 4–6 Voice loop | ✅ done | #17 + #19 protocol (§3.10), #21 voice session backend (VAD, speculative STT, Kokoro streaming, barge-in, preload), #20 voice-first chat page (presence field, captions, browser VAD barge-in, transcript panel, "Start a conversation"), #18 citation tables. Independently reviewed (both sides) and verified end to end on the real models in the browser: spoken question → cited spoken answer, barge-in with `heard_text`, backchannels ignored, stop, Hindi, reload, second tab, backend restart; first audio median ~3.2 s in the browser, 2.7–4.9 s across runs (§9.5) |
-| 3 + 7 Router, state, revisit features | ✅ backend done | #23 automatic titles, user summaries, transcript export; router + conversation state + memory summary + drift and EN/HI/Hinglish switching (this PR): 43/43 intents on the labelled set with `qwen3:4b-instruct` (prompt tuned on that set), router p50 ≈ 0.65 s / p95 ≈ 1 s on routed turns, 0 on fast-path turns. UI for summaries/export next |
+| 3 + 7 Router, state, revisit features | ✅ done | #23 automatic titles, user summaries, transcript export; #24 router + conversation state + memory summary + drift and EN/HI/Hinglish switching: 43/43 intents on the labelled set with `qwen3:4b-instruct` (prompt tuned on that set), router p50 ≈ 0.65 s / p95 ≈ 1 s on routed turns, 0 on fast-path turns; #25 summary/export/title UI and routed-answer labels; #29 title job lane |
+| 10 Live visual canvas | in progress | **part of the MVP** (user decision 2026-10-09); §12.1, contract v1 |
 
 Design-only PRs so far: #4 and #6 (voice presence UI, §3.8), #7 (projects, chats, transcripts, §3.9).
 
-**Execution order (voice-first).** After phase 1 lands, go straight to the voice loop with the voice-first chat page: **4 → 5 → 6**, then **3 + 7** (router, drift, language switching; summaries/titles/export as revisit features), then **2** tuning on the eval set, **8** (web search), **9** (evals, latency, polish). Phase numbers keep their meaning; only the order changes.
+**Execution order (voice-first).** After phase 1 lands, go straight to the voice loop with the voice-first chat page: **4 → 5 → 6**, then **3 + 7** (router, drift, language switching; summaries/titles/export as revisit features), then **2** tuning on the eval set, **8** (web search), **10** (live visual canvas, in the MVP since 2026-10-09: its backend foundation and canvas panel are built in parallel with 2 and 8, the router/voice integration after the quality round), **9** (evals, latency, polish). Phase numbers keep their meaning; only the order changes.
 
 | Phase | Deliverable | Done when |
 |---|---|---|
@@ -904,6 +905,7 @@ Design-only PRs so far: #4 and #6 (voice presence UI, §3.8), #7 (projects, chat
 | 7 | Topic drift + EN/HI switching + code-mixing | drift script passes: document → general → Hindi → document |
 | 8 | Live-data tools: web search with filler + streamed partial answers (§3.7) | mixed doc+live question answered with separate [S]/[W] citations; first words < 1 s after filler; barge-in cancels search; timeout falls back to document-only answer |
 | 9 | Evals + observability + UI polish | retrieval Recall@5/MRR, groundedness, latency dashboard; demo script runs end to end |
+| 10 | **Live visual canvas** (§12.1, MVP): typed datasets, chartability, `VisualSpec` + validator + calculator, overview dashboard on upload, canvas panel, router/voice integration | every plotted number grounded to a cell (100%), hallucinated values 0; "show me revenue over five years" puts a cited chart on screen ≤ 1 s after the spoken answer starts; voice edits ("make it a bar chart", "remove that") work; overview dashboard after upload |
 
 Each phase is green (tests + acceptance criteria) before the next starts.
 
@@ -984,6 +986,41 @@ KPI tiles · line (trend) · bar / grouped bar (comparison) · stacked bar (comp
 - **No extra models needed;** memory impact is the frontend chart library plus SQLite datasets.
 - **Latency:** the visual must never delay first audio; target visual on screen ≤ 1 s after the spoken answer starts.
 
-#### Suggested placement
+#### Placement
 
-After the core voice loop (phases 0–7): datasets hook in phase 1 (workstream 1), then a dedicated **"Visual canvas"** phase covering workstreams 2–9, with speculative preparation (10) last. To be scheduled once phases 0–7 are green.
+**Part of the MVP (user decision 2026-10-09)** as phase 10 (§10). Workstream 1 landed in phase 1 (every Docling table is stored as a cell-level dataset in `document_tables`). Workstreams 2–4, 6 (storage and API), 7 and 9 are built first and in parallel; 5 and 8 (router and voice integration) follow the quality round; 10 (speculative preparation) comes last.
+
+#### Contract v1 (backend ↔ frontend)
+
+Application code turns a validated `VisualSpec` (what the model picked) into a **`Visual`** (what the frontend renders). The frontend never sees model output and never computes numbers.
+
+```text
+Visual {
+  id: "vis_…", chat_id | null (null = project overview), project_id, created_at, updated_at,
+  kind: "kpi" | "line" | "bar" | "grouped_bar" | "stacked_bar" | "waterfall" | "donut" | "table" | "comparison" | "timeline",
+  title, subtitle | null, language: "en" | "hi",
+  summary: str                     # text alternative (screen readers, transcript, spoken one-liner)
+  unit: Unit | null                # default unit of the values
+  x: {key, label, type: "period" | "category" | "date"} | null        # null for kpi / comparison
+  series: [{key, label, unit: Unit | null, calculated: bool}]
+  rows: [{x: str, values: {series_key: number | null}, cells: {series_key: CellRef | null}}]
+  tiles: [{label, value: number, unit: Unit | null, cell: CellRef | null,
+           delta: {value: number, kind: "abs" | "pct" | "pp", calculation: Calculation} | null}]    # kpi / comparison only
+  events: [{date: "YYYY-MM-DD" | label, label, detail | null, cell: CellRef | null}]                 # timeline only
+  highlight: {x: [str], series: [str], note | null} | null
+  calculations: [Calculation]      # every derived number shown anywhere in this visual
+  sources: [Citation]              # the document citations (source_id S1…) that CellRefs point to
+  pinned: bool, position: int      # on the canvas
+}
+Unit        { kind: "currency" | "percent" | "count" | "ratio" | "duration" | "none", currency: "INR" | "USD" | … | null,
+              scale: "crore" | "lakh" | "million" | "billion" | "thousand" | null, label: "₹ crore" }
+CellRef     { source_id: "S1", document_id, table_id, page, row, col, text }      # the exact cell the value came from
+Calculation { label, op: "growth" | "cagr" | "diff" | "ratio" | "share" | "sum", value: number, unit: Unit | null,
+              inputs: [CellRef], formula_text }                                     # labelled "calculated" in the UI
+```
+
+- Values are numbers in the unit's scale (4210 with `scale: "crore"` = ₹4,210 crore); the frontend formats them (Indian grouping for INR/lakh/crore sources, Hindi labels when `language: "hi"`).
+- **Canvas** (per chat): `GET /api/chats/{id}/canvas` → `{panels: [Visual]}` in position order; `POST /api/chats/{id}/canvas/ops` with `{op: "remove" | "pin" | "unpin" | "move", visual_id, position?}` → the new canvas. Visuals are added by the conversation (and, for testing and the debug panel, `POST /api/chats/{id}/visuals` with a `VisualSpec`).
+- **Overview** (per project, built after ingestion): `GET /api/projects/{id}/overview` → `{panels: [Visual], status: "ready" | "building" | "none"}`.
+- **Events** on both transports (SSE and the voice WebSocket, with `turn_id` on the WebSocket): `visual {phase: "preparing" | "ready" | "failed", visual_id, visual?: Visual, detail?}` and `canvas {panels: [Visual]}` (a snapshot after any change). A visual never delays the spoken answer; `preparing` lets the UI show a skeleton.
+- Additive changes are allowed; anything else changes this section first.
