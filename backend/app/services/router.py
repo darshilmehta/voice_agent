@@ -55,6 +55,7 @@ from .canvas.conversation import CanvasEdit, parse_edit, refers_to_screen
 from .canvas.planner import visual_intent
 from .language import asked_language, is_devanagari, message_language, wordset
 from .live_data import live_data_cue
+from .retrieval import fiscal_year_ends
 from .sources import strip_markers
 
 ROUTER_PROMPT_VERSION = "router-v1"
@@ -325,9 +326,10 @@ def is_definitional(text: str) -> bool:
 
 def about_the_documents(text: str, filenames: Sequence[str] = ()) -> bool:
     """Points at what the documents are about: names them ("the report"), their subject ("the company", "our
-    revenue", "its board") or a reporting period ("FY24", "at the end of the year", "वित्त वर्ष"), or a name from a
-    document's filename ("Valmora" for valmora_annual_report_fy24.pdf)."""
-    if mentions_documents(text, filenames) or _DOCUMENT_SUBJECT.search(text):
+    revenue", "its board") or a reporting period ("FY24", "at the end of the year", "वित्त वर्ष", the end of a fiscal
+    year: "31 March 2024", "March 31, 2024", "31.03.2024", "31 मार्च 2024"), or a name from a document's filename
+    ("Valmora" for valmora_annual_report_fy24.pdf)."""
+    if mentions_documents(text, filenames) or _DOCUMENT_SUBJECT.search(text) or fiscal_year_ends(text):
         return True
     names = {
         w

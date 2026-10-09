@@ -140,6 +140,7 @@ from .prompts import (
     continuation_user_prompt,
     conversation_system_prompt,
     coverage_note,
+    fiscal_year_end_note,
     general_system_prompt,
     general_user_prompt,
     insist_on_language,
@@ -165,6 +166,7 @@ from .retrieval import (
     RetrievalService,
     SpeculationOutcome,
     asked_periods,
+    fiscal_year_ends,
     scope_of,
 )
 from .router import LLMTurnRouter, RouteRequest, TurnRouter, asks_about_facts, fast_route, heard
@@ -1655,6 +1657,11 @@ class ChatTurnService:
             notes = []
             if (latest := self._latest_period([turn.text, plan.query, plan.query_en], sources)) is not None:
                 notes.append(latest_period_note(latest))
+            year_ends = list(
+                dict.fromkeys(y for t in (turn.text, query, plan.query_en) if t for y in fiscal_year_ends(t))
+            )
+            if year_ends:  # "31 March 2024" is the end of FY24
+                notes.append(fiscal_year_end_note(year_ends))
             if renames:
                 notes.append(names_note(renames))
             on_screen = None

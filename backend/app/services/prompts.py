@@ -594,6 +594,17 @@ def latest_period_note(period: str) -> str:
     )
 
 
+def fiscal_year_end_note(years: Sequence[int]) -> str:
+    """The question names the last day of a fiscal year ("31 March 2024"): which year that is (the final real run:
+    "net debt on 31 March 2024" was answered with FY23's figure, "at 31 March 2023", from the recap of FY23)."""
+    fys = " and ".join(f"FY{y:02d}" for y in years)
+    dates = " and ".join(f"31 March 20{y:02d}" for y in years)
+    return (
+        f"(Indian fiscal years run from April to March: {dates} is the end of {fys}. Answer with the figure as at "
+        f"{dates} ({fys}), not another year's; if the sources don't give it, say so.)"
+    )
+
+
 def names_note(renames: Mapping[str, str]) -> str:
     """The user's words for a name, as speech recognition heard them, and the documents' spelling (item 10)."""
     pairs = "; ".join(f'"{said}" is {name}' for said, name in renames.items())
