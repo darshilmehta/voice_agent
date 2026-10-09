@@ -142,6 +142,8 @@ def prepare(messages: Sequence[Message]) -> Prepared:
             label = "Assistant (interrupted: the user heard only this)" if heard else "Assistant"
             if route.get("answer") == "general" or route.get("general_note") == "not_covered":
                 label += " (general knowledge, not from the documents)"
+            if route.get("web_sources"):  # live data (§3.7): its web sources are numbered like the documents
+                label += " (includes live web results)"
             lines.append(_line(m.seq, f"#{m.seq} {label}: {body}"))
     return Prepared(lines, sources, unanswered)
 

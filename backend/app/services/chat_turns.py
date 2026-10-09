@@ -12,6 +12,17 @@
     citations validated, message saved with route and latency, conversation state advanced → AgentMessageEvent
     any failure                                                  → ErrorEvent (stage: retrieval | llm | storage), end
 
+Live data (§3.7): a route with ``tools=["web_search"]`` starts the web search (services/web_search.py) right after
+planning, so it runs beside document retrieval                   → ToolEvent start (the query that leaves the machine)
+    the first web results (partial_wait_ms after the first one, bounded by timeout_s) → ToolEvent results [W1]…
+    sources: document passages [S#] and web results [W#] (``kind: "web"``) → SourcesEvent
+    the answer from both (live prompt: each fact cited and said as from the report or from the web) → DeltaEvent …
+    results that arrived meanwhile: at most ``max_continuations`` short continuations → ToolEvent results, DeltaEvent
+    the search ends                                              → ToolEvent done | timeout | failed
+    no web results (timeout, failure) or the tool unavailable: the answer starts with a fixed notice ("I couldn't get
+    live data just now.") and answers from the documents (or abstains, or answers from general knowledge) as before.
+Stopping the turn cancels the search and its page fetches with it.
+
 Every turn that doesn't fail ends with ``AgentMessageEvent``. A "stop" turn says nothing: no ``DeltaEvent``, and the
 message it ends with has role ``event`` (a short notice for the transcript, carrying the route).
 
@@ -42,6 +53,7 @@ import asyncio
 import contextlib
 import functools
 import logging
+import re
 import time
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -49,9 +61,11 @@ from typing import Any, ClassVar, Literal
 
 from ..domain.conversation import ConversationState
 from ..domain.projects import Chat, Citation, Message, Modality
+from ..providers.base import PlaceholderProvider
 from ..providers.llm import LLMClient, LLMMessage
 from ..providers.registry import Container
 from ..providers.storage import MetadataDB
+from ..providers.web_search import WebSearch
 from ..settings import Language, Settings
 from .base import InvalidInput
 from .chats import ChatService
@@ -63,24 +77,34 @@ from .messages import MessageService
 from .planning import DocumentQARouter, TurnPlan, TurnPlanner, interrupted_answer
 from .prompts import (
     ANSWER_LENGTHS,
+    CONTINUATION_NOTHING,
+    CONTINUATION_PROMPT_VERSION,
+    LIVE_PROMPT_VERSION,
     PROMPT_IDS,
     SILENT_NOTICES,
     AbstainReason,
     AnswerLength,
+    DocumentsPart,
     abstention,
     ack_text,
     answer_system_prompt,
     answer_user_prompt,
     clarification_system_prompt,
+    continuation_user_prompt,
     conversation_system_prompt,
     general_system_prompt,
     general_user_prompt,
+    live_notice,
+    live_system_prompt,
+    live_user_prefix,
+    live_user_prompt,
     resume_text,
     with_memory,
 )
 from .retrieval import Confidence, RetrievalResult, RetrievalService, SpeculationOutcome
 from .router import LLMTurnRouter, RouteRequest, TurnRouter, heard
 from .sources import Source, build_sources, finalize_answer, strip_markers, trim_open_marker
+from .web_search import ToolEvent, WebSearchRun, WebSource
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +117,7 @@ __all__ = [  # the turn API used by the transports, and the router slot (phase 1
     "DocumentQARouter",
     "ErrorEvent",
     "SourcesEvent",
+    "ToolEvent",
     "Turn",
     "TurnPlan",
     "TurnRouter",
@@ -105,6 +130,10 @@ TEXT_MAX = 4000
 HISTORY_MESSAGES = 6  # recent messages sent as conversation context (three exchanges)
 HISTORY_CHARS = 1000  # per message
 SHORT_REPLY_TOKENS = 96  # conversation replies and clarifying questions: one sentence
+CONTINUATION_TOKENS = 96  # one sentence about results that arrived after the answer started (§3.7)
+# The end of a continuation's first sentence: a full stop before a capitalised word or a Devanagari one ("Rs. 997"
+# and "U.S. dollar" don't end it).
+_FIRST_SENTENCE = re.compile("(?<=[.!?।])\\s+(?=[A-Z\"'ऀ-ॿ])")
 
 Stage = Literal["retrieval", "llm", "storage"]
 
@@ -158,7 +187,7 @@ class UserMessageEvent:
 @dataclass(frozen=True, slots=True)
 class SourcesEvent:
     """The numbered sources the answer may cite (none when abstaining or not searching) and the retrieval
-    confidence."""
+    confidence. Document passages [S#] first, then the web results the answer starts with [W#] (``kind: "web"``)."""
 
     sources: list[Citation]
     confidence: Confidence | None
@@ -208,7 +237,7 @@ class ErrorEvent:
         return {"detail": self.detail, "stage": self.stage}
 
 
-ChatEvent = UserMessageEvent | SourcesEvent | DeltaEvent | AgentMessageEvent | ErrorEvent
+ChatEvent = UserMessageEvent | SourcesEvent | DeltaEvent | AgentMessageEvent | ErrorEvent | ToolEvent
 
 
 # ------------------------------------------------------------------ turn
@@ -274,6 +303,15 @@ class _Progress:
     memory: str | None = None  # the chat's memory summary
     ready: Mapping[str, str] = field(default_factory=dict)  # READY documents: id → filename
     speculation: SpeculationOutcome = "none"
+    web: WebSearchRun | None = None  # the turn's web search (§3.7)
+    web_sources: list[WebSource] = field(default_factory=list)  # web results given to the model, [W1]…
+    documents_part: DocumentsPart = "none"  # what the live prompt says about the documents
+    continuations: int = 0  # continuation sentences added after the answer
+    warm: asyncio.Task[Any] | None = None  # the live prompt's prefix, read by the model while the web is searched
+
+    @property
+    def citable(self) -> list[Source | WebSource]:
+        return [*self.sources, *self.web_sources]
 
 
 @dataclass
@@ -308,6 +346,7 @@ class ChatTurnService:
         llm: LLMClient,
         settings: Settings,
         router: TurnRouter | None = None,
+        web_search: WebSearch | None = None,
     ) -> None:
         self.chats = ChatService(db)
         self.messages = MessageService(db)
@@ -316,6 +355,7 @@ class ChatTurnService:
         self.retrieval = retrieval
         self.llm = llm
         self.settings = settings
+        self.web_search = web_search  # None: no live-data tool (questions that want live data say so)
         self.router: TurnRouter = router if router is not None else LLMTurnRouter(llm)
         self.planner = TurnPlanner(retrieval, self.router, timeout_s=settings.llm.router_timeout_ms / 1000)
         self.memory = MemoryKeeper(db, llm, settings, window=HISTORY_MESSAGES)
@@ -327,7 +367,21 @@ class ChatTurnService:
             raise TypeError(
                 f"expected MetadataDB and LLMClient providers, got {type(db).__name__}, {type(llm).__name__}"
             )
-        return cls(db, retrieval=RetrievalService.from_container(container), llm=llm, settings=container.settings)
+        web = container.providers.get("web_search")
+        web_search = web if isinstance(web, WebSearch) and not isinstance(web, PlaceholderProvider) else None
+        return cls(
+            db,
+            retrieval=RetrievalService.from_container(container),
+            llm=llm,
+            settings=container.settings,
+            web_search=web_search,
+        )
+
+    def available_tools(self) -> frozenset[str]:
+        """The live-data tools that can run now (§3.7): web search when configured, allowed and reachable."""
+        if self.web_search is None or self.web_search.unavailable_reason() is not None:
+            return frozenset()
+        return frozenset({"web_search"})
 
     async def begin(
         self,
@@ -478,7 +532,13 @@ class ChatTurnService:
             return
         state = p.state
         request = RouteRequest(
-            turn.text, turn.language, history, state, list(ready.values()), interrupted_answer(history)
+            turn.text,
+            turn.language,
+            history,
+            state,
+            list(ready.values()),
+            interrupted_answer(history),
+            available_tools=self.available_tools(),
         )
         plan = p.plan = await self.planner.plan(
             request, project_id=chat.project_id, ready=ready, retrieval_enabled=state.retrieval_enabled
@@ -502,6 +562,27 @@ class ChatTurnService:
                 yield event
             return
 
+        # The web search (if any) starts now and runs while the documents are searched; it ends with the turn.
+        web = p.web = self._start_web(plan)
+        try:
+            if web is not None:
+                yield ToolEvent("start", web.query)
+            async with contextlib.aclosing(self._sourced_answer(turn, history, clock, p)) as answer:
+                async for event in answer:
+                    yield event
+        finally:
+            if p.warm is not None and not p.warm.done():  # stopped while waiting for the web
+                p.warm.cancel()
+            if web is not None:
+                await web.aclose()
+
+    async def _sourced_answer(
+        self, turn: Turn, history: Sequence[Message], clock: _Clock, p: _Progress
+    ) -> AsyncGenerator[ChatEvent, None]:
+        """Retrieval (and the web's first results), the abstention gate, the sources, the answer and its
+        continuation from later web results, the save."""
+        chat, plan, ready, web = turn.chat, p.plan, p.ready, p.web
+        confidence: Confidence | None = None
         if plan.needs_retrieval:
             try:
                 result = p.result = await self._retrieve(plan, p, chat) if ready else None
@@ -511,58 +592,167 @@ class ChatTurnService:
                 return
             p.retrieval_ms = clock.ms()
             confidence = result.confidence if result is not None else None
-            if confidence is None or not confidence.above_threshold:
-                if plan.mode == "mixed":  # the document part isn't covered: general knowledge, saying so
-                    plan = p.plan = plan.as_general("not_covered" if ready else "no_documents")
-                    yield SourcesEvent([], confidence, abstained=False)
-                else:
-                    reason: AbstainReason = "no_documents" if not ready else "not_covered"
-                    p.abstained, p.reason = True, reason
-                    yield SourcesEvent([], confidence, abstained=True)
-                    answer = abstention(plan.language, reason)
-                    p.parts.append(answer)
-                    yield DeltaEvent(answer)
-                    route = self._route(turn, p, abstained=True, reason=reason, model_used=False)
-                    latency = self._latency(clock, p, first_delta_ms=clock.ms(), llm_ms=None)
-                    async for event in self._save_answer(turn, answer, [], route, latency, p):
-                        yield event
-                    return
+        covered = plan.needs_retrieval and confidence is not None and confidence.above_threshold
+        if covered:
+            assert p.result is not None
+            p.sources = build_sources(
+                p.result.chunks, ready, budget_tokens=self.settings.retrieval.context_token_budget
+            )
+            p.documents_part = "sources"
+        elif plan.needs_retrieval:
+            p.documents_part = "not_covered"
+
+        if web is not None:  # the answer starts on the first web results (or without them, saying so)
+            if not web.results:  # waiting for the web: have the model read the documents meanwhile
+                p.warm = self._warm_up(turn, plan, history, p)
+            p.web_sources = await web.first_batch()
+            if p.web_sources:
+                yield web.results_event(p.web_sources)
+            if (end := web.terminal_event()) is not None:
+                yield end
+            if not p.web_sources:
+                plan = p.plan = plan.without_live_data("failed")
+        web_citations = [w.citation() for w in p.web_sources]
+
+        if plan.needs_retrieval and not covered:
+            if p.web_sources:  # the documents don't answer it, the web may: say so and answer from the web
+                yield SourcesEvent(web_citations, confidence, abstained=False)
+            elif plan.mode == "mixed":  # the document part isn't covered: general knowledge, saying so
+                plan = p.plan = plan.as_general("not_covered" if ready else "no_documents")
+                yield SourcesEvent([], confidence, abstained=False)
             else:
-                assert result is not None
-                p.sources = build_sources(
-                    result.chunks, ready, budget_tokens=self.settings.retrieval.context_token_budget
-                )
-                yield SourcesEvent([s.citation() for s in p.sources], confidence, abstained=False)
+                reason: AbstainReason = "no_documents" if not ready else "not_covered"
+                p.abstained, p.reason = True, reason
+                yield SourcesEvent([], confidence, abstained=True)
+                notice = live_notice(plan.live_note, plan.language) + " " if plan.live_note else ""
+                answer = notice + abstention(plan.language, reason)
+                p.parts.append(answer)
+                yield DeltaEvent(answer)
+                route = self._route(turn, p, abstained=True, reason=reason, model_used=False)
+                latency = self._latency(clock, p, first_delta_ms=clock.ms(), llm_ms=None)
+                async for event in self._save_answer(turn, answer, [], route, latency, p):
+                    yield event
+                return
+        elif covered:
+            yield SourcesEvent([*(s.citation() for s in p.sources), *web_citations], confidence, abstained=False)
         else:
-            yield SourcesEvent([], None, abstained=False)
+            yield SourcesEvent(web_citations, None, abstained=False)
+
+        if plan.live_note is not None and not p.web_sources:  # live data asked for, none to give: say so first
+            notice = live_notice(plan.live_note, plan.language) + " "
+            p.first_delta_ms = clock.ms()
+            p.parts.append(notice)
+            yield DeltaEvent(notice)
 
         p.llm_start = time.perf_counter()
-        prompt = self._prompt(turn, plan, history, p.sources, p.memory)
+        prompt = self._prompt(turn, plan, history, p.sources, p.memory, p)
         short = plan.mode in ("conversation", "clarification")
         stream = self.llm.stream(
             prompt, max_tokens=SHORT_REPLY_TOKENS if short else ANSWER_LENGTHS[turn.length].max_tokens
         )
+        model_parts: list[str] = []
         try:
             async with contextlib.aclosing(stream):  # type: ignore[type-var]  (closing the stream stops generation)
                 async for piece in stream:
                     if p.first_delta_ms is None:
                         p.first_delta_ms = clock.ms()
                     p.parts.append(piece)
+                    model_parts.append(piece)
                     yield DeltaEvent(piece)
+                    # The search ended with nothing left to add: the "searching the web" badge can go now.
+                    if web is not None and web.taken == len(web.results) and (end := web.terminal_event()):
+                        yield end
         except Exception as e:  # cancellation (BaseException) goes to run's handler
             log.warning("chat %s: answer generation failed: %s", chat.id, _describe(e))
             yield ErrorEvent("llm", f"answer generation failed: {_describe(e)}")
             return
-        answer, citations = finalize_answer("".join(p.parts), p.sources)
+        if not "".join(model_parts).strip():
+            yield ErrorEvent("llm", "the model returned an empty answer")
+            return
+        llm_ms = clock.ms(p.llm_start)
+        if web is not None:
+            async for event in self._continue(turn, prompt, "".join(model_parts), p, web):
+                yield event
+            if (end := web.stop()) is not None:
+                yield end
+        answer, citations = finalize_answer("".join(p.parts), p.citable)
         if not answer:
             yield ErrorEvent("llm", "the model returned an empty answer")
             return
-        if p.sources and not citations:
+        if (p.sources or p.web_sources) and not citations:
             log.info("chat %s: answer cites no source", chat.id)
         route = self._route(turn, p, abstained=False, reason=None)
-        latency = self._latency(clock, p, first_delta_ms=p.first_delta_ms, llm_ms=clock.ms(p.llm_start))
+        latency = self._latency(clock, p, first_delta_ms=p.first_delta_ms, llm_ms=llm_ms)
         async for event in self._save_answer(turn, answer, citations, route, latency, p):
             yield event
+
+    # -------------------------------------------------------------- live data (§3.7)
+
+    def _start_web(self, plan: TurnPlan) -> WebSearchRun | None:
+        """Start the plan's web search (only its query leaves the machine)."""
+        if plan.web_query is None or self.web_search is None or "web_search" not in plan.tools:
+            return None
+        return WebSearchRun(self.web_search, plan.web_query, self.settings.tools.web_search)
+
+    async def _continue(
+        self, turn: Turn, prompt: list[LLMMessage], answer: str, p: _Progress, web: WebSearchRun
+    ) -> AsyncGenerator[ChatEvent, None]:
+        """Results (and page texts) that arrived after the answer started: at most ``max_continuations`` short
+        continuations, each one more model call, kept only if it cites what is new."""
+        cfg = self.settings.tools.web_search
+        if not p.web_sources or not cfg.stream_partial_results:
+            return
+        for i in range(cfg.max_continuations):
+            new = await web.next_batch(last=i == cfg.max_continuations - 1)
+            pages = web.fresh_pages()
+            if new:
+                p.web_sources.extend(new)
+                yield web.results_event(new)
+            if not new and not pages:
+                return
+            text = await self._continuation(turn, prompt, answer, new, pages, p)
+            if text:
+                piece = " " + text
+                p.parts.append(piece)
+                answer += piece
+                p.continuations += 1
+                yield DeltaEvent(piece)
+            if web.finished and not web.pending_pages:
+                return
+
+    async def _continuation(
+        self,
+        turn: Turn,
+        prompt: list[LLMMessage],
+        answer: str,
+        new: Sequence[WebSource],
+        pages: Sequence[WebSource],
+        p: _Progress,
+    ) -> str | None:
+        """One continuation sentence (buffered: it is kept only if it cites a new result or page), or None."""
+        for source in (*new, *pages):
+            source.content_given = source.content_given or bool(source.content)
+        messages = [
+            *prompt,
+            LLMMessage("assistant", answer),
+            LLMMessage("user", continuation_user_prompt(new, pages, p.plan.language)),
+        ]
+        pieces: list[str] = []
+        try:
+            stream = self.llm.stream(messages, max_tokens=CONTINUATION_TOKENS)
+            async with contextlib.aclosing(stream):  # type: ignore[type-var]
+                async for piece in stream:
+                    pieces.append(piece)
+        except Exception as e:  # the answer stands without it
+            log.warning("chat %s: continuation failed: %s", turn.chat.id, _describe(e))
+            return None
+        text = _FIRST_SENTENCE.split(" ".join("".join(pieces).split()), maxsplit=1)[0]  # one sentence, as asked
+        fresh = {s.source_id for s in (*new, *pages)}
+        _, cited = finalize_answer(text, p.citable)
+        keep = not text.startswith(CONTINUATION_NOTHING) and any(c.source_id in fresh for c in cited)
+        verdict = "kept" if keep else "dropped"
+        log.info("chat %s: continuation from %s %s: %r", turn.chat.id, sorted(fresh), verdict, text)
+        return text if keep else None
 
     # -------------------------------------------------------------- helpers
 
@@ -605,26 +795,69 @@ class ChatTurnService:
         history: Sequence[Message],
         sources: Sequence[Source],
         memory: str | None,
+        p: _Progress | None = None,
     ) -> list[LLMMessage]:
         language, length = plan.language, turn.length
-        if plan.mode in ("grounded", "mixed"):
-            system = answer_system_prompt(language, length, mixed=plan.mode == "mixed")
+        web = p.web_sources if p is not None else []
+        if web and p is not None and p.web is not None:  # live data (§3.7): documents [S#] and web results [W#]
+            # Page texts are long (prefill ~3 ms per token): the first answer has the snippets, a continuation the
+            # pages, unless no continuation will come.
+            cfg = self.settings.tools.web_search
+            pages = not (cfg.stream_partial_results and cfg.max_continuations > 0)
+            system = live_system_prompt(language, length, documents=p.documents_part)
+            question = live_user_prompt(
+                plan.query, sources, web, language, search_query=p.web.query, with_content=pages
+            )
+            for source in web:
+                source.content_given = source.content_given or (pages and bool(source.content))
+        elif plan.mode in ("grounded", "mixed"):
+            system = answer_system_prompt(language, length, mixed=plan.mode == "mixed", live_note=plan.live_note)
             question = answer_user_prompt(plan.query, sources, language)
         elif plan.mode == "general":
-            system = general_system_prompt(language, length, plan.general_note)
+            system = general_system_prompt(language, length, plan.general_note, live_note=plan.live_note)
             question = general_user_prompt(plan.query, language)
         elif plan.mode == "clarification":
             system, question = clarification_system_prompt(language), turn.text
         else:
             system, question = conversation_system_prompt(language), turn.text
+        return [*self._context(system, history, memory), LLMMessage("user", question)]
+
+    @staticmethod
+    def _context(system: str, history: Sequence[Message], memory: str | None) -> list[LLMMessage]:
+        """The system prompt (with the memory summary) and the recent messages."""
         messages = [LLMMessage("system", with_memory(system, memory))]
         for m in history:
             # Interrupted voice answers: only what was heard ("" when nothing was: the answer is left out).
             text = strip_markers(heard(m))[:HISTORY_CHARS]
             if text:
                 messages.append(LLMMessage("user" if m.role == "user" else "assistant", text))
-        messages.append(LLMMessage("user", question))
         return messages
+
+    def _warm_up(
+        self, turn: Turn, plan: TurnPlan, history: Sequence[Message], p: _Progress
+    ) -> asyncio.Task[Any] | None:
+        """While the web is searched, have the model read what the live prompt starts with (system prompt, history,
+        document passages): the model server keeps that prefix, so the answer then only reads the web results and
+        the question (§3.7; prefill is ~3 ms per token on this machine, most of the time to the first word).
+        A one-token request in the background, cancelled with the turn; its failure changes nothing."""
+        if p.web is None:
+            return None
+        system = live_system_prompt(plan.language, turn.length, documents=p.documents_part)
+        messages = self._context(system, history, p.memory)
+        if p.sources:
+            messages.append(LLMMessage("user", live_user_prefix(p.sources)))
+
+        async def warm() -> None:
+            try:
+                await self.llm.generate(messages, max_tokens=1)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.info("chat %s: warming the live prompt failed: %s", turn.chat.id, _describe(e))
+
+        task = asyncio.ensure_future(warm())
+        task.set_name("live-prompt-warm-up")
+        return task
 
     def _route(
         self,
@@ -641,12 +874,18 @@ class ChatTurnService:
         plan, result = p.plan, p.result
         route = plan.route
         prompt = PROMPT_IDS[plan.mode] if model_used else None
+        if model_used and p.web_sources:
+            prompt = LIVE_PROMPT_VERSION + (f"+{CONTINUATION_PROMPT_VERSION}" if p.continuations else "")
         return {
             "intent": plan.intent,
             "needs_retrieval": plan.needs_retrieval,
             "rewritten_query": route.rewritten_query if route is not None else None,
             "query_en": plan.query_en,
             "tools": list(route.tools) if route is not None else [],
+            "web_search": p.web.record() if p.web is not None else None,
+            "live_note": plan.live_note,
+            "web_sources": len(p.web_sources),
+            "continuations": p.continuations,
             "topic": route.topic if route is not None else None,
             "is_topic_shift": route.is_topic_shift if route is not None else False,
             "response_language": plan.language,
@@ -673,7 +912,7 @@ class ChatTurnService:
     def _latency(clock: _Clock, p: _Progress, *, first_delta_ms: float | None, llm_ms: float | None) -> dict[str, Any]:
         timings = p.result.timings_ms if p.result is not None else {}
         decision = p.plan.decision
-        return {
+        latency: dict[str, Any] = {
             "router_ms": p.plan.router_ms,
             "router_llm_ms": decision.llm_ms if decision is not None else None,
             "retrieval_ms": p.retrieval_ms,
@@ -684,6 +923,9 @@ class ChatTurnService:
             "llm_ms": llm_ms,
             "total_ms": clock.ms(),
         }
+        if p.web is not None:  # from the web search's start (right after routing)
+            latency.update(p.web.latency())
+        return latency
 
     def _advance_state(
         self,
@@ -768,7 +1010,7 @@ class ChatTurnService:
         sources that text cites, with what was heard of it when the caller knows (``stop``), and remember it as the
         interrupted answer. Without ``stop``, nothing is saved when no text remains; with it (voice) an empty answer
         is saved, so the turn is closed."""
-        text, citations = finalize_answer(trim_open_marker("".join(p.parts)), p.sources)
+        text, citations = finalize_answer(trim_open_marker("".join(p.parts)), p.citable)
         if not text and stop is None:
             return
         route = self._route(turn, p, abstained=p.abstained, reason=p.reason, stopped=True)

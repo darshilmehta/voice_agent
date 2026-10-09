@@ -30,6 +30,7 @@ from .fakes import (
     FakeSTT,
     FakeTTS,
     FakeVAD,
+    FakeWebSearch,
     TextParser,
     keyword_scorer,
 )
@@ -224,6 +225,7 @@ class Fakes:
     vad: FakeVAD = field(default_factory=FakeVAD)
     stt: FakeSTT = field(default_factory=FakeSTT)
     tts: FakeTTS = field(default_factory=FakeTTS)
+    web: FakeWebSearch | None = None  # None: the configured provider (SearXNG, turned off) stays
 
     def install(self, container: Any) -> Any:
         container.providers.update(
@@ -236,6 +238,8 @@ class Fakes:
             stt=self.stt,
             tts=self.tts,
         )
+        if self.web is not None:
+            container.providers["web_search"] = self.web
         return container
 
 

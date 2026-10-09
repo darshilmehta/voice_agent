@@ -10,6 +10,9 @@ Both formats are built from the same ``TranscriptExport`` model, so they always 
   (and in the Markdown's ``[n]``).
 
 Source numbers are chat-wide: one per distinct document and page range, in order of first citation (``chat_sources``).
+Live web results (``[W#]``, §3.7) are sources too, one per URL: their citations and sources carry ``kind: "web"``,
+``url`` and ``title`` (document entries are unchanged: no ``kind`` means a document), and Markdown lists them with
+their title and link.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import quote
 
-from pydantic import BaseModel
+from pydantic import BaseModel, SerializerFunctionWrapHandler, model_serializer
 
 from ..domain.projects import Chat, Message
 from ..domain.summaries import SourceRef, SummaryData, UnansweredQuestion, UserSummary
@@ -69,15 +72,30 @@ class ExportChat(BaseModel):
     last_message_at: datetime | None
 
 
-class ExportCitation(BaseModel):
-    source_id: str  # the marker in the message text: "S1" for [S1]
+class _WebFields(BaseModel):
+    """``kind``, ``url`` and ``title`` appear on web sources only: document entries stay as they were."""
+
+    @model_serializer(mode="wrap")
+    def _without_web_fields(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        if data.get("kind") == "document":
+            for name in ("kind", "url", "title"):
+                data.pop(name, None)
+        return data
+
+
+class ExportCitation(_WebFields):
+    source_id: str  # the marker in the message text: "S1" for [S1], "W1" for a web result [W1]
     ref: int  # the source's number in the top-level ``sources`` list
     document_id: str
-    filename: str
+    filename: str  # web results: the site
     page_start: int | None
     page_end: int | None
     chunk_id: str
     snippet: str
+    kind: Literal["document", "web"] = "document"
+    url: str | None = None
+    title: str | None = None
 
 
 class ExportMessage(BaseModel):
@@ -95,14 +113,17 @@ class ExportMessage(BaseModel):
     latency: dict[str, Any] | None  # stage timings in ms
 
 
-class ExportSource(BaseModel):
+class ExportSource(_WebFields):
     ref: int
     document_id: str
-    filename: str
+    filename: str  # web results: the site
     page_start: int | None
     page_end: int | None
     snippet: str
     cited_by: list[int]  # seq of the messages that cite it
+    kind: Literal["document", "web"] = "document"
+    url: str | None = None
+    title: str | None = None
 
 
 class ExportSummarySource(BaseModel):
@@ -184,6 +205,9 @@ class ExportService(Service):
                     page_end=e.page_end,
                     snippet=e.snippet,
                     cited_by=e.cited_by,
+                    kind=e.kind,
+                    url=e.url,
+                    title=e.title,
                 )
                 for e in sources.entries
             ],
@@ -235,6 +259,9 @@ def _export_message(m: Message, sources: ChatSources) -> ExportMessage:
                 page_end=c.page_end,
                 chunk_id=c.chunk_id,
                 snippet=c.snippet,
+                kind=c.kind,
+                url=c.url,
+                title=c.title,
             )
             for c in m.citations
         ],
@@ -372,6 +399,9 @@ def _render_message(m: ExportMessage) -> list[str]:
 def _render_source(s: ExportSource) -> str:
     pages = pages_label(s.page_start, s.page_end)
     where = f"**{s.filename or '(unknown document)'}**" + (f", {pages}" if pages else "")
+    if s.kind == "web":  # a live web result: its title, the site and the link
+        title = _SPACE.sub(" ", s.title or s.filename or s.url or "web result").strip()
+        where = f"**{title}** (web: {s.filename})" + (f" <{s.url}>" if s.url else "")
     snippet = f" — “{_SPACE.sub(' ', s.snippet).strip()}”" if s.snippet.strip() else ""
     cited = ""
     if s.cited_by:

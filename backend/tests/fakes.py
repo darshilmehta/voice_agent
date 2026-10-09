@@ -35,6 +35,7 @@ from app.providers.retrieval import (
     VectorStore,
 )
 from app.providers.speech import SpeechRecognizer, SpeechSynthesizer, Transcript, VoiceActivityDetector
+from app.providers.web_search import SearchResult, WebSearch, site_of
 from app.services.language import message_language
 
 
@@ -482,3 +483,69 @@ class FakeTTS(SpeechSynthesizer):
             raise self.fail_with
         samples = OUT_RATE * self.MS_PER_WORD // 1000 * len(text.split())
         return np.full(samples, 1000, dtype="<i2").tobytes()
+
+
+# ------------------------------------------------------------------ live data
+
+
+def web_result(n: int, *, site: str = "news.example.com", snippet: str | None = None, **over: Any) -> SearchResult:
+    url = over.pop("url", f"https://{site}/story-{n}")
+    fields: dict[str, Any] = {
+        "url": url,
+        "title": f"Story {n}",
+        "snippet": snippet if snippet is not None else f"live fact {n}",
+        "site": site_of(url),
+        "engine": "fake",
+        "published": "2026-10-09T08:00:00",
+    }
+    fields.update(over)
+    return SearchResult(**fields)
+
+
+class FakeWebSearch(WebSearch):
+    """A scripted live-data search. ``script``: (seconds after the previous one, result), yielded in order; then
+    ``fail_with`` is raised, or the stream stays open while ``hang`` (until cancelled or the deadline). ``reason``:
+    what ``unavailable_reason`` says. Records every query, and how many streams were cancelled or are still open."""
+
+    name = "fake"
+
+    def __init__(self, script: Sequence[tuple[float, SearchResult]] = ()) -> None:  # no config/context needed
+        self.script = list(script)
+        self.queries: list[str] = []
+        self.started_at: list[float] = []  # loop time of each stream's start
+        self.fail_with: Exception | None = None
+        self.hang = False
+        self.reason: str | None = None
+        self.cancelled = 0
+        self.open = 0
+        self.pages: dict[str, str] = {}
+        self.page_delay = 0.0
+        self.fetched: list[str] = []
+
+    def unavailable_reason(self) -> str | None:
+        return self.reason
+
+    async def stream(  # type: ignore[override]
+        self, query: str, max_results: int | None = None
+    ) -> AsyncIterator[SearchResult]:
+        self.queries.append(query)
+        self.started_at.append(asyncio.get_running_loop().time())
+        self.open += 1
+        try:
+            for delay, result in self.script[: max_results or None]:
+                await asyncio.sleep(delay)
+                yield result
+            if self.fail_with is not None:
+                raise self.fail_with
+            if self.hang:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        finally:
+            self.open -= 1
+
+    async def fetch_page(self, url: str) -> str | None:
+        self.fetched.append(url)
+        await asyncio.sleep(self.page_delay)
+        return self.pages.get(url)

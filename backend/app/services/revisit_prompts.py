@@ -49,7 +49,7 @@ def title_messages(language: Language, question: str, answer: str | None) -> lis
     return [LLMMessage("system", system), LLMMessage("user", "\n".join(parts))]
 
 
-_MARKER = re.compile(r"\s*\[\s*S\d+(?:\s*[,;]\s*S\d+)*\s*\]", re.IGNORECASE)
+_MARKER = re.compile(r"\s*\[\s*[SW]\d+(?:\s*[,;]\s*[SW]\d+)*\s*\]", re.IGNORECASE)  # [S1] documents, [W1] web
 _SPACE = re.compile(r"\s+")
 _PREFIX = re.compile(r"^(?:chat\s+)?(?:title|शीर्षक)\s*[:\uff1a\-\u2013\u2014]\s*", re.IGNORECASE)
 # straight and curly quotes, guillemets, CJK corner brackets
