@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from app.domain.conversation import ConversationState
-from app.services.live_data import live_data_cue, web_query
+from app.services.live_data import asks_live_figure, live_data_cue, web_query
 from app.services.planning import live_search
 from app.services.router import (
     RouteDecision,
@@ -596,3 +596,20 @@ def test_router_eval_cases_tool_decisions(case):
     for intent in (case["intent"], *case.get("also", [])):
         d = with_live_tools(decision_for(req, intent), req)
         assert d.route.tools == case["tools"], intent
+
+
+@pytest.mark.parametrize(
+    ("text", "figure"),
+    [
+        ("USD to INR today", True),  # the real run: "approximately 83.50" with web search off
+        ("What's the dollar to rupee rate right now?", True),
+        ("How is the Sensex doing?", True),
+        ("Any news on the dividend?", True),
+        ("आज सोने का भाव क्या है?", True),
+        ("What should I cook today?", False),  # "today" alone: no live figure
+        ("What was the exchange rate assumed in the report?", False),  # a document's figure
+    ],
+)
+def test_questions_for_a_live_figure(text, figure):
+    """Without live data these get a fixed honest line, never a guess (quality round, item 2)."""
+    assert asks_live_figure(text) is figure

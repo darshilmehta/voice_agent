@@ -87,6 +87,7 @@ from ..providers.registry import Container
 from ..providers.storage import MetadataDB
 from ..providers.web_search import WebSearch
 from ..settings import Language, Settings
+from .answer_guard import AnswerGuard, Coverage, Unit, evidence_units, figures_in, identifiers_in, terms
 from .base import InvalidInput
 from .canvas.conversation import (
     CanvasEdit,
@@ -113,7 +114,7 @@ from .language import (
     message_language,
     script_language,
 )
-from .live_data import LiveNote
+from .live_data import LiveNote, asks_live_figure
 from .memory import MemoryKeeper, chat_activity
 from .messages import MessageService
 from .planning import VISUAL_INTENTS, DocumentQARouter, TurnPlan, TurnPlanner, interrupted_answer
@@ -121,8 +122,10 @@ from .prompts import (
     ANSWER_LENGTHS,
     CONTINUATION_NOTHING,
     CONTINUATION_PROMPT_VERSION,
+    LIVE_FIGURE_TEXTS,
     LIVE_NOTICES,
     LIVE_PROMPT_VERSION,
+    NOT_FROM_DOCUMENTS,
     PROMPT_IDS,
     SILENT_NOTICES,
     AbstainReason,
@@ -132,23 +135,50 @@ from .prompts import (
     ack_text,
     answer_system_prompt,
     answer_user_prompt,
+    chart_correction,
     clarification_system_prompt,
     continuation_user_prompt,
     conversation_system_prompt,
+    coverage_note,
     general_system_prompt,
     general_user_prompt,
     insist_on_language,
     language_request_note,
+    latest_period_note,
+    live_figure_text,
     live_notice,
     live_system_prompt,
     live_user_prefix,
     live_user_prompt,
+    names_note,
+    on_screen_note,
+    passage_correction,
     resume_text,
+    short_document_name,
     with_memory,
+    with_note,
 )
-from .retrieval import Confidence, RankedChunk, RetrievalResult, RetrievalService, SpeculationOutcome, scope_of
-from .router import LLMTurnRouter, RouteRequest, TurnRouter, fast_route, heard
-from .sources import Source, build_sources, finalize_answer, says_not_covered, strip_markers, trim_open_marker
+from .retrieval import (
+    Confidence,
+    RankedChunk,
+    RetrievalResult,
+    RetrievalService,
+    SpeculationOutcome,
+    asked_periods,
+    scope_of,
+)
+from .router import LLMTurnRouter, RouteRequest, TurnRouter, asks_about_facts, fast_route, heard
+from .sources import (
+    Source,
+    answer_declines,
+    build_sources,
+    estimate_tokens,
+    finalize_answer,
+    section_of,
+    strip_markers,
+    trim_open_marker,
+)
+from .subjects import misheard_names, respell
 from .web_search import ToolEvent, WebSearchRun, WebSource
 
 if TYPE_CHECKING:
@@ -185,6 +215,14 @@ HISTORY_CHARS = 1000  # per message
 SHORT_REPLY_TOKENS = 96  # conversation replies and clarifying questions: one sentence
 VISUAL_BUILD_S = 2.0  # after the planner's timeout: a heuristic fallback, building from the cells, storing (§12.1)
 CONTINUATION_TOKENS = 96  # one sentence about results that arrived after the answer started (§3.7)
+# Short answers (voice, and text chats' default) stop at the end of the sentence that reaches this many words, or at
+# their third sentence (quality round, item 7: three long sentences were 36-45 s of speech).
+SHORT_ANSWER_WORDS = 45
+SHORT_ANSWER_SENTENCES = 3
+# A passage whose reranker score is at least this "covers" the question for the answer's checks: an answer saying the
+# documents don't have what it states is asked again (quality round, item 1).
+STRONG_PASSAGE = 0.5
+DRAFT_WAIT_S = 0.3  # how long the sources wait for the visual's draft (built in ~20 ms) to add its tables
 # The end of a continuation's first sentence: a full stop before a capitalised word or a Devanagari one ("Rs. 997"
 # and "U.S. dollar" don't end it).
 _FIRST_SENTENCE = re.compile("(?<=[.!?।])\\s+(?=[A-Z\"'ऀ-ॿ])")
@@ -397,6 +435,14 @@ class _Progress:
     screen: list[str] = field(default_factory=list)  # that visual, described for the answer prompt
     edit: dict[str, Any] | None = None  # route.canvas_edit of an edit turn
     labels: dict[str, str] = field(default_factory=dict)  # document id → label, for the company a question names
+    # The answer's checks (services/answer_guard.py, quality round)
+    draft: Visual | None = None  # the visual's draft, on screen from the answer's first words
+    draft_sources: list[Source] = field(default_factory=list)  # its tables, among the answer's sources
+    draft_confident: bool = False
+    renames: dict[str, str] = field(default_factory=dict)  # misheard name → the documents' spelling (item 10)
+    checks: list[dict[str, Any]] = field(default_factory=list)  # route.checks: what the checks changed
+    fixed_live: bool = False  # a live figure answered with the fixed honest line (item 2)
+    prefix: str | None = None  # "Not from your documents, but" (item 9)
 
     @property
     def citable(self) -> list[Source | WebSource]:
@@ -442,6 +488,13 @@ def _delivered(visual: TurnVisual, events: Sequence[VisualEvent | CanvasEvent]) 
 
 Basis = Literal["documents", "web", "general"]
 _SENTENCE_END = re.compile("(?<=[.!?।])\\s+")
+# A question that names a period without a fiscal-year tag: a quarter, a calendar year, "last year", "पिछले साल".
+_NAMES_A_PERIOD = re.compile(
+    r"\b(?:q[1-4]|h[12]|(?:19|20)\d\d|(?:last|this|previous|current|next|prior)\s+(?:fiscal\s+|financial\s+)?"
+    r"(?:year|quarter|half)|pichhle\s+saal|pichle\s+saal|is\s+saal)\b|पिछले\s+साल|इस\s+साल|पिछली\s+तिमाही",
+    re.IGNORECASE,
+)
+_FIGURE_IN_LINE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 _CITED = re.compile(r"\[\s*[SW]\d+", re.IGNORECASE)
 _NOTICES = tuple(text for texts in LIVE_NOTICES.values() for text in texts.values())
 
@@ -457,6 +510,8 @@ def answer_basis(p: _Progress, text: str, citations: Sequence[Citation]) -> list
     An answer from web results counts only what it cites; an abstention, a grounded answer citing nothing and a
     "stop" are []."""
     mode = p.plan.mode
+    if p.fixed_live:  # "I can't look up live data…": nothing was drawn on
+        return []
     kinds = {c.kind for c in citations}
     basis: set[Basis] = set()
     if "document" in kinds:
@@ -870,9 +925,25 @@ class ChatTurnService:
                 return
         elif covered:
             await self._start_draft(turn, p)  # the visual's draft, built while the answer is written (§12.1)
+            await self._draft_evidence(turn, p)  # its tables among the answer's sources (quality round, item 1)
             yield SourcesEvent([*(s.citation() for s in p.sources), *web_citations], confidence, abstained=False)
         else:
             yield SourcesEvent(web_citations, None, abstained=False)
+
+        if plan.mode == "general" and not p.web_sources and self._asks_live_figure(turn, p):
+            # A live figure (a rate, a price, the news) with no live data and no document that answers it: a fixed
+            # honest line, never the model's guess (quality round, item 2: "USD to INR today" got "about 83.50").
+            p.fixed_live = True
+            p.notice = plan.live_note
+            answer = live_figure_text(plan.language, plan.live_note)
+            p.parts.append(answer)
+            yield DeltaEvent(answer)
+            route = self._route(turn, p, abstained=False, reason=None, model_used=False)
+            route["live_fixed"] = True
+            latency = self._latency(clock, p, first_delta_ms=clock.ms(), llm_ms=None)
+            async for event in self._save_answer(turn, answer, [], route, latency, p):
+                yield event
+            return
 
         # Live data asked for, none to give: say so first, after a failed search (the user heard the filler), or with
         # the tool unavailable when the documents don't answer it. Otherwise the prompt only says never to guess
@@ -883,12 +954,21 @@ class ChatTurnService:
             p.first_delta_ms = clock.ms()
             p.parts.append(notice)
             yield DeltaEvent(notice)
+        elif self._not_from_documents(turn, p):
+            # A general answer spoken in a chat with documents says so first (quality round, item 9): the "general
+            # knowledge" label is on screen only.
+            p.prefix = NOT_FROM_DOCUMENTS[plan.language]
+            p.first_delta_ms = clock.ms()
+            p.parts.append(p.prefix)
+            yield DeltaEvent(p.prefix)
 
         p.llm_start = time.perf_counter()
+        p.renames = self._renames(turn, p)
         prompt = self._prompt(turn, plan, history, p.sources, p.memory, p)
         short = plan.mode in ("conversation", "clarification")
         max_tokens = SHORT_REPLY_TOKENS if short else ANSWER_LENGTHS[turn.length].max_tokens
-        stream = self._answer_stream(prompt, plan.language, max_tokens, p)
+        guard = self._guard(turn, p)
+        stream = self._guarded_stream(prompt, plan.language, max_tokens, p, guard)
         model_parts: list[str] = []
         try:
             async with contextlib.aclosing(stream):  # closing the stream stops generation
@@ -930,10 +1010,17 @@ class ChatTurnService:
             return
         if (p.sources or p.web_sources) and not citations:
             log.info("chat %s: answer cites no source", chat.id)
-        if plan.mode == "grounded" and not citations and not p.web_sources and says_not_covered(answer):
-            # The documents passed the gate but the answer says they don't cover it (B9): it is an abstention, listed
-            # among the summary's unanswered questions, not an answer.
+        p.checks = guard.checks
+        if (
+            plan.mode == "grounded"
+            and not p.web_sources
+            and answer_declines(answer, [turn.text, plan.query, plan.query_en])
+        ):
+            # The documents passed the gate but the answer says they don't cover what was asked (B9; quality round,
+            # item 5: also when it cites what it says around it): an abstention, listed among the summary's
+            # unanswered questions, with no source chips.
             p.abstained, p.reason = True, "not_covered"
+            answer, citations = strip_markers(answer), []
         self._start_visual(turn, p, answer)
         if p.visual is not None and p.visual_sink is None:
             # the draft (or a skeleton) if no delta carried it yet: it shows while the answer is saved
@@ -942,6 +1029,8 @@ class ChatTurnService:
         route = self._route(turn, p, abstained=p.abstained, reason=p.reason)
         if p.abstained:
             route["abstained_by"] = "answer"  # the gate let it through; the answer itself said so
+        if p.prefix:
+            route["not_from_documents"] = True
         latency = self._latency(clock, p, first_delta_ms=p.first_delta_ms, llm_ms=llm_ms)
         async for event in self._save_answer(turn, answer, citations, route, latency, p):
             yield event
@@ -982,6 +1071,220 @@ class ChatTurnService:
             if held:
                 yield "".join(held)
             return
+
+    # -------------------------------------------------------------- the answer's checks (quality round)
+
+    async def _guarded_stream(
+        self, prompt: list[LLMMessage], language: Language, max_tokens: int, p: _Progress, guard: AnswerGuard
+    ) -> AsyncGenerator[str, None]:
+        """The model's answer through its checks (services/answer_guard.py): only checked text comes out. A first
+        sentence that says the documents don't cover what the chart on screen or a strong passage states closes the
+        stream, and the model is asked once more with the evidence named (``route.checks``)."""
+        if not guard.active:
+            async for piece in self._answer_stream(prompt, language, max_tokens, p):
+                yield piece
+            return
+        for attempt in (1, 2):
+            retry = False
+            stream = self._answer_stream(prompt, language, max_tokens, p)
+            async with contextlib.aclosing(stream):  # closing the stream stops generation
+                async for piece in stream:
+                    out = guard.feed(piece)
+                    if out.text:
+                        yield out.text
+                    if out.verdict == "retry":
+                        retry = True
+                        break
+                    if out.verdict == "stop":
+                        return
+            if not retry:
+                out = guard.finish()
+                if out.text:
+                    yield out.text
+                retry = out.verdict == "retry"
+            if not retry or attempt == 2 or guard.coverage is None:
+                return
+            log.info("answer denies what its evidence states: asking again")
+            guard.restart()
+            prompt = with_note(prompt, coverage_note(guard.coverage.retry_note))
+
+    def _guard(self, turn: Turn, p: _Progress) -> AnswerGuard:
+        """The checks of this answer: coverage (a draft on screen, strong passages), live figures (a live question
+        answered without live data), codes in the sources, misheard names, the length of a short answer."""
+        plan = p.plan
+        documents = plan.mode in ("grounded", "mixed") and not p.web_sources
+        figures = None
+        if documents and (plan.live_hint or plan.live_note is not None) and p.sources:
+            said = [turn.text, plan.query, plan.query_en or ""]
+            figures = figures_in([*(s.chunk.text for s in p.sources), *said])
+        short = turn.length == "short" and plan.mode in ("grounded", "mixed", "general")
+        return AnswerGuard(
+            coverage=self._coverage(turn, p) if documents else None,
+            identifiers=identifiers_in(s.chunk.text for s in p.sources),
+            figures=figures,
+            live_line=LIVE_FIGURE_TEXTS[plan.language][0 if p.notice is None else 1],
+            renames=p.renames,
+            max_words=SHORT_ANSWER_WORDS if short else None,
+            max_sentences=SHORT_ANSWER_SENTENCES if short else None,
+            lower_first=p.prefix is not None and plan.language == "en",
+        )
+
+    def _coverage(self, turn: Turn, p: _Progress) -> Coverage | None:
+        """What answers the question already (the draft's tables, the strong passages), as the coverage check's units,
+        with the sentence that replaces a denial of it and the note for asking again."""
+        plan = p.plan
+        strong = [s for s in p.sources if s.rerank_score >= STRONG_PASSAGE and s not in p.draft_sources]
+        if not strong and not p.draft_sources:
+            return None
+        units: list[Unit] = []
+        for s in [*p.draft_sources, *strong]:
+            units += evidence_units(s.chunk.text, " ".join(s.chunk.heading_path))
+        names = frozenset(w for label in self._labels_now(p).values() for w in label.casefold().split())
+        question = terms(" ".join(t for t in (turn.text, plan.query, plan.query_en) if t), ignore=names)
+        if p.draft is not None and p.draft_sources:
+            ids = [s.source_id for s in p.draft_sources]
+            document = short_document_name(p.draft_sources[0].filename)
+            correction = chart_correction(p.draft.title, document, ids, plan.language)
+            note = f"{''.join(f'[{i}]' for i in ids)}, the table(s) of the chart on screen ({describe(p.draft)})"
+        else:
+            best = max(strong, key=lambda s: s.rerank_score)
+            heading = best.chunk.heading_path[-1] if best.chunk.heading_path else None
+            where = heading or (best.pages or None)
+            document = short_document_name(best.filename)
+            correction = passage_correction(document, where, best.source_id, plan.language)
+            note = f"[{best.source_id}] ({section_of(best.chunk.heading_path) or best.pages or best.filename})"
+        return Coverage(units, question, correction, note, names=names, visual=p.draft is not None)
+
+    def _asks_live_figure(self, turn: Turn, p: _Progress) -> bool:
+        """A question for a live figure that gets no live data (web search off, unavailable, or empty)."""
+        plan = p.plan
+        if not (plan.live_hint or plan.live_note is not None):
+            return False
+        route = plan.route
+        texts = (turn.text, route.rewritten_query if route is not None else None, plan.query_en)
+        documents = list(p.ready.values())
+        return any(asks_live_figure(t, documents=documents) for t in texts if t)
+
+    def _not_from_documents(self, turn: Turn, p: _Progress) -> bool:
+        """A spoken general answer in a chat with READY documents to a question about facts (not a definition, a
+        how-to or small talk), or to a question the documents were searched for and don't cover: it starts by saying
+        it isn't from them (quality round, item 9)."""
+        plan = p.plan
+        if plan.mode != "general" or turn.modality != "voice" or not p.ready or p.notice is not None:
+            return False
+        return plan.general_note == "not_covered" or asks_about_facts(turn.text)
+
+    def _renames(self, turn: Turn, p: _Progress) -> dict[str, str]:
+        """Names the user was misheard as, and the documents' spelling ("Wall Mora" → "Valmora", item 10)."""
+        if not p.ready or p.plan.mode not in ("grounded", "mixed", "general"):
+            return {}
+        plan = p.plan
+        return misheard_names([turn.text, plan.query, plan.query_en], self._labels_now(p))
+
+    async def _draft_evidence(self, turn: Turn, p: _Progress) -> None:
+        """The visual's draft is on screen from the answer's first words (§12.1): its tables must be among the
+        answer's sources, or the answer may deny what the chart shows (quality round, item 1: a voice answer gets the
+        best three passages, and the quarterly table the chart was drawn from was the fourth). Waits for the draft
+        (~20 ms of code), adds its tables (with the [S#] ids the visual's cells already use), and keeps the
+        evidence within the answer's budget by dropping the weakest other passages."""
+        visual = p.visual
+        if visual is None:
+            return
+        shown = await visual.draft(DRAFT_WAIT_S)
+        if shown is None:
+            return
+        p.draft, p.draft_confident = shown, visual.trace.draft == "confident"
+        have = {s.chunk.chunk_id: s for s in p.sources}
+        ranked = {r.chunk.chunk_id: r for r in (p.result.chunks if p.result is not None else [])}
+        added: list[Source] = []
+        tables: dict[str, Chunk] | None = None
+        for citation in shown.sources:
+            if citation.chunk_id in have:
+                p.draft_sources.append(have[citation.chunk_id])
+                continue
+            r = ranked.get(citation.chunk_id)
+            chunk = r.chunk if r is not None else None
+            if chunk is None:
+                if tables is None:
+                    tables = {c.chunk.chunk_id: c.chunk for c in await self._table_chunks(turn.chat, shown)}
+                chunk = tables.get(citation.chunk_id)
+            if chunk is None or chunk.document_id not in p.ready:
+                continue
+            filename = p.ready[chunk.document_id]
+            added.append(Source(citation.source_id, chunk, filename, r.rerank_score if r is not None else 1.0))
+        p.draft_sources += added
+        if not added:
+            return
+        style = ANSWER_LENGTHS[turn.length]
+        budget = self.settings.retrieval.context_token_budget
+        limit = min(budget, style.context_tokens or budget)  # the passages besides the best one (build_sources)
+        best = max(p.sources, key=lambda s: s.rerank_score) if p.sources else None
+        keep = {s.chunk.chunk_id for s in p.draft_sources} | ({best.chunk.chunk_id} if best is not None else set())
+
+        def cost(s: Source) -> int:
+            return estimate_tokens(s.chunk.text) + 24
+
+        used = sum(cost(s) for s in [*p.sources, *added] if s is not best)
+        weakest = sorted((s for s in p.sources if s.chunk.chunk_id not in keep), key=lambda s: s.rerank_score)
+        dropped: set[str] = set()
+        while used > limit and weakest:
+            s = weakest.pop(0)
+            dropped.add(s.chunk.chunk_id)
+            used -= cost(s)
+        p.sources = [*(s for s in p.sources if s.chunk.chunk_id not in dropped), *added]
+        p.name_documents = self._name_documents(p)
+        log.info(
+            "chat %s: the draft's table(s) %s added to the answer's sources (%d dropped)",
+            turn.chat.id,
+            [s.source_id for s in added],
+            len(dropped),
+        )
+
+    @staticmethod
+    def _latest_period(question: Sequence[str | None], sources: Sequence[Source]) -> str | None:
+        """For a question that names no period, the latest fiscal year the sources' tables give figures for, when they
+        give figures for more than one ("What is the dividend per share?": FY24, not FY23; quality round, item 4).
+        Tables only (their header and rows): a paragraph's years are as often plans ("capex over FY25 and FY26") as
+        figures."""
+        if any(t and (asked_periods(t) or _NAMES_A_PERIOD.search(t)) for t in question):
+            return None
+        found: set[int] = set()
+        for s in sources:
+            rows = [line for line in s.chunk.text.splitlines() if line.strip().startswith("|")]
+            plain = [re.sub(r"(?i)\b(?:q[1-4]\s*)?fy\s?'?\d{2,4}|(?:19|20)\d\d", " ", r) for r in rows]
+            if any(_FIGURE_IN_LINE.search(r) for r in plain):
+                for row in rows:
+                    found |= asked_periods(row)
+        return f"FY{max(found) % 100:02d}" if len(found) >= 2 else None
+
+    async def _table_chunks(self, chat: Chat, visual: Visual) -> list[RankedChunk]:
+        """The tables a visual was built from, as passages (``chunk_id`` as the visual's citations name them)."""
+        if self.canvas is None:
+            return []
+        try:
+            tables = await self.canvas.visual_tables(chat.id, visual)
+        except Exception as e:
+            log.warning("chat %s: reading the tables of %s failed: %s", chat.id, visual.id, _describe(e))
+            return []
+        out = []
+        for ds, table in tables:
+            chunk = Chunk(
+                chunk_id=ds.chunk_id or f"{ds.document_id}:v{ds.version}:table{ds.table_index}",
+                project_id=chat.project_id,
+                document_id=ds.document_id,
+                version=ds.version,
+                chunk_index=-1,
+                chunking_version="canvas",
+                page_start=ds.page_start,
+                page_end=ds.page_end,
+                heading_path=[*table.heading_path[-1:], ds.title] if table.heading_path else [ds.title],
+                content_type="table",
+                language="hi" if any("ऀ" <= ch <= "ॿ" for ch in table.markdown) else "en",
+                text=table.markdown,
+                token_count=len(table.markdown) // 4,
+            )
+            out.append(RankedChunk(chunk, rerank_score=1.0, fused_score=1.0, dense_score=None, search_rank=0))
+        return out
 
     # -------------------------------------------------------------- the canvas (§12.1)
 
@@ -1170,32 +1473,9 @@ class ChatTurnService:
     async def _screen_evidence(self, chat: Chat, p: _Progress) -> list[RankedChunk]:
         """The tables of the visual a question is about, as passages that rank first (a question about what is on
         screen is answered from the cells it shows, cited like any source)."""
-        if self.canvas is None or p.screen_visual is None:
+        if p.screen_visual is None:
             return []
-        try:
-            tables = await self.canvas.visual_tables(chat.id, p.screen_visual)
-        except Exception as e:
-            log.warning("chat %s: reading the tables of %s failed: %s", chat.id, p.screen_visual.id, _describe(e))
-            return []
-        out = []
-        for ds, table in tables:
-            chunk = Chunk(
-                chunk_id=ds.chunk_id or f"{ds.document_id}:table:{ds.table_index}",
-                project_id=chat.project_id,
-                document_id=ds.document_id,
-                version=ds.version,
-                chunk_index=-1,
-                chunking_version="canvas",
-                page_start=ds.page_start,
-                page_end=ds.page_end,
-                heading_path=[*table.heading_path[-1:], ds.title] if table.heading_path else [ds.title],
-                content_type="table",
-                language="hi" if any("ऀ" <= ch <= "ॿ" for ch in table.markdown) else "en",
-                text=table.markdown,
-                token_count=len(table.markdown) // 4,
-            )
-            out.append(RankedChunk(chunk, rerank_score=1.0, fused_score=1.0, dense_score=None, search_rank=0))
-        return out
+        return await self._table_chunks(chat, p.screen_visual)
 
     # -------------------------------------------------------------- live data (§3.7)
 
@@ -1351,15 +1631,15 @@ class ChatTurnService:
     ) -> list[LLMMessage]:
         language, length = plan.language, turn.length
         web = p.web_sources if p is not None else []
+        renames = p.renames if p is not None else {}
+        query = respell(plan.query, renames)  # the documents' spelling of a misheard name (item 10)
         if web and p is not None and p.web is not None:  # live data (§3.7): documents [S#] and web results [W#]
             # Page texts are long (prefill ~3 ms per token): the first answer has the snippets, a continuation the
             # pages, unless no continuation will come.
             cfg = self.settings.tools.web_search
             pages = not (cfg.stream_partial_results and cfg.max_continuations > 0)
             system = live_system_prompt(language, length, documents=p.documents_part)
-            question = live_user_prompt(
-                plan.query, sources, web, language, search_query=p.web.query, with_content=pages
-            )
+            question = live_user_prompt(query, sources, web, language, search_query=p.web.query, with_content=pages)
             for source in web:
                 source.content_given = source.content_given or (pages and bool(source.content))
         elif plan.mode in ("grounded", "mixed"):
@@ -1372,18 +1652,30 @@ class ChatTurnService:
                 live_hint=plan.live_hint and notice is None,
             )
             route = plan.route
+            notes = []
+            if (latest := self._latest_period([turn.text, plan.query, plan.query_en], sources)) is not None:
+                notes.append(latest_period_note(latest))
+            if renames:
+                notes.append(names_note(renames))
+            on_screen = None
+            if p is not None and p.draft is not None and p.draft_sources:
+                ids = [s.source_id for s in p.draft_sources]
+                on_screen = on_screen_note(describe(p.draft), ids, confident=p.draft_confident)
             question = answer_user_prompt(
-                plan.query,
+                query,
                 sources,
                 language,
                 name_documents=p is not None and p.name_documents,
                 visual_requested=route is not None and route.visual == "requested" and self.canvas is not None,
                 screen=p.screen if p is not None else (),
+                on_screen=on_screen,
+                notes=notes,
             )
         elif plan.mode == "general":
             notice = p.notice if p is not None else None
-            system = general_system_prompt(language, length, plan.general_note, live_note=notice)
-            question = general_user_prompt(plan.query, language)
+            prefixed = p is not None and p.prefix is not None
+            system = general_system_prompt(language, length, plan.general_note, live_note=notice, prefixed=prefixed)
+            question = general_user_prompt(query, language)
         elif plan.mode == "clarification":
             system, question = clarification_system_prompt(language), turn.text
         else:
@@ -1458,6 +1750,8 @@ class ChatTurnService:
             canvas["screen_visual_id"] = p.screen_visual.id  # the visual a question was about
         if p.edit is not None:
             canvas["canvas_edit"] = p.edit
+        if p.checks:
+            canvas["checks"] = list(p.checks)  # what the answer's checks changed (quality round)
         return {
             "intent": plan.intent,
             "needs_retrieval": plan.needs_retrieval,

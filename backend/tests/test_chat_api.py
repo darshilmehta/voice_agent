@@ -87,7 +87,7 @@ def test_answer_streams_in_contract_order_and_cites_only_what_it_uses(app, fakes
     fakes.llm.reply = lambda messages: (
         "The EBITDA margin in FY24 was 18.2% "
         + "".join(f"[{s}]" for s in _ids_containing(messages[-1].content, "18.2%"))
-        + " [S9]."
+        + " [S9], up from the year before as revenue grew faster than costs."
     )
     events = ask(app, chat, EN)
 
@@ -118,15 +118,16 @@ def test_answer_streams_in_contract_order_and_cites_only_what_it_uses(app, fakes
 
     table, sentence = source_with(events, "| EBITDA margin"), source_with(events, "improved to 18.2%")
     cited = f"[{table['source_id']}][{sentence['source_id']}]"
-    assert answer_text(events).endswith(f"18.2% {cited} [S9].")  # raw stream, as generated
-    assert agent["text"] == f"The EBITDA margin in FY24 was 18.2% {cited}."  # unknown [S9] removed
+    tail = ", up from the year before as revenue grew faster than costs."
+    assert answer_text(events).endswith(f"18.2% {cited} [S9]{tail}")  # raw stream, as generated
+    assert agent["text"] == f"The EBITDA margin in FY24 was 18.2% {cited}{tail}"  # unknown [S9] removed
     assert agent["citations"] == [table, sentence]  # only cited sources, in order of mention
     assert table["page_start"] == table["page_end"] == 2
     assert (agent["role"], agent["language"], agent["modality"]) == ("agent", "en", "text")
     assert agent["route"]["abstained"] is False and agent["route"]["intent"] == "document_qa"
     assert agent["route"]["stopped"] is False and agent["route"]["length"] == "short"
     assert user["modality"] == agent["modality"] == "text"
-    assert agent["route"]["prompt"] == "answer-v1" and agent["route"]["model"] == "qwen3:4b-instruct"
+    assert agent["route"]["prompt"] == "answer-v2" and agent["route"]["model"] == "qwen3:4b-instruct"
     assert {"retrieval_ms", "rerank_ms", "first_delta_ms", "llm_ms", "total_ms"} <= set(agent["latency"])
 
     (call,) = fakes.llm.calls
@@ -304,7 +305,8 @@ def test_llm_failing_mid_answer_ends_the_stream_without_saving_a_partial_answer(
     fakes.llm.reply = "The margin was 18.2% according to [S1]."
     fakes.llm.fail_after = 2
     events = ask(app, chat, EN)
-    assert names(events) == ["user_message", "sources", "delta", "error"]  # the first words go out together (B5)
+    # the answer's first words are held while they are checked (its passages are strong: services/answer_guard.py)
+    assert names(events) == ["user_message", "sources", "error"]
     assert payload(events, "error")["stage"] == "llm"
     assert app.get(f"/api/chats/{chat}/messages").json()["total"] == 1
 

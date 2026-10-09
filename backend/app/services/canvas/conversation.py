@@ -569,6 +569,7 @@ class TurnVisual:
     delivered: bool = False  # the client got a ready visual (set by the transport)
     remove: Callable[[], Awaitable[None]] | None = None  # takes the visual off the canvas (``withdraw``)
     _answer: asyncio.Future[AnswerText] | None = None
+    _draft: asyncio.Future[Visual | None] | None = None  # the draft shown (None: none), once the draft stage is over
     _callbacks: list[Callable[[TurnVisual], Awaitable[None]]] = field(default_factory=list)
     _settled: bool = False
     _cancel_detail: str = "cancelled"
@@ -617,9 +618,29 @@ class TurnVisual:
         return self._answer is not None and self._answer.done()
 
     async def answer(self) -> AnswerText:
+        self._drafted(None)  # the planner waits for the answer: the draft stage is over (nothing was shown)
         if self._answer is None:
             self._answer = asyncio.get_running_loop().create_future()
         return await asyncio.shield(self._answer)
+
+    # -------------------------------------------------------------- the draft (for the answer's evidence)
+
+    def _drafted(self, visual: Visual | None) -> None:
+        if self._draft is None:
+            self._draft = asyncio.get_running_loop().create_future()
+        if not self._draft.done():
+            self._draft.set_result(visual)
+
+    async def draft(self, timeout: float) -> Visual | None:
+        """The draft on the canvas once it is built (code, ~20 ms), or None when there is none, or none yet after
+        ``timeout`` seconds. The turn puts its tables among the answer's sources and tells the answer what is on
+        screen (quality round, item 1)."""
+        if self._draft is None:
+            self._draft = asyncio.get_running_loop().create_future()
+        try:
+            return await asyncio.wait_for(asyncio.shield(self._draft), timeout)
+        except TimeoutError:
+            return None
 
     # -------------------------------------------------------------- the task
 
@@ -634,6 +655,7 @@ class TurnVisual:
                             continue  # announced at the start
                         if event.phase == "ready":
                             self._stored = True
+                            self._drafted(event.visual)
                         elif self.status == "ready":  # a shown draft withdrawn (the planner: no table fits)
                             self._stored = False
                         cancelled = event.phase == "failed" and event.detail == "cancelled"
@@ -656,6 +678,7 @@ class TurnVisual:
                     self.queue.put_nowait(VisualEvent(phase="failed", visual_id=self.visual_id, detail="failed"))
 
     def _finished(self, task: asyncio.Task[None]) -> None:
+        self._drafted(None)
         if task.cancelled():
             if self.trace.planner is None and self.trace.draft is not None:
                 self.trace.planner = "cancelled"

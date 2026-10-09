@@ -146,7 +146,7 @@ async def test_a_document_question_is_answered_from_the_documents(world):
         False,
     )
     assert (r["topic"], r["rewritten_query"], r["query_en"], r["language"]) == ("ebitda margin", None, None, "en")
-    assert r["router"]["source"] == "llm" and r["speculation"] == "used" and r["prompt"] == "answer-v1"
+    assert r["router"]["source"] == "llm" and r["speculation"] == "used" and r["prompt"] == "answer-v2"
     assert agent.latency["router_ms"] is not None and agent.latency["router_llm_ms"] is not None
 
 
@@ -162,7 +162,7 @@ async def test_an_unrelated_question_skips_retrieval_and_says_so(world):
         False,
         "general",
         False,
-        "general-v1",
+        "general-v2",
     )
     assert r["speculation"] == "discarded" and r["sources"] == 0 and r["candidates"] == 0
     (call,) = answer_calls(world)
@@ -280,7 +280,7 @@ async def test_mixed_questions_cite_documents_or_fall_back_to_general_knowledge(
         }
     )
     _, agent = await say(world, "Is the FY24 EBITDA margin good?")
-    assert agent.route["answer"] == "mixed" and agent.citations and agent.route["prompt"] == "mixed-v1"
+    assert agent.route["answer"] == "mixed" and agent.citations and agent.route["prompt"] == "mixed-v2"
     assert "general knowledge" in answer_calls(world)[-1]["messages"][0].content
     events, agent = await say(world, "Is that typical for the sector?")  # nothing in the documents
     assert agent.route["answer"] == "general" and agent.route["general_note"] == "not_covered"

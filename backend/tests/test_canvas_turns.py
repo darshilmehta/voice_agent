@@ -75,6 +75,7 @@ def test_a_requested_visuals_draft_arrives_with_the_answers_first_delta(app_with
     api, chat_id, _, fakes = app_with_report
     Script(planner=choose("line", "Revenue")).install(fakes.llm)
     fakes.llm.delay = 0.05  # the answer's first words take a moment (0.8 s on the real model): the draft is ready
+    fakes.llm.reply = "The chart shows revenue rising every quarter [S4]. It peaked at 1,933 in Q4 FY24 [S4]."
     events = ask(api, chat_id, SHOW)
     order = names(events)
     # the draft (code, built when the retrieval returned) comes with the answer's first words, never before them
@@ -86,11 +87,10 @@ def test_a_requested_visuals_draft_arrives_with_the_answers_first_delta(app_with
     visual = ready["visual"]
     assert visual["kind"] == "line" and visual["chat_id"] == chat_id
     assert [r["x"] for r in visual["rows"]] == ["Q1 FY24", "Q2 FY24", "Q3 FY24", "Q4 FY24"]
-    # the chart's cells cite the answer's own [S#] ids
+    # the chart's cells cite the answer's own [S#] ids, and its table is among the answer's sources (quality round)
     turn_sources = {s["chunk_id"]: s["source_id"] for s in payload(events, "sources")["sources"]}
     for source in visual["sources"]:
-        if source["chunk_id"] in turn_sources:
-            assert source["source_id"] == turn_sources[source["chunk_id"]]
+        assert source["source_id"] == turn_sources[source["chunk_id"]]
     assert payload(events, "canvas")["panels"][0]["id"] == visual["id"]
     # a confident draft is the visual: no model call for it at all
     assert planner_calls(fakes.llm) == []
@@ -101,8 +101,11 @@ def test_a_requested_visuals_draft_arrives_with_the_answers_first_delta(app_with
     plan = agent["route"]["visual_plan"]
     assert plan["draft"] == "confident" and plan["planner"] == "skipped"
     assert [v["id"] for v in canvas(api, chat_id)] == [visual["id"]]
-    # the answer prompt knew a chart was asked for: no "I can't show charts", no promise
-    assert VISUAL_NOTE in fakes.llm.calls[-1]["messages"][-1].content
+    # the answer prompt knew the chart is on screen, drawn from its table: it agrees with it ("The chart shows …")
+    prompt = fakes.llm.calls[-1]["messages"][-1].content
+    ids = "".join("[" + s["source_id"] + "]" for s in visual["sources"])
+    assert f"A chart of this is on screen now, drawn by the app from {ids}" in prompt
+    assert 'You may begin with "The chart shows' in prompt and VISUAL_NOTE not in prompt
 
 
 async def timed_turn(api, text: str, chat_id: str) -> tuple[list[tuple[float, Any]], float]:
@@ -120,6 +123,7 @@ def test_an_unsure_draft_is_refined_after_the_answer_and_replaced_in_place(app_w
     script = Script(planner=choose_table("line", "Q1 FY24", "Revenue")).install(fakes.llm)
     script.planner_delay = 0.3
     fakes.llm.delay = 0.02  # every piece of the answer takes a moment
+    fakes.llm.reply = "Revenue was 7,365 in FY24, with Specialty Chemicals the largest segment at 3,568 [S1]."
     got, t0 = run(api, timed_turn, api, UNSURE, chat_id)
     deltas = [t for t, e in got if isinstance(e, DeltaEvent)]
     readies = [(t, e) for t, e in got if isinstance(e, VisualEvent) and e.phase == "ready"]
@@ -231,7 +235,9 @@ def test_no_visual_for_general_ack_stop_or_abstained_turns(app_with_report, utte
 def test_an_answer_that_says_the_documents_dont_cover_it_withdraws_its_draft(app_with_report):
     api, chat_id, _, fakes = app_with_report
     Script(planner=choose("line", "Revenue")).install(fakes.llm)
-    fakes.llm.reply = "The documents don't cover quarterly revenue."  # the gate let it through; the answer abstains
+    # the gate let it through; the answer abstains (on what no table states: a denial of what the chart shows would
+    # be asked again, tests/test_answer_checks.py)
+    fakes.llm.reply = "The documents don't cover revenue for FY25."
     events = ask(api, chat_id, UNSURE)
     assert visuals(events) == [("preparing", None), ("ready", None), ("failed", "cancelled")]  # no note: just gone
     assert [d["panels"] for e, d in events if e == "canvas"][-1] == []

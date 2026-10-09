@@ -139,7 +139,8 @@ def test_no_tail_when_the_planner_withdraws_the_draft(voice):
 
 def test_an_answer_that_abstains_before_its_first_audio_shows_no_visual(voice):
     Script(planner=choose("line", "Revenue")).install(voice.fakes.llm)
-    voice.fakes.llm.reply = "The documents don't cover quarterly revenue."  # the answer itself abstains (B9)
+    # the answer itself abstains (B9), on what no table states (a denial of what the chart shows is asked again)
+    voice.fakes.llm.reply = "The documents don't cover revenue for FY25."
     voice.fakes.tts.delay = 0.3  # its text is complete before its first audio: the draft is withdrawn while held
     with voice.connect() as ws:
         c = VoiceClient(ws)
@@ -193,7 +194,9 @@ def test_a_barge_in_during_the_refinement_keeps_the_draft_and_the_new_question_c
 
 def test_a_stop_before_the_first_audio_never_shows_the_draft(voice):
     Script(planner=choose("line", "Revenue")).install(voice.fakes.llm)
-    voice.fakes.llm.hold_after = 3  # the model is still writing the answer's first words
+    # the model is still writing the first words (the first is out, 3 words behind it: too few for speech)
+    voice.fakes.llm.reply = "Revenue rose in every quarter of FY24, from 1,742 to 1,933 in the fourth quarter [S1]."
+    voice.fakes.llm.hold_after = 5
     with voice.connect() as ws:
         c = VoiceClient(ws)
         c.start()
