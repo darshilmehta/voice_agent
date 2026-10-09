@@ -18,6 +18,15 @@ took them for backchannels, §9.5), a "stop"/"backchannel" that asks a question 
 nothing before it is a question, an English turn needs no English query, a query that repeats the utterance is
 dropped.
 
+**Live data** (§3.7, ``with_live_tools``): application code, not the model, decides when the web search tool runs.
+A turn that asks a question (document, mixed, general, correction, resume with a question) gets
+``tools=["web_search"]`` when its utterance or standalone question carries a live-data cue (services/live_data.py:
+"today", "latest news", "share price", "आज", "abhi"…) and the tool is available (``RouteRequest.available_tools``);
+otherwise the decision still records the cue, so the answer can say live data isn't available. A live question
+never takes the document fast path: the router model writes its standalone English question, which is what gets
+searched (it resolves "the stock" from the conversation), and for Hindi and Hinglish turns that English query is
+kept for every answering intent.
+
 Routing a turn as a whole (speculative retrieval alongside the router, timeout, fallback, retrieval policy) is
 ``services/planning.py``.
 """
@@ -26,7 +35,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal, Protocol
 
 from pydantic import BaseModel
@@ -36,6 +45,7 @@ from ..domain.projects import Message
 from ..providers.llm import LLMClient, LLMMessage
 from ..settings import Language
 from .language import asked_language, is_devanagari, message_language, wordset
+from .live_data import live_data_cue
 from .sources import strip_markers
 
 ROUTER_PROMPT_VERSION = "router-v1"
@@ -247,6 +257,15 @@ class RouteRequest:
     state: ConversationState | None = None
     documents: Sequence[str] = ()  # filenames of the chat's READY documents
     interrupted: InterruptedAnswer | None = None
+    available_tools: frozenset[str] = frozenset()  # tools that can run now ("web_search", §3.7)
+
+    def live_cue(self, *texts: str | None) -> str | None:
+        """The live-data cue of the utterance, else of the given texts (its standalone question), or None."""
+        for text in (self.utterance, *texts):
+            cue = live_data_cue(text, documents=self.documents)
+            if cue is not None:
+                return cue
+        return None
 
     @property
     def previous_question(self) -> str | None:
@@ -295,6 +314,7 @@ class RouteDecision:
     error: str | None = None
     llm_ms: float | None = None
     reply: ReplyKind | None = None  # a fixed reply (heuristic thanks / greeting)
+    live: str | None = None  # the live-data cue of a question that wants current data (§3.7), tool or not
 
     def record(self) -> dict[str, object]:
         """How the route was decided, for the message's ``route.router`` (transcript and evals)."""
@@ -304,6 +324,7 @@ class RouteDecision:
             "overrides": list(self.overrides),
             "error": self.error,
             "prompt": ROUTER_PROMPT_VERSION if self.source in ("llm", "fallback") else None,
+            "live_cue": self.live,
         }
 
 
@@ -405,6 +426,7 @@ def fast_route(req: RouteRequest) -> RouteDecision | None:
         message_language(req.utterance) == "en"
         and standalone_question(req)
         and mentions_documents(req.utterance, req.documents)
+        and not ("web_search" in req.available_tools and req.live_cue() is not None)  # the router writes its query
     ):
         return RouteDecision(_route(req, "document_qa", confidence=CONFIDENCE["heuristic"]), "heuristic")
     return None
@@ -485,7 +507,8 @@ def validate(proposal: RouterProposal, req: RouteRequest, *, llm_ms: float | Non
         if message_language(text) == "en" or is_devanagari(proposed):
             query = proposed
         else:
-            if intent in _SEARCHING:
+            # The English query searches the documents, and for a live question the web (§3.7), whatever the intent.
+            if intent in _SEARCHING or (intent in ANSWERING and req.live_cue(proposed) is not None):
                 query_en = proposed
             if refers_back(text) or is_correction(text) or intent in ("correction", "resume_document"):
                 query = proposed
@@ -507,6 +530,23 @@ def validate(proposal: RouterProposal, req: RouteRequest, *, llm_ms: float | Non
 
 _SEARCHING: frozenset[Intent] = frozenset({"document_qa", "mixed", "correction", "resume_document"})
 _NO_QUERY: frozenset[Intent] = frozenset({"stop", "backchannel", "conversation", "clarification"})
+# Intents that answer a question: the ones a live-data tool can serve (resume only with a question).
+ANSWERING: frozenset[Intent] = frozenset({"document_qa", "mixed", "general_qa", "correction", "resume_document"})
+
+
+def with_live_tools(decision: RouteDecision, req: RouteRequest) -> RouteDecision:
+    """The decision with ``tools=["web_search"]`` when the question needs live data and the tool is available, and
+    the live-data cue recorded either way (module docstring). Applied to every route, however it was decided."""
+    route = decision.route
+    if route.intent not in ANSWERING or (route.intent == "resume_document" and route.rewritten_query is None):
+        return decision
+    cue = req.live_cue(route.rewritten_query, route.query_en)
+    if cue is None:
+        return decision
+    tools: list[Literal["web_search"]] = ["web_search"] if "web_search" in req.available_tools else []
+    return replace(decision, route=route.model_copy(update={"tools": tools}), live=cue)
+
+
 _SENTENCE = re.compile(r"[^.!?।]*\?")
 
 

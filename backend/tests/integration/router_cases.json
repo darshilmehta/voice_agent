@@ -1,5 +1,5 @@
 {
-  "about": "Labelled router turns (docs/DESIGN.md §3.4) for tests/integration/test_router_eval.py. Each case: the utterance, a short history ([role, text] or [role, text, heard_text] for an interrupted answer), the conversation state's topics, the expected intent (plus acceptable alternatives) and words the standalone query / English query must contain (any of each inner list).",
+  "about": "Labelled router turns (docs/DESIGN.md §3.4) for tests/integration/test_router_eval.py. Each case: the utterance, a short history ([role, text] or [role, text, heard_text] for an interrupted answer), the conversation state's topics, the expected intent (plus acceptable alternatives) and words the standalone query / English query must contain (any of each inner list). Live-data cases (§3.7) also give the expected tools (decided by application code from live-data cues, checked without the model in tests/test_live_routing.py) and words the web search query must contain.",
   "documents": ["annual_report.pdf"],
   "cases": [
     {"id": "doc-fresh-margin", "utterance": "What was the EBITDA margin in FY24?", "intent": "document_qa"},
@@ -107,6 +107,26 @@
     {
       "id": "stop-after-interrupt", "utterance": "stop", "intent": "stop",
       "history": [["user", "Summarize the risks section."], ["agent", "The risks section covers supplier concentration, currency exposure and regulation.", "The risks section covers"]]
-    }
+    },
+    {
+      "id": "live-report-and-stock-today", "utterance": "The report says revenue grew 34%; how is the stock doing today?",
+      "intent": "mixed", "also": ["document_qa", "general_qa"], "tools": ["web_search"], "web_query": [["stock"], ["today"]]
+    },
+    {"id": "live-news", "utterance": "What's the latest news about Infosys?", "intent": "general_qa", "also": ["mixed", "document_qa"], "tools": ["web_search"], "web_query": [["infosys"], ["news"]]},
+    {"id": "live-fx", "utterance": "What is the USD to INR exchange rate right now?", "intent": "general_qa", "also": ["mixed"], "tools": ["web_search"], "web_query": [["usd", "dollar"], ["inr", "rupee"]]},
+    {
+      "id": "live-followup-today", "utterance": "And how is it trading today?", "intent": "document_qa", "also": ["mixed", "general_qa"],
+      "history": [["user", "What was Infosys's share price at the end of FY24?"], ["agent", "Infosys closed FY24 at Rs 1,498 a share."]],
+      "topic": "share price", "tools": ["web_search"], "web_query": [["infosys"], ["today", "trading", "current"]]
+    },
+    {"id": "hi-live-dollar", "utterance": "आज डॉलर का रेट क्या है?", "intent": "general_qa", "also": ["mixed"], "tools": ["web_search"], "web_query": [["dollar", "usd"]]},
+    {"id": "hi-live-share-price", "utterance": "इंफोसिस के शेयर का भाव क्या है?", "intent": "general_qa", "also": ["mixed", "document_qa"], "tools": ["web_search"], "web_query": [["infosys"], ["share", "stock"]]},
+    {"id": "hinglish-live-sensex", "utterance": "aaj Sensex kitna upar gaya?", "intent": "general_qa", "also": ["mixed"], "tools": ["web_search"], "web_query": [["sensex"]]},
+    {"id": "hinglish-live-share", "utterance": "abhi Infosys ka share price kya hai?", "intent": "general_qa", "also": ["mixed", "document_qa"], "tools": ["web_search"], "web_query": [["infosys"]]},
+    {"id": "nolive-current-ratio", "utterance": "What was the current ratio in FY24?", "intent": "document_qa", "tools": []},
+    {"id": "nolive-latest-report", "utterance": "What does the latest annual report say about debt?", "intent": "document_qa", "tools": []},
+    {"id": "nolive-report-share-price", "utterance": "What does the report say about the share price?", "intent": "document_qa", "tools": []},
+    {"id": "hi-nolive-so-far", "utterance": "अभी तक कंपनी ने कितना निवेश किया है?", "intent": "document_qa", "also": ["mixed"], "tools": []},
+    {"id": "hinglish-nolive-debt", "utterance": "FY24 mein net debt kitna tha?", "intent": "document_qa", "tools": [], "query_en": [["debt"]]}
   ]
 }

@@ -26,9 +26,16 @@ from app.domain.conversation import ConversationState
 from app.domain.projects import Message
 from app.providers.base import ProviderContext
 from app.providers.llm import LLMMessage, OllamaLLM
-from app.services.planning import interrupted_answer
+from app.services.planning import interrupted_answer, live_search
 from app.services.prompts import answer_system_prompt
-from app.services.router import RouteRequest, RouterProposal, fast_route, router_messages, validate
+from app.services.router import (
+    RouteRequest,
+    RouterProposal,
+    fast_route,
+    router_messages,
+    validate,
+    with_live_tools,
+)
 from app.settings import load_settings
 
 from .conftest import LOCAL_CONFIG, METRICS
@@ -74,7 +81,15 @@ def request_for(case: dict[str, Any]) -> RouteRequest:
         document_topic=case.get("document_topic") or case.get("topic"),
         last_intent="document_qa" if case.get("topic") else None,
     )
-    return RouteRequest(case["utterance"], "en", history, state, CASES["documents"], interrupted_answer(history))
+    return RouteRequest(
+        case["utterance"],
+        "en",
+        history,
+        state,
+        CASES["documents"],
+        interrupted_answer(history),
+        available_tools=frozenset({"web_search"}),  # live-data cases (§3.7) check the tool decision too
+    )
 
 
 def _contains_all(text: str | None, groups: list[list[str]]) -> bool:
@@ -125,6 +140,9 @@ async def test_router_on_the_real_model(tmp_path):
         output_tokens: list[int] = []
         compute: list[float] = []
         misses: list[str] = []
+        tools_ok: list[bool] = []
+        web_ok: list[bool] = []
+        web_queries: list[str] = []
         fast = 0
         for case in CASES["cases"]:
             req = request_for(case)
@@ -148,6 +166,16 @@ async def test_router_on_the_real_model(tmp_path):
                     misses.append(f"{case['id']}: query={route.rewritten_query!r} query_en={route.query_en!r}")
             if not ok:
                 misses.append(f"{case['id']}: {proposal.intent} → {route.intent}, expected {sorted(accepted)}")
+            if "tools" in case:  # live data (§3.7): the tool decision and the query that would leave the machine
+                live, web_q, _ = live_search(with_live_tools(quick or decision, req), req)
+                tools_ok.append(list(live.route.tools) == case["tools"])
+                if not tools_ok[-1]:
+                    misses.append(f"{case['id']}: tools {list(live.route.tools)}, expected {case['tools']}")
+                if "web_query" in case:
+                    web_ok.append(_contains_all(web_q, case["web_query"]))
+                    web_queries.append(f"{case['id']}: {web_q!r}")
+                    if not web_ok[-1]:
+                        misses.append(f"{case['id']}: web query {web_q!r}")
             walls.append(wall)
             prompt_tokens.append(data.get("prompt_eval_count", 0))
             prefill_ms.append(data.get("prompt_eval_duration", 0) / 1e6)
@@ -163,6 +191,9 @@ async def test_router_on_the_real_model(tmp_path):
         f"{sum(pipeline_ok)}/{len(pipeline_ok)}; fast path took {fast}/{len(pipeline_ok)} turns"
     )
     METRICS["router queries (rewritten / English)"] = f"{sum(query_ok)}/{len(query_ok)}"
+    METRICS["router live-data tools (web_search or none)"] = f"{sum(tools_ok)}/{len(tools_ok)}"
+    METRICS["router web search queries carrying the expected words"] = f"{sum(web_ok)}/{len(web_ok)}"
+    METRICS["router web search queries"] = "\n  " + "\n  ".join(web_queries)
     METRICS["router call latency p50 / p95 / max (wall)"] = (
         f"{statistics.median(walls):.0f} / {_pct(walls, 0.95):.0f} / {max(walls):.0f} ms"
     )
@@ -177,6 +208,8 @@ async def test_router_on_the_real_model(tmp_path):
         METRICS["router misses"] = "\n  " + "\n  ".join(misses)
     assert correct / total >= MIN_INTENT_ACCURACY, misses
     assert sum(query_ok) / len(query_ok) >= MIN_QUERY_ACCURACY, misses
+    assert all(tools_ok), misses  # application code decides, from the utterance and the model's English query
+    assert sum(web_ok) / len(web_ok) >= MIN_QUERY_ACCURACY, misses
 
 
 async def test_what_a_router_call_costs_the_next_answer(tmp_path):
