@@ -54,7 +54,8 @@ def test_a_spoken_long_sentence_comes_as_two_chunks(voice):  # noqa: F811
         c.say(QUESTION)
         got = c.until("agent_message")
         c.send("end")
-    chunks = [m["text"] for m in of(got, "audio_chunk")]
+    # the answer's own chunks: a "tail" ("It's on screen now.") may follow if the answer's figures drew a chart
+    chunks = [m["text"] for m in of(got, "audio_chunk") if not m.get("tail") and not m.get("filler")]
     assert chunks[0] == "Revenue was Rs 7,365 crore,"  # the first chunk (the chunker's first clause)
     assert " ".join(chunks) == LONG
     assert len(chunks) == 3  # the rest of the sentence, in two clauses
