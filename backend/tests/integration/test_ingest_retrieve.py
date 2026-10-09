@@ -73,8 +73,9 @@ def is_fy24_margin(text: str) -> bool:
 def test_ingestion_result(ingested: IngestionResult, container: Container, loop: asyncio.AbstractEventLoop):
     assert (ingested.page_count, ingested.table_count, ingested.language) == (3, 1, "en")
     assert ingested.chunk_count == len(ingested.chunks) >= 4
+    version = container.settings.ingestion.chunking.version
     for c in ingested.chunks:
-        assert (c.project_id, c.document_id, c.version, c.chunking_version) == (PROJECT, DOCUMENT, 1, "v1")
+        assert (c.project_id, c.document_id, c.version, c.chunking_version) == (PROJECT, DOCUMENT, 1, version)
         assert c.page_start is not None and 1 <= c.page_start <= (c.page_end or 0) <= 3
         assert c.heading_path and c.language == "en"
         assert c.token_count <= 500 or c.content_type == "table"

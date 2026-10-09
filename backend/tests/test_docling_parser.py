@@ -92,7 +92,8 @@ def test_chunks_keep_the_table_whole_and_carry_provenance(parser, tmp_path):
     lists = [c for c in chunks if c.content_type == "list"]
     assert lists and lists[0].heading_path == ["Annual Report", "Risks"]
     assert [c.chunk_index for c in chunks] == list(range(len(chunks)))
-    assert all(c.chunk_id.startswith("d1:v2:") and c.chunking_version == "v1" for c in chunks)
+    assert all(c.chunk_id.startswith("d1:v2:") and c.chunking_version == parser.cfg.chunking.version for c in chunks)
+    assert {c.document_label for c in chunks} == {"report"}  # the title "Annual Report" leads every heading path
     assert all(c.language == "en" and c.page_start is None for c in chunks)
     assert all(c.token_count <= 40 for c in chunks if c.content_type != "table")
 
