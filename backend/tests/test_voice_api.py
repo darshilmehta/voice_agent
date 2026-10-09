@@ -350,9 +350,13 @@ def test_barge_in_mid_answer_stops_it_saves_what_was_heard_and_answers_the_corre
         c.send("barge_in_start", turn_id=1, played_ms=700)  # 2 chunks of 500 ms sent; 40% into the second
         c.say(CORRECTION, ms=400)
         items = c.until("agent_message")
-        assert kinds(items) == ["user_speech", "barge_in", "state", "agent_message"]
+        # Speech start, the decision, "interrupted", then the cut answer. The correction may end (user_speech end,
+        # state thinking) before the cut answer is saved on a slow machine: §3.10 only promises the cut answer's
+        # agent_message comes before the next turn's user_message.
+        assert kinds(items)[:3] == ["user_speech", "barge_in", "state"] and kinds(items)[-1] == "agent_message"
+        assert set(kinds(items)[3:-1]) <= {"user_speech", "state"}
         assert one(items, "barge_in") == {"type": "barge_in", "turn_id": 1, "decision": "stop"}
-        assert of(items, "state") == [{"type": "state", "state": "interrupted"}]
+        assert of(items, "state")[0] == {"type": "state", "state": "interrupted"}
         stopped = one(items, "agent_message")["message"]
         assert stopped["heard_text"] == "The EBITDA margin was 18.2%. Revenue grew"
         assert stopped["interrupted"] is True
@@ -361,8 +365,14 @@ def test_barge_in_mid_answer_stops_it_saves_what_was_heard_and_answers_the_corre
         assert voice.fakes.llm.closed  # generation was cancelled
 
         # the interruption becomes the next turn; nothing of turn 1 comes after the decision
+        before = items
         items = c.until("agent_message")
-        assert kinds(items)[:5] == ["state", "user_speech", "state", "user_message", "turn"]
+        seen = kinds(before) + kinds(items)
+        # The correction's end of speech and "thinking" come after the decision and before its user_message,
+        # which comes before its turn id; nothing of turn 1 follows the cut answer.
+        assert seen.index("barge_in") < len(seen) - 1 - seen[::-1].index("user_speech") < seen.index("user_message")
+        assert seen.index("user_message") < seen.index("turn")
+        assert {"type": "state", "state": "thinking"} in of(before, "state") + of(items, "state")
         assert one(items, "user_message")["message"]["text"] == "No wait, I meant the EBITDA margin"
         assert one(items, "turn")["turn_id"] == 2  # turn ids increase within the session
         assert not of_turn(items, 1) and of_turn(items, 2)
