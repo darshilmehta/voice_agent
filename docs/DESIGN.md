@@ -100,7 +100,7 @@ upload → validate (ext, size, MIME) → SHA-256 (dedupe / versioning) → docu
 → BGE-M3 dense + sparse → Qdrant upsert → ingestion QA → READY
 ```
 
-Chunks keep provenance: `document_id`, `version`, `chunk_id`, `page_start/end`, `heading_path`, `content_type` (paragraph/table/list), `language`. Tables are never split and are stored as markdown (+ optional text summary). Tables are **also persisted as typed, cell-level datasets** (§12.1, workstream 1) so later features (visual canvas, calculator) never re-parse text. Chunk sizing (~300–700 tokens, 50–100 overlap) is a starting point to tune with evals.
+Chunks keep provenance: `document_id`, `version`, `chunk_id`, `page_start/end`, `heading_path`, `content_type` (paragraph/table/list), `language`. A citation says where its passage is by page, and, where there is none (Docling gives DOCX no pages), by `section`, the chunk's heading path ("4. Travel > 4.2 Domestic > 4.2.1 Hotels"); the UI shows "§ 4.2.1 Hotels" (whole path on hover), the summary and export "file.docx, § 4.2.1 Hotels". A page wins where present. Tables are never split and are stored as markdown (+ optional text summary). Tables are **also persisted as typed, cell-level datasets** (§12.1, workstream 1) so later features (visual canvas, calculator) never re-parse text. Chunk sizing (~300–700 tokens, 50–100 overlap) is a starting point to tune with evals.
 
 ### 3.2 Retrieval (per document question)
 

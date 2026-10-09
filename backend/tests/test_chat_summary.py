@@ -119,11 +119,11 @@ def test_summary_has_overview_key_points_with_pages_and_follow_ups(env):
     first, second = s["key_points"]
     assert first["text"] == "The EBITDA margin in FY24 was 18.2%."
     assert first["sources"] == [  # the answer's [S1][S2] as documents and pages, not markers
-        {"document_id": "doc_report", "filename": "annual_report.pdf", "page_start": 2, "page_end": 2},
-        {"document_id": "doc_report", "filename": "annual_report.pdf", "page_start": 3, "page_end": 3},
+        {"document_id": "doc_report", "filename": "annual_report.pdf", "page_start": 2, "page_end": 2, "section": None},
+        {"document_id": "doc_report", "filename": "annual_report.pdf", "page_start": 3, "page_end": 3, "section": None},
     ]
     assert second["sources"] == [
-        {"document_id": "doc_deck", "filename": "investor_deck.pdf", "page_start": 7, "page_end": 7}
+        {"document_id": "doc_deck", "filename": "investor_deck.pdf", "page_start": 7, "page_end": 7, "section": None}
     ]
 
     assert s["content"] == (

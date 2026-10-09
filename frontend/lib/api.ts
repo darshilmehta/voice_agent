@@ -118,6 +118,12 @@ export interface Citation {
   page_start?: number | null;
   page_end?: number | null;
   chunk_id?: string;
+  /**
+   * Where in the document the passage is: its heading path ("4. Travel > 4.2 Domestic > 4.2.1 Hotels"). What locates a
+   * DOCX passage, which has no pages; a page wins where there is one. Absent or null for a passage without headings
+   * and for web results.
+   */
+  section?: string | null;
   /** Up to ~300 characters of the cited passage (web results: of the result's text). */
   snippet?: string;
   /** Older messages: a single page. */
@@ -186,6 +192,8 @@ export interface SummarySource {
   filename: string;
   page_start: number | null;
   page_end: number | null;
+  /** Documents without pages (DOCX): the heading path of the cited passage. */
+  section?: string | null;
   /** A live web result (the backend sends `document_id: ""` and the site as `filename`). */
   web?: boolean;
 }

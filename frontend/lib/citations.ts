@@ -5,6 +5,9 @@
  * citation without `kind` is a document passage; `kind: "web"` carries `url`, `title`, `site` and `published`. Older
  * messages hold free-form citation JSON (`document_id`, `page`, `chunk_id`, maybe a name); everything here reads all
  * the shapes and never throws on odd input.
+ *
+ * Where a document passage is: its pages when it has them, else (DOCX has none) its `section`, the heading path
+ * ("4. Travel > 4.2 Domestic > 4.2.1 Hotels"), shown as "§ 4.2.1 Hotels" with the whole path on hover.
  */
 
 import type { Citation, ProjectDocument } from "./api";
@@ -23,6 +26,8 @@ export interface SourceRef {
   filename: string;
   pageStart: number | null;
   pageEnd: number | null;
+  /** Documents: the heading path of the passage ("4. Travel > 4.2 Domestic > 4.2.1 Hotels"), when it has headings. */
+  section: string | null;
   snippet: string | null;
   chunkId: string | null;
   /** Web results: where the page is (http or https only; anything else is dropped), its title, site and date. */
@@ -93,6 +98,7 @@ export function toSourceRef(c: Citation, docsById: Record<string, ProjectDocumen
       filename: site ?? "Web",
       pageStart: null,
       pageEnd: null,
+      section: null,
       snippet: str(raw.snippet) ?? str(raw.text),
       chunkId: null,
       url,
@@ -119,6 +125,7 @@ export function toSourceRef(c: Citation, docsById: Record<string, ProjectDocumen
     filename,
     pageStart,
     pageEnd,
+    section: str(raw.section),
     snippet: str(raw.snippet) ?? str(raw.text),
     chunkId,
     url: null,
@@ -157,6 +164,41 @@ export function pagesLong(ref: SourceRef): string | null {
     : `Page ${ref.pageStart}`;
 }
 
+/** What the backend joins a heading path with (`Citation.section`). */
+const SECTION_SEPARATOR = " > ";
+
+/** The headings of the section, outermost first: ["4. Travel", "4.2 Domestic", "4.2.1 Hotels"]. */
+export function sectionHeadings(ref: SourceRef): string[] {
+  if (ref.kind !== "document" || !ref.section) return [];
+  return ref.section
+    .split(SECTION_SEPARATOR)
+    .map((h) => h.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+}
+
+/** "§ 4.2.1 Hotels": the last heading of the section, or null without one. */
+export function sectionShort(ref: SourceRef): string | null {
+  const last = sectionHeadings(ref).at(-1);
+  return last ? `§ ${last}` : null;
+}
+
+/** "4. Travel > 4.2 Domestic > 4.2.1 Hotels": the whole path, or null without a section. */
+export function sectionPath(ref: SourceRef): string | null {
+  const headings = sectionHeadings(ref);
+  return headings.length > 0 ? headings.join(" > ") : null;
+}
+
+/**
+ * Where in the document a source is: its pages when it has them ("p.4"), else its section ("§ 4.2.1 Hotels", `path`
+ * is the whole heading path for a tooltip), else nothing.
+ */
+export function locationShort(ref: SourceRef): { kind: "pages" | "section"; label: string; path: string | null } | null {
+  const pages = pagesShort(ref);
+  if (pages) return { kind: "pages", label: pages, path: null };
+  const section = sectionShort(ref);
+  return section ? { kind: "section", label: section, path: sectionPath(ref) } : null;
+}
+
 /** What the answer text calls it: "W1" for a web result, "1" for the numbered document passage "S1". */
 export function markerOf(ref: SourceRef): string | null {
   if (ref.number === null) return null;
@@ -164,8 +206,8 @@ export function markerOf(ref: SourceRef): string | null {
 }
 
 /**
- * Spoken/accessible description: "Source 1: annual_report.pdf, page 4", "Web result 1: Rupee gains, reuters.com,
- * 8 Oct 2026".
+ * Spoken/accessible description: "Source 1: annual_report.pdf, page 4" ("Source 1: travel.docx, section 4.2.1 Hotels"
+ * for a document without pages), "Web result 1: Rupee gains, reuters.com, 8 Oct 2026".
  */
 export function describeSource(ref: SourceRef): string {
   if (ref.kind === "web") {
@@ -174,8 +216,10 @@ export function describeSource(ref: SourceRef): string {
     return detail ? `${label}: ${detail}` : label;
   }
   const pages = pagesLong(ref);
+  const last = sectionHeadings(ref).at(-1);
   const label = ref.number !== null ? `Source ${ref.number}` : "Source";
-  return `${label}: ${ref.filename}${pages ? `, ${pages.toLowerCase()}` : ""}`;
+  const where = pages ? pages.toLowerCase() : last ? `section ${last}` : null;
+  return `${label}: ${ref.filename}${where ? `, ${where}` : ""}`;
 }
 
 /** Documents first, then web results; each in numbered order (un-numbered last, in the order they came). */

@@ -35,11 +35,13 @@ import {
   describeSource,
   hostOf,
   isNumericCell,
+  locationShort,
   markerOf,
   pagesLong,
-  pagesShort,
   parseTableSnippet,
   publishedText,
+  sectionPath,
+  sectionShort,
   sortSources,
   splitCitations,
   withoutPartialMarker,
@@ -268,7 +270,15 @@ export function CitationPopoverProvider({ children }: { children: ReactNode }) {
                     {source.filename}
                   </strong>
                 </div>
-                {pages && <p className="cite-pop-pages">{pages}</p>}
+                {pages ? (
+                  <p className="cite-pop-pages">{pages}</p>
+                ) : (
+                  sectionShort(source) && (
+                    <p className="cite-pop-pages cite-pop-section" title={sectionPath(source) ?? undefined}>
+                      {sectionShort(source)}
+                    </p>
+                  )
+                )}
                 {source.snippet ? (
                   <SnippetView snippet={source.snippet} />
                 ) : (
@@ -493,7 +503,7 @@ export function SourceList({ sources }: { sources: SourceRef[] }) {
 
 function SourceButton({ source }: { source: SourceRef }) {
   const trigger = useSourceTrigger(source);
-  const pages = pagesShort(source);
+  const where = locationShort(source);
   if (source.kind === "web") {
     // A live web result: a globe and the site (the page itself is one click further, in the popover).
     const marker = markerOf(source);
@@ -515,7 +525,14 @@ function SourceButton({ source }: { source: SourceRef }) {
         <Icon name="doc" size={12} />
       )}
       <span className="cite-name">{source.filename}</span>
-      {pages && <span className="cite-page">{pages}</span>}
+      {where &&
+        (where.kind === "pages" ? (
+          <span className="cite-page">{where.label}</span>
+        ) : (
+          <span className="cite-page cite-section" title={where.path ?? undefined}>
+            {where.label}
+          </span>
+        ))}
     </button>
   );
 }
