@@ -167,7 +167,8 @@ _LEFT = f"(?<![A-Za-z{_HINDI_LETTERS}])"
 _RIGHT = f"(?![A-Za-z{_HINDI_LETTERS}])"
 _VERBS = (
     f"{_LEFT}(?:answer|reply|respond|speak|talk|say|tell|explain|write|continue|switch|translate|batao|bataiye|"
-    "bolo|boliye|bol|baat|samjhao|samjhaiye|jawab|likho|बताओ|बताइए|बताइये|बोलो|बोलिए|बोलिये|बात|समझाओ|समझाइए|"
+    "bolo|boliye|bol|baat|samjhao|samjhaiye|jawab|likho|bataye|bataiye|batayein|बताओ|बताइए|बताइये|बताये|बतायें|बताएं|"
+    "बताएँ|बोलो|बोलिए|बोलिये|बात|समझाओ|समझाइए|"
     f"जवाब|लिखो){_RIGHT}"
 )
 

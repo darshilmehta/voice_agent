@@ -116,6 +116,9 @@ def test_hinglish_needs_more_than_one_stray_word():
         ("Hindi mein batao", "hi"),
         ("english me bolo", "en"),
         ("हिंदी में बताइए", "hi"),
+        ("हिंदी में बताये", "hi"),  # the spellings Whisper writes (final end-to-end run: "हिंदी में बताये")
+        ("हिंदी में बताएं", "hi"),
+        ("hindi mein bataye", "hi"),
         ("अंग्रेज़ी में बताओ", "en"),
         ("in Hindi please", "hi"),
         ("Switch to English", "en"),
@@ -190,6 +193,22 @@ def test_a_language_request_alone_repeats_the_previous_question_or_is_acknowledg
     decision = fast_route(request("please answer in Hindi", language="hi"))  # nothing to repeat yet
     assert decision is not None and (decision.route.intent, decision.reply) == ("conversation", "language")
     assert fast_route(request("answer in Hindi: what was the revenue?", language="hi")) is None  # asks more
+
+
+@pytest.mark.parametrize("spoken", ["हिंदी में बताये", "हिंदी में बताएं", "हिंदी में बतायें", "hindi mein bataye"])
+def test_a_language_request_in_whisper_spellings_is_still_only_a_language_request(spoken):
+    """Found in the final end-to-end run: Whisper wrote "हिंदी में बताइए" as "हिंदी में बताये", which missed the fast path;
+    the router model took it for an acknowledgement and the agent said nothing ("Acknowledged"), never switching."""
+    answered = [
+        MARGIN[0],
+        MARGIN[1].model_copy(update={"route": {"answer": "grounded", "topic": "ebitda margin", "query_en": None}}),
+    ]
+    decision = fast_route(request(spoken, answered, language="hi"))
+    assert decision is not None and decision.language_request and decision.route.intent == "correction"
+    assert (
+        decision.route.rewritten_query == "What was the EBITDA margin in FY24?"
+        and decision.route.response_language == "hi"
+    )
 
 
 def test_b5_asked_for_english_the_previous_hinglish_question_is_asked_again_in_english():

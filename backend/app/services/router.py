@@ -115,10 +115,10 @@ _LANGUAGE_REQUEST_WORDS = wordset(
     """
     please pls plz now from on can could would you will answer reply respond speak talk say tell explain write
     continue switch use repeat in into to me it that this the same again it's language
-    hindi english angrezi angreji batao bataiye bolo boliye bol karo kariye baat jawab do dijiye mein me main ab se
-    zara thoda
-    हिंदी हिन्दी अंग्रेज़ी अंग्रेजी इंग्लिश में बताओ बताइए बताइये बोलो बोलिए बोलिये कीजिए करो करें बात जवाब दो दीजिए अब से
-    ज़रा थोड़ा यह इसे
+    hindi english angrezi angreji batao bataiye bataye batayein bolo boliye bol karo kariye baat jawab do dijiye mein
+    me main ab se zara thoda
+    हिंदी हिन्दी अंग्रेज़ी अंग्रेजी इंग्लिश में बताओ बताइए बताइये बताये बतायें बताएं बताएँ बोलो बोलिए बोलिये कीजिए करो
+    करें बात जवाब दो दीजिए अब से ज़रा थोड़ा यह इसे
     """
 )
 GREETING_PHRASES = _phrases(
