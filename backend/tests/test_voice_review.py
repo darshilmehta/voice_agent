@@ -329,12 +329,18 @@ def test_16b_a_replaced_session_saves_its_answer_as_disconnected_before_the_new_
             second.start()
             second.say(CORRECTION)
             second.until("agent_message")
-    assert [(r[0], r[3]) for r in roles(voice)] == [
+    expected = [
         ("user", None),
         ("agent", "disconnect"),  # saved by the first session before the second one's message
         ("user", None),
         ("agent", "disconnect"),  # the second session closed mid-playback too
     ]
+    # The second session's interruption is recorded by its clean-up after the socket closes: give it a moment on a
+    # slow machine instead of reading the transcript in the same instant.
+    deadline = time.monotonic() + 5
+    while [(r[0], r[3]) for r in roles(voice)] != expected and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert [(r[0], r[3]) for r in roles(voice)] == expected
 
 
 def test_17_after_an_llm_error_the_cut_off_fragment_is_not_spoken(voice):
