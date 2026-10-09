@@ -2,7 +2,8 @@
 
     query (+ English query_en from the router, §3.4) → BGE-M3 dense + sparse
       → Qdrant: top prefetch_k dense + top prefetch_k sparse, filtered to the project (and chat's documents), RRF
-      → bge-reranker-v2-m3 scores (query_en when given: the reranker is calibrated best EN-EN, §9.2)
+      → bge-reranker-v2-m3 scores (with query_en when given, except Hindi passages: the user's own words;
+        the reranker is calibrated best within one language, §9.2)
       → top rerank_top_n + confidence (top score, gap to the runner-up, dense similarity)
 
 ``search`` and ``rerank`` are public so the voice loop can start retrieval speculatively on the raw utterance and
@@ -211,11 +212,27 @@ class RetrievalService:
         hits = fuse_hit_lists(lists, limit=self.config.prefetch_k)
         return hits, {"embed": _ms(t1 - t0), "search": _ms(t2 - t1)}
 
-    async def rerank(self, query: str, hits: Sequence[SearchHit]) -> list[RankedChunk]:
-        """Every hit scored against ``query`` with the cross-encoder, best first."""
+    async def rerank(
+        self, query: str, hits: Sequence[SearchHit], *, native_query: str | None = None
+    ) -> list[RankedChunk]:
+        """Every hit scored against ``query`` with the cross-encoder, best first.
+
+        ``native_query``: the question as the user asked it, when ``query`` is its English version. Hindi passages
+        are then scored against the user's own words and the others against the English query: the cross-encoder
+        is calibrated best within one language (§9.2). Same number of passages scored, in two calls."""
         if not hits:
             return []
-        scores = await self.reranker.score(query, [h.chunk.embed_text for h in hits])
+        texts = [h.chunk.embed_text for h in hits]
+        native = [i for i, h in enumerate(hits) if h.chunk.language == "hi"]
+        if not native_query or not native or same_query(native_query, query):
+            return rank_by_scores(hits, await self.reranker.score(query, texts))
+        native_set = set(native)
+        english = [i for i in range(len(hits)) if i not in native_set]
+        scores = [0.0] * len(hits)
+        for idx, q in ((english, query), (native, native_query)):
+            if idx:
+                for i, score in zip(idx, await self.reranker.score(q, [texts[i] for i in idx]), strict=True):
+                    scores[i] = score
         return rank_by_scores(hits, scores)
 
     async def retrieve(
@@ -254,7 +271,7 @@ class RetrievalService:
         ``query_en`` when given. ``started`` (a ``perf_counter`` value) is when the search began, for the total."""
         t1 = time.perf_counter()
         rerank_query = (query_en or "").strip() or query
-        ranked = await self.rerank(rerank_query, hits)
+        ranked = await self.rerank(rerank_query, hits, native_query=query if rerank_query != query else None)
         t2 = time.perf_counter()
         return RetrievalResult(
             query=query,

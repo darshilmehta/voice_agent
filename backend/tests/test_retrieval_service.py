@@ -158,6 +158,26 @@ def test_retrieve_reranks_with_the_english_query():
     assert set(res.timings_ms) == {"embed", "search", "rerank", "total"}
 
 
+def test_hindi_passages_are_reranked_with_the_users_own_words():
+    """With an English query from the router, English passages are scored against it and Hindi passages against
+    the question as asked: the cross-encoder compares best within one language (§9.2)."""
+    en_chunk = make_chunk(0, text="EBITDA margin was 21.0% in FY24.")
+    hi_chunk = make_chunk(1, text="योजना में प्रशिक्षण निःशुल्क है।", language="hi")
+    store = FakeStore(results=[[hit(en_chunk), hit(hi_chunk)], [hit(hi_chunk)]])
+    svc, _, reranker = service(store, scorer=lambda q, p: 0.9 if "योजना" in q and "योजना" in p else 0.2)
+    hi = "क्या योजना में प्रशिक्षण मुफ़्त है?"
+    en = "Is the training under the scheme free?"
+    res = asyncio.run(svc.retrieve(hi, project_id="proj1", query_en=en))
+    assert reranker.calls == [(en, [en_chunk.embed_text]), (hi, [hi_chunk.embed_text])]
+    assert [r.chunk.chunk_index for r in res.chunks] == [1, 0] and res.confidence.top_score == 0.9
+    assert res.rerank_query == en
+
+    store = FakeStore(results=[[hit(hi_chunk), hit(en_chunk)]])  # no English query: one call, the question
+    svc, _, reranker = service(store)
+    asyncio.run(svc.retrieve(hi, project_id="proj1"))
+    assert reranker.calls == [(hi, [hi_chunk.embed_text, en_chunk.embed_text])]
+
+
 def test_retrieve_without_english_query_searches_once_and_reranks_the_query():
     c = chunks(2)
     store = FakeStore(results=[[hit(c[0]), hit(c[1])]])
