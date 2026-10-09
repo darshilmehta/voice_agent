@@ -8,11 +8,15 @@ import pytest
 
 from app.providers.ingestion import (
     ChunkPiece,
+    ParsedDocument,
+    ParsedItem,
     ParsedTable,
     TableCell,
     assemble_chunks,
     content_budget,
     detect_language,
+    document_label,
+    document_title,
     point_id,
     tail_text,
 )
@@ -153,6 +157,71 @@ def test_chunk_language_is_detected_with_the_document_language_as_fallback():
         [piece("कंपनी ने EBITDA मार्जिन में सुधार किया।", "A"), piece("12,345 67.8%", "B")], default_language="hi"
     )
     assert [c.language for c in chunks] == ["hi", "hi"]
+
+
+def test_chunks_are_labelled_with_their_document():
+    """Tables and slides rarely name their company: the label (file name and title) is embedded and reranked with
+    every chunk, so "Valmora's EBITDA" can't match another company's table as well as Valmora's."""
+    chunks = assemble(
+        [
+            piece("| Metric | FY24 |\n| EBITDA margin | 21.0% |", "Financial highlights"),
+            piece("Introduction to the plan.", "Valmora Industries: Annual Report"),
+        ],
+        source_name="valmora_annual-report.FY24.pdf",
+        title="Valmora Industries: Annual Report",
+    )
+    table_chunk, titled = chunks
+    assert table_chunk.document_label == "valmora annual report FY24: Valmora Industries: Annual Report"
+    assert table_chunk.embed_text.splitlines()[:2] == [table_chunk.document_label, "Financial highlights"]
+    assert table_chunk.text.startswith("| Metric")  # shown and cited as before
+    assert table_chunk.token_count == words(table_chunk.embed_text)
+    assert titled.document_label == "valmora annual report FY24"  # its heading path already starts with the title
+    (plain,) = assemble([piece("Text.", "H")])
+    assert plain.document_label == "" and plain.embed_text == "H\nText."  # no name given: unlabelled, as before
+
+
+@pytest.mark.parametrize(
+    ("name", "title", "label"),
+    [
+        (
+            "zephyra_investor_deck_q4fy24.pptx",
+            "Zephyra Logistics Limited",
+            "zephyra investor deck q4fy24: Zephyra Logistics Limited",
+        ),
+        ("valmora_annual_report.pdf", "Valmora annual report", "valmora annual report"),  # title adds nothing
+        ("scan0042.pdf", None, "scan0042"),
+        ("", "Group Health Insurance Policy", "Group Health Insurance Policy"),
+    ],
+)
+def test_document_label(name, title, label):
+    assert document_label(name, title) == label
+
+
+def test_document_title_is_the_title_item_or_the_first_heading_of_the_first_page():
+    def item(label: str, text: str, page: int | None, level: int | None = None) -> ParsedItem:
+        return ParsedItem(ref="#", label=label, text=text, page=page, heading_path=[], level=level)
+
+    def doc(*items: ParsedItem) -> ParsedDocument:
+        return ParsedDocument(
+            source_name="a.pdf",
+            format="pdf",
+            page_count=2,
+            pages=[],
+            items=list(items),
+            tables=[],
+            markdown="",
+            language="en",
+            parse_seconds=0.1,
+        )
+
+    cover = item("section_header", "VALMORA INDUSTRIES  LIMITED", 1, level=1)
+    body = item("text", "Annual Report 2023-24", 1)
+    later = item("section_header", "Corporate information", 2, level=1)
+    assert document_title(doc(body, cover, later)) == "VALMORA INDUSTRIES LIMITED"
+    assert document_title(doc(cover, item("title", "The Real Title", 2, level=0))) == "The Real Title"
+    assert document_title(doc(body, later)) is None  # no heading on the first page
+    assert document_title(doc(item("title", "x" * 200, 1, level=0))) is None  # not a title
+    assert document_title(doc()) is None
 
 
 def test_pages_may_be_unknown():

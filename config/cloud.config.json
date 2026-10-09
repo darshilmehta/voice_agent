@@ -103,14 +103,14 @@
     "ocr_engine": "rapidocr",
     "max_pages": 500,
     "allowed_extensions": [".pdf", ".docx", ".pptx", ".txt", ".md"],
-    "chunking": { "version": "v1", "target_tokens": 500, "overlap_tokens": 80 }
+    "chunking": { "version": "v2", "target_tokens": 500, "overlap_tokens": 80 }
   },
 
   "retrieval": {
     "prefetch_k": 8,
     "fusion": "rrf",
     "rerank_top_n": 5,
-    "min_rerank_score": 0.05,
+    "min_rerank_score": 0.02,
     "context_token_budget": 3000
   },
 

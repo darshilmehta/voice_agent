@@ -25,6 +25,7 @@ from app.providers.retrieval import (
     build_filter,
     build_hybrid_query,
     cosine,
+    rerank_batch_size,
     to_hit,
     to_point,
 )
@@ -236,9 +237,40 @@ def test_count_uses_the_filter(store):
     assert client.last("count")["exact"] is True
 
 
+def test_outdated_documents_have_no_chunks_or_chunks_of_another_chunking_version(store):
+    # document -> (chunks, chunks of another chunking version)
+    index = {"current": (5, 0), "mixed": (3, 2), "old": (4, 4), "missing": (0, 0)}
+
+    class CountingClient(FakeClient):
+        async def count(self, name: str, **kw: Any) -> Any:
+            self._record("count", name=name, **kw)
+            flt = kw["count_filter"]
+            doc = flt.must[0].match.value
+            total, other = index[doc]
+            if flt.must_not:
+                assert flt.must_not == [qm.FieldCondition(key="chunking_version", match=qm.MatchValue(value="v9"))]
+                return SimpleNamespace(count=other)
+            return SimpleNamespace(count=total)
+
+    client = use(store, CountingClient(exists=True))
+    assert asyncio.run(store.outdated(list(index), "v9")) == ["mixed", "old", "missing"]
+    assert all(kw["exact"] for n, kw in client.calls if n == "count")
+    assert asyncio.run(store.outdated([], "v9")) == []
+
+    client = use(store, FakeClient(exists=False))  # no collection (new or dropped): everything must be indexed
+    assert asyncio.run(store.outdated(["a", "b"], "v9")) == ["a", "b"]
+    assert "count" not in client.names()
+
+
 def test_client_is_created_lazily_without_network(store):
     assert store._client is None
     client = store.client()
     assert store.client() is client  # constructed once, no compatibility request
     asyncio.run(store.close())
     assert store._client is None
+
+
+def test_the_reranker_uses_small_length_sorted_batches_on_mps():
+    """Less padding: ~45% faster on the M4 (see RERANK_BATCH_SIZE_MPS); other devices keep large batches."""
+    assert rerank_batch_size("mps") == 2
+    assert rerank_batch_size("cpu") == rerank_batch_size("cuda") == 32

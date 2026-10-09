@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -139,6 +140,40 @@ class DocumentService(Service):
             s.add(job)
             await s.flush()
             return Document.model_validate(doc), job.id
+
+    async def indexed_documents(self) -> list[str]:
+        """READY documents of every project with no ingestion job queued or running: the ones whose index a newer
+        chunking version may have made stale. Oldest first."""
+        active = select(orm.IngestionJob.document_id).where(orm.IngestionJob.status.in_((QUEUED, RUNNING)))
+        stmt = (
+            select(orm.Document.id)
+            .where(orm.Document.status == READY, orm.Document.id.not_in(active))
+            .order_by(orm.Document.created_at, orm.Document.id)
+        )
+        async with self.db.session() as s:
+            return list((await s.scalars(stmt)).all())
+
+    async def queue_reindex(self, document_id: str) -> str | None:
+        """A QUEUED job that ingests a READY document's current version again (its index is stale). The document
+        stays READY, and searchable on its old index, until the job starts (PROCESSING, then READY again).
+        None when the document is gone, not READY, or already has a job queued or running."""
+        async with self.db.session() as s:
+            doc = await s.get(orm.Document, document_id)
+            if doc is None or doc.status != READY:
+                return None
+            active = await s.scalar(
+                select(orm.IngestionJob.id).where(
+                    orm.IngestionJob.document_id == document_id, orm.IngestionJob.status.in_((QUEUED, RUNNING))
+                )
+            )
+            if active is not None:
+                return None
+            job = orm.IngestionJob(
+                document_id=document_id, version=doc.version, status=QUEUED, attempts=0, created_at=self.now()
+            )
+            s.add(job)
+            await s.flush()
+            return job.id
 
     async def start_job(self, job_id: str) -> JobTarget | None:
         """Mark a QUEUED job RUNNING and its document PROCESSING. None when there is nothing to do (the document was
@@ -275,32 +310,38 @@ class DocumentService(Service):
             return [DocumentTable.model_validate(t) for t in (await s.scalars(stmt)).all()]
 
 
+def _table_fields(t: ParsedTable) -> dict[str, Any]:
+    return {
+        "table_index": t.index,
+        "page_start": t.page_start,
+        "page_end": t.page_end,
+        "bbox": list(t.bbox) if t.bbox is not None else None,
+        "heading_path": list(t.heading_path),
+        "caption": t.caption,
+        "num_rows": t.num_rows,
+        "num_cols": t.num_cols,
+        "markdown": t.markdown,
+        "cells": [c.model_dump(mode="json") for c in t.cells],
+    }
+
+
 async def _replace_tables(
     s: AsyncSession, document_id: str, version: int, tables: Sequence[ParsedTable], now: datetime
 ) -> None:
-    await s.execute(
-        delete(orm.DocumentTable).where(
-            orm.DocumentTable.document_id == document_id, orm.DocumentTable.version == version
-        )
-    )
-    for t in tables:
-        s.add(
-            orm.DocumentTable(
-                document_id=document_id,
-                version=version,
-                table_index=t.index,
-                page_start=t.page_start,
-                page_end=t.page_end,
-                bbox=list(t.bbox) if t.bbox is not None else None,
-                heading_path=list(t.heading_path),
-                caption=t.caption,
-                num_rows=t.num_rows,
-                num_cols=t.num_cols,
-                markdown=t.markdown,
-                cells=[c.model_dump(mode="json") for c in t.cells],
-                created_at=now,
-            )
-        )
+    """Store a version's tables. When the stored ones are the same (a re-index of an unchanged file, see
+    ``DocumentPipeline.reindex_outdated``) the rows are kept, so their ids (and the canvas datasets and cell
+    references built on them, §12.1) stay valid."""
+    of_version = (orm.DocumentTable.document_id == document_id, orm.DocumentTable.version == version)
+    query = select(orm.DocumentTable).where(*of_version).order_by(orm.DocumentTable.table_index)
+    stored = (await s.scalars(query)).all()
+    fields = [_table_fields(t) for t in tables]
+    if len(stored) == len(fields) and all(
+        all(getattr(row, k) == v for k, v in f.items()) for row, f in zip(stored, fields, strict=True)
+    ):
+        return
+    await s.execute(delete(orm.DocumentTable).where(*of_version))
+    for f in fields:
+        s.add(orm.DocumentTable(document_id=document_id, version=version, created_at=now, **f))
 
 
 def _clip(text: str) -> str:

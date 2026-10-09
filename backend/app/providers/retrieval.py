@@ -33,14 +33,21 @@ SPARSE = "sparse"
 # Longest text the embedder reads. Chunks are ≤ ~target_tokens, but whole tables can be longer; BGE-M3 handles 8192.
 EMBED_MAX_TOKENS = 2048
 # Query + passage tokens the cross-encoder reads (as in smoke test 04). Chunks of target_tokens (500) fit almost
-# whole; long table chunks are cut, which bounds their cost. Reranking is compute-bound and linear in the number of
-# candidates (retrieval.prefetch_k): on an M4 (MPS, fp16) ~110 ms per ~425-token candidate, ~68 ms at ~250 and
-# ~35 ms at ~120 tokens, so 20 full-size candidates take ~2.0 s and 8 take ~0.9 s. prefetch_k is 8: on the smoke
-# corpus padded with long distractors the answer's fused rank stayed within the top 5 (EN, HI, Hinglish, identifier
-# and cross-lingual queries), and the reranker reorders whatever is in the list.
+# whole; long table chunks are cut, which bounds their cost (none of the phase-2 eval corpus's: its longest chunk is
+# ~430 tokens). Reranking is compute-bound and linear in the number of candidates (retrieval.prefetch_k).
 RERANK_MAX_TOKENS = 512
+# Pairs per forward pass. sentence-transformers sorts pairs by length, so small batches pad each pair only to its
+# neighbours' length instead of the longest candidate's: on the M4 (MPS, fp16, phase-2 eval candidates of ~50-430
+# tokens, p50) 8 candidates take ~340 ms in batches of 2 against ~615 ms in one batch of 32, 12 take ~490 against
+# ~930 ms, 16 take ~640 against ~1,240 ms (batches of 1 and 4 are within ~40 ms of 2). Other devices keep large
+# batches (unmeasured; CUDA prefers them).
 RERANK_BATCH_SIZE = 32
+RERANK_BATCH_SIZE_MPS = 2
 UPSERT_BATCH = 256
+
+
+def rerank_batch_size(device: str) -> int:
+    return RERANK_BATCH_SIZE_MPS if device == "mps" else RERANK_BATCH_SIZE
 
 
 class VectorStoreError(RuntimeError):
@@ -215,7 +222,9 @@ class BgeReranker(Reranker, LazyModelProvider):
             model = self._model_locked()
             with self._torch_use():
                 scores = model.predict(
-                    [(query, p) for p in passages], batch_size=RERANK_BATCH_SIZE, show_progress_bar=False
+                    [(query, p) for p in passages],
+                    batch_size=rerank_batch_size(self.cfg.device),
+                    show_progress_bar=False,
                 )
         return [float(s) for s in scores]
 
@@ -245,6 +254,11 @@ class VectorStore(Provider):
 
     async def count(self, filters: RetrievalFilters) -> int:
         raise NotImplementedError(f"{type(self).__name__}.count")
+
+    async def outdated(self, document_ids: Sequence[str], chunking_version: str) -> list[str]:
+        """The documents among ``document_ids`` whose index must be rebuilt: no chunks indexed, or chunks built by
+        another ``chunking_version`` (what is embedded changed). Order of ``document_ids`` kept."""
+        raise NotImplementedError(f"{type(self).__name__}.outdated")
 
 
 def build_filter(filters: RetrievalFilters) -> qm.Filter:
@@ -453,6 +467,30 @@ class QdrantStore(VectorStore):
                 return 0
             raise
         return res.count
+
+    async def outdated(self, document_ids: Sequence[str], chunking_version: str) -> list[str]:
+        from qdrant_client import models as qm
+
+        if not document_ids:
+            return []
+        client = self.client()
+        try:
+            exists = await client.collection_exists(self.collection)
+        except Exception as e:
+            raise VectorStoreError(f"cannot check the index of {len(document_ids)} document(s): {e}") from e
+        if not exists:
+            return list(document_ids)
+        out = []
+        for doc_id in document_ids:
+            of_doc = qm.FieldCondition(key="document_id", match=qm.MatchValue(value=doc_id))
+            current = qm.FieldCondition(key="chunking_version", match=qm.MatchValue(value=chunking_version))
+            total = await client.count(self.collection, count_filter=qm.Filter(must=[of_doc]), exact=True)
+            other = await client.count(
+                self.collection, count_filter=qm.Filter(must=[of_doc], must_not=[current]), exact=True
+            )
+            if total.count == 0 or other.count > 0:
+                out.append(doc_id)
+        return out
 
     async def drop_collection(self) -> None:
         """Delete the whole collection (tests, re-index). Recreated on the next upsert."""

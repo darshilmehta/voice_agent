@@ -228,6 +228,7 @@ class Fakes:
     web: FakeWebSearch | None = None  # None: the configured provider (SearXNG, turned off) stays
 
     def install(self, container: Any) -> Any:
+        self.parser.chunking_version = container.settings.ingestion.chunking.version  # as the real parser does
         container.providers.update(
             ingestion=self.parser,
             embeddings=self.embedder,

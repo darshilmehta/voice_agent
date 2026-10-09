@@ -11,9 +11,12 @@ from app.providers.retrieval import RetrievalFilters
 from app.services.retrieval import (
     RankedChunk,
     RetrievalService,
+    asked_periods,
     confidence_of,
     fuse_hit_lists,
+    missing_periods,
     rank_by_scores,
+    stated_periods,
 )
 from app.settings import RetrievalSection
 
@@ -66,6 +69,66 @@ def test_confidence_signals():
     assert confidence_of([], 0.3) is None
 
 
+@pytest.mark.parametrize(
+    ("text", "periods"),
+    [
+        ("What is Valmora's EBITDA margin for FY25?", {25}),
+        ("revenue in fy24 vs FY 23", {23, 24}),
+        ("FY2025 guidance", {25}),
+        ("FY 2024-25 capex, FY24-25 and 2023-24", {24, 25}),
+        ("वाल्मोरा का FY25 का लाभांश", {25}),
+        ("वित्त वर्ष २०२४-२५ में", {25}),  # Devanagari digits
+        ("Q1 FY25 revenue", {25}),
+        ("zephyra investor deck q4fy24", {24}),
+        ("What happened in 2024?", set()),  # a bare calendar year is not a fiscal period
+        ("How many employees does Valmora have?", set()),
+    ],
+)
+def test_periods_a_question_names(text, periods):
+    assert asked_periods(text) == periods
+
+
+@pytest.mark.parametrize(
+    ("text", "periods"),
+    [
+        ("EBITDA margin was 21.0% in FY24, up from 19.8% in FY23", {23, 24}),
+        ("The market capitalisation on 31 March 2024 was ₹ 22,640 crore", {24}),
+        ("paid on or after 4 September 2024", {25}),
+        ("31 मार्च 2024 को", {24}),
+        ("founded in 1998", {98, 99}),  # an undated year: either fiscal year it can fall in
+    ],
+)
+def test_periods_a_passage_states(text, periods):
+    assert stated_periods(text) == periods
+
+
+def test_gate_refuses_a_question_about_a_period_the_best_passage_does_not_state():
+    """Near misses ("FY25" when the documents stop at FY24) score high with the reranker: the gate checks periods."""
+    fy24 = make_chunk(0, text="The EBITDA margin was 21.0% in FY24, up from 19.8% in FY23.")
+    outlook = make_chunk(1, text="For FY25 the Board approved capital expenditure of ₹ 1,100 crore.")
+    ranked = [RankedChunk(fy24, 0.95, 0.03, 0.7, 1), RankedChunk(outlook, 0.6, 0.02, 0.6, 2)]
+
+    asked_fy25 = confidence_of(ranked, 0.05, queries=["What is the EBITDA margin for FY25?", None])
+    assert asked_fy25.top_score == 0.95 and asked_fy25.missing_periods == (25,)
+    assert asked_fy25.above_threshold is False
+
+    hindi = confidence_of(ranked, 0.05, queries=["FY25 का EBITDA मार्जिन?", "What is the EBITDA margin for FY25?"])
+    assert hindi.above_threshold is False and hindi.missing_periods == (25,)
+    for question in ("What was the EBITDA margin in FY24?", "What was the EBITDA margin?", "FY23 vs FY24 margin"):
+        conf = confidence_of(ranked, 0.05, queries=[question])
+        assert conf.above_threshold is True and conf.missing_periods == ()
+    assert missing_periods(["FY24 and FY26?"], fy24.embed_text) == (26,)
+    # a passage that names no year can't contradict the question
+    assert missing_periods(["EBITDA margin in FY25?"], "EBITDA margin 18.2%") == ()
+
+
+def test_the_document_label_counts_as_stated():
+    """A chunk of "annual report fy24" covers FY24 even when its own text names no year."""
+    chunk = make_chunk(0, text="Net debt declined to ₹ 831 crore.", document_label="valmora annual report fy24")
+    conf = confidence_of([RankedChunk(chunk, 0.9, 0.03, 0.7, 1)], 0.05, queries=["Net debt in FY24?"])
+    assert conf.above_threshold is True
+
+
 # ------------------------------------------------------------------ service
 
 
@@ -93,6 +156,26 @@ def test_retrieve_reranks_with_the_english_query():
     assert [r.chunk.chunk_index for r in res.chunks][:1] == [3] and len(res.chunks) == 2  # rerank_top_n
     assert res.confidence.top_score == 0.95 and res.confidence.gap == pytest.approx(0.85)
     assert set(res.timings_ms) == {"embed", "search", "rerank", "total"}
+
+
+def test_hindi_passages_are_reranked_with_the_users_own_words():
+    """With an English query from the router, English passages are scored against it and Hindi passages against
+    the question as asked: the cross-encoder compares best within one language (§9.2)."""
+    en_chunk = make_chunk(0, text="EBITDA margin was 21.0% in FY24.")
+    hi_chunk = make_chunk(1, text="योजना में प्रशिक्षण निःशुल्क है।", language="hi")
+    store = FakeStore(results=[[hit(en_chunk), hit(hi_chunk)], [hit(hi_chunk)]])
+    svc, _, reranker = service(store, scorer=lambda q, p: 0.9 if "योजना" in q and "योजना" in p else 0.2)
+    hi = "क्या योजना में प्रशिक्षण मुफ़्त है?"
+    en = "Is the training under the scheme free?"
+    res = asyncio.run(svc.retrieve(hi, project_id="proj1", query_en=en))
+    assert reranker.calls == [(en, [en_chunk.embed_text]), (hi, [hi_chunk.embed_text])]
+    assert [r.chunk.chunk_index for r in res.chunks] == [1, 0] and res.confidence.top_score == 0.9
+    assert res.rerank_query == en
+
+    store = FakeStore(results=[[hit(hi_chunk), hit(en_chunk)]])  # no English query: one call, the question
+    svc, _, reranker = service(store)
+    asyncio.run(svc.retrieve(hi, project_id="proj1"))
+    assert reranker.calls == [(hi, [hi_chunk.embed_text, en_chunk.embed_text])]
 
 
 def test_retrieve_without_english_query_searches_once_and_reranks_the_query():

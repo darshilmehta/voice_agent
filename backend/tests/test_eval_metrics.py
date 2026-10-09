@@ -201,6 +201,21 @@ SAMPLES = [
 ]
 
 
+def test_a_vetoed_question_is_refused_at_any_threshold():
+    """The gate's period check refuses a near miss whatever its score; ``gate=False`` shows the score gate alone."""
+    near_miss = GateSample(0.95, 0.5, 0.6, False, "en", veto=True, subtype="near_miss_year")
+    answerable = GateSample(0.9, 0.4, 0.7, True, "en")
+    assert not m.answers(near_miss, 0.05) and m.answers(near_miss, 0.05, gate=False)
+    c = m.confusion([near_miss, answerable], 0.05)
+    assert (c["answered_unanswerable"], c["answered_answerable"]) == (0, 1)
+    assert m.confusion([near_miss, answerable], 0.05, gate=False)["answered_unanswerable"] == 1
+    assert all(p["answered_unanswerable"] == 0 for p in m.sweep([near_miss, answerable]))
+    assert m.hallucination_by_subtype([near_miss, answerable], 0.05) == {
+        "near_miss_year": {"n": 1, "answered": 0, "hallucination_risk": 0.0}
+    }
+    assert m.hallucination_by_subtype([near_miss], 0.05, gate=False)["near_miss_year"]["hallucination_risk"] == 1.0
+
+
 def test_confusion_matrix_at_a_threshold():
     c = m.confusion(SAMPLES, 0.3)
     assert (c["answered_answerable"], c["abstained_answerable"]) == (2, 1)

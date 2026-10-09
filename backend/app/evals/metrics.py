@@ -15,7 +15,8 @@ two pages in the top 3 scores 0.5); ``success@k`` is 1 when all targets are cove
 should be abstained are excluded from all of these; they feed the abstention metrics.
 
 The answer-or-abstain decision follows the pipeline's gate: answer when the best reranker score is at least the
-threshold; nothing retrieved always abstains.
+threshold and nothing vetoes the question (a fiscal year it names that the best passage doesn't state); nothing
+retrieved always abstains. ``gate=False`` gives the score gate alone, for comparison.
 """
 
 from __future__ import annotations
@@ -276,23 +277,35 @@ class GateSample:
     should_answer: bool  # the documents contain the answer
     language: str
     evidence_retrieved: bool = False  # answerable questions: the expected evidence is in the post-rerank top N
+    veto: bool = False  # the gate refuses it whatever the score (Confidence.missing_periods)
+    subtype: str | None = None  # unanswerable questions: near_miss_year, other_company, ...
 
 
 def answers_at(sample: GateSample, threshold: float) -> bool:
-    """The pipeline's gate: answer when the best score reaches the threshold."""
+    """The score gate: answer when the best score reaches the threshold."""
     return sample.top_score is not None and sample.top_score >= threshold
+
+
+def answers(sample: GateSample, threshold: float, *, gate: bool = True) -> bool:
+    """The pipeline's gate at ``threshold``: the score gate, unless vetoed; ``gate=False``: the score gate alone."""
+    return answers_at(sample, threshold) and not (gate and sample.veto)
 
 
 def _ratio(num: int, den: int) -> float | None:
     return num / den if den else None
 
 
-def confusion(samples: Sequence[GateSample], threshold: float) -> dict[str, float | int | None]:
-    """The answer-or-abstain confusion matrix at ``threshold``. "Positive" = the documents hold the answer."""
-    aa = sum(1 for s in samples if s.should_answer and answers_at(s, threshold))  # answered, answerable
-    ba = sum(1 for s in samples if s.should_answer and not answers_at(s, threshold))  # abstained, answerable (miss)
-    au = sum(1 for s in samples if not s.should_answer and answers_at(s, threshold))  # answered, unanswerable (bad)
-    bu = sum(1 for s in samples if not s.should_answer and not answers_at(s, threshold))  # abstained, unanswerable
+def confusion(samples: Sequence[GateSample], threshold: float, *, gate: bool = True) -> dict[str, float | int | None]:
+    """The answer-or-abstain confusion matrix at ``threshold`` (``gate=False``: the score gate alone, see
+    ``answers``). "Positive" = the documents hold the answer."""
+
+    def ok(s: GateSample) -> bool:
+        return answers(s, threshold, gate=gate)
+
+    aa = sum(1 for s in samples if s.should_answer and ok(s))  # answered, answerable
+    ba = sum(1 for s in samples if s.should_answer and not ok(s))  # abstained, answerable (miss)
+    au = sum(1 for s in samples if not s.should_answer and ok(s))  # answered, unanswerable (bad)
+    bu = sum(1 for s in samples if not s.should_answer and not ok(s))  # abstained, unanswerable
     precision = _ratio(aa, aa + au)  # of the questions answered, how many had an answer
     recall = _ratio(aa, aa + ba)  # of the answerable questions, how many were answered
     f1 = None if not precision or not recall else 2 * precision * recall / (precision + recall)
@@ -312,17 +325,31 @@ def confusion(samples: Sequence[GateSample], threshold: float) -> dict[str, floa
         "abstain_precision": _ratio(bu, ba + bu),
         "abstain_recall": _ratio(bu, au + bu),
         "accuracy": _ratio(aa + bu, len(samples)),
-        "answered_with_evidence": sum(
-            1 for s in samples if s.should_answer and answers_at(s, threshold) and s.evidence_retrieved
-        ),
+        "answered_with_evidence": sum(1 for s in samples if s.should_answer and ok(s) and s.evidence_retrieved),
     }
 
 
+def hallucination_by_subtype(
+    samples: Sequence[GateSample], threshold: float, *, gate: bool = True
+) -> dict[str, dict[str, float | int | None]]:
+    """Unanswerable questions answered anyway, per subtype (near misses vs off-topic need different signals)."""
+    out: dict[str, dict[str, float | int | None]] = {}
+    for s in samples:
+        if s.should_answer:
+            continue
+        row = out.setdefault(s.subtype or "-", {"n": 0, "answered": 0, "hallucination_risk": None})
+        row["n"] = int(row["n"] or 0) + 1
+        row["answered"] = int(row["answered"] or 0) + answers(s, threshold, gate=gate)
+    for row in out.values():
+        row["hallucination_risk"] = _ratio(int(row["answered"] or 0), int(row["n"] or 0))
+    return dict(sorted(out.items()))
+
+
 def sweep(
-    samples: Sequence[GateSample], thresholds: Sequence[float] = SWEEP_GRID
+    samples: Sequence[GateSample], thresholds: Sequence[float] = SWEEP_GRID, *, gate: bool = True
 ) -> list[dict[str, float | int | None]]:
     """``confusion`` at each threshold."""
-    return [confusion(samples, t) for t in thresholds]
+    return [confusion(samples, t, gate=gate) for t in thresholds]
 
 
 def auc(positive: Sequence[float], negative: Sequence[float]) -> float | None:

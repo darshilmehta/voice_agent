@@ -35,7 +35,7 @@ from ..providers.ingestion import Chunk, IngestionError, ParsedDocument
 from ..providers.models import ModelUnavailableError
 from ..providers.registry import Container
 from ..providers.retrieval import VectorStore
-from ..providers.runtime import LANE_LONG, JobQueue
+from ..providers.runtime import LANE_LONG, LANE_SHORT, JobQueue
 from ..providers.storage import MetadataDB, ObjectNotFound, ObjectStore
 from ..settings import Settings
 from .base import InvalidInput, Unavailable
@@ -215,10 +215,16 @@ class DocumentPipeline:
         return self.settings.server.max_upload_mb * 1024 * 1024
 
     async def start(self) -> None:
-        """Hook the queue's idle signal and resume ingestions a restart interrupted."""
+        """Hook the queue's idle signal, resume ingestions a restart interrupted and queue a check for documents
+        indexed by an older chunking version (``reindex_outdated``)."""
         try:
             self.queue.on_idle(self._release_parser, lane=LANE_LONG)
             jobs = await self.documents.recover_interrupted()
+            if await self.documents.indexed_documents():
+                # In the background, never failing startup. A quick job (database and vector-store counts, no model):
+                # the short lane, so nothing waits for it and the long lane stays idle when nothing is outdated. The
+                # re-ingestions it queues go to the long lane and wait for the preload like any ingestion.
+                await self.queue.submit("re-index check", self.reindex_outdated, lane=LANE_SHORT)
         except NotImplementedError as e:  # placeholder providers (cloud template in tests): nothing to run
             log.warning("document pipeline not started: %s", e)
             return
@@ -226,6 +232,30 @@ class DocumentPipeline:
             await self._submit(job_id)
         if jobs:
             log.info("re-queued %d interrupted ingestion job(s)", len(jobs))
+
+    async def reindex_outdated(self) -> list[str]:
+        """Queue a re-ingestion of every READY document whose index is missing or was built by another
+        ``ingestion.chunking.version`` (chunking or the embedded text changed, docs/DESIGN.md §3.1). Each stays
+        READY on its old index until its job starts, is PROCESSING while it re-ingests, then READY again. Returns
+        the documents queued; a store that can't tell, or a failed check, queues nothing."""
+        version = self.settings.ingestion.chunking.version
+        try:
+            candidates = await self.documents.indexed_documents()
+            outdated = await self.vectors.outdated(candidates, version) if candidates else []
+        except NotImplementedError:
+            return []
+        except Exception as e:
+            log.warning("could not check which documents need re-indexing: %s", describe_failure(e))
+            return []
+        queued: list[str] = []
+        for doc_id in outdated:
+            job_id = await self.documents.queue_reindex(doc_id)
+            if job_id is not None:
+                await self._submit(job_id)
+                queued.append(doc_id)
+        if queued:
+            log.info("re-indexing %d document(s) for chunking version %s", len(queued), version)
+        return queued
 
     # -------------------------------------------------------------- upload
 
@@ -286,7 +316,9 @@ class DocumentPipeline:
             async with self.store.open_temp_copy(target.storage_key, filename=temp_name) as path:
                 stage = "ingest"
                 await self.documents.set_stage(job_id, stage)
-                result = await self.ingestion.ingest_file(path, target.project_id, doc_id, target.version)
+                result = await self.ingestion.ingest_file(
+                    path, target.project_id, doc_id, target.version, filename=target.filename
+                )
             stage = "persist"
             saved = await self.documents.finish_job(
                 job_id, page_count=result.page_count, chunk_count=result.chunk_count, tables=result.tables

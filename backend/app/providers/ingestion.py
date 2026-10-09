@@ -140,7 +140,11 @@ class ParsedDocument(_Model):
 
 
 class Chunk(_Model):
-    """A retrievable unit with provenance. ``text`` is shown and cited; ``embed_text`` is embedded and reranked."""
+    """A retrievable unit with provenance. ``text`` is shown and cited; ``embed_text`` is embedded and reranked.
+
+    ``document_label`` names the document the chunk comes from (file name and title, see ``document_label``): tables
+    and slides rarely name their company or report, so without it "Valmora's EBITDA" matches another company's
+    table as well as Valmora's (docs/DESIGN.md §3.2). Chunks indexed before it existed have none."""
 
     chunk_id: str
     project_id: str
@@ -157,19 +161,52 @@ class Chunk(_Model):
     overlap_text: str = ""  # tail of the previous chunk of the same section (context for embedding)
     table_index: int | None = None
     token_count: int
+    document_label: str = ""
 
     @property
     def embed_text(self) -> str:
-        return compose_embed_text(self.heading_path, self.overlap_text, self.text)
+        return compose_embed_text(self.heading_path, self.overlap_text, self.text, self.document_label)
 
     @property
     def point_id(self) -> str:
         return point_id(self.chunk_id)
 
 
-def compose_embed_text(heading_path: Sequence[str], overlap_text: str, text: str) -> str:
-    """Headings, overlap and text joined like Docling's ``contextualize`` (newline-delimited)."""
-    return "\n".join([*heading_path, *([overlap_text] if overlap_text else []), text])
+def compose_embed_text(heading_path: Sequence[str], overlap_text: str, text: str, document_label: str = "") -> str:
+    """Document label, headings, overlap and text joined like Docling's ``contextualize`` (newline-delimited)."""
+    head = [document_label] if document_label else []
+    return "\n".join([*head, *heading_path, *([overlap_text] if overlap_text else []), text])
+
+
+_NAME_SEPARATORS = re.compile(r"[\s_\-.]+")
+TITLE_MAX_CHARS = 120
+
+
+def document_title(document: ParsedDocument) -> str | None:
+    """The document's own title: its first title item, else the first heading on its first page (a deck's first
+    slide, a report's cover). None when there is none, or it is implausibly long."""
+    first_page = min((it.page for it in document.items if it.page is not None), default=None)
+    candidates = [it for it in document.items if it.label == "title"] or [
+        it for it in document.items if it.level is not None and it.page == first_page
+    ]
+    for it in candidates:
+        title = " ".join(it.text.split())
+        if title:
+            return title if len(title) <= TITLE_MAX_CHARS else None
+    return None
+
+
+def document_label(source_name: str, title: str | None) -> str:
+    """What a chunk's document is, for its embedded and reranked text: the file name without extension and
+    separators ("valmora_annual_report_fy24.pdf" → "valmora annual report fy24"), then the title when it adds
+    words the name doesn't have."""
+    name = _NAME_SEPARATORS.sub(" ", Path(source_name).stem).strip()
+    if not title:
+        return name
+    name_words = set(name.casefold().split())
+    if not name or not set(_NAME_SEPARATORS.sub(" ", title).casefold().split()) <= name_words:
+        return f"{name}: {title}" if name else title
+    return name
 
 
 def chunk_id(document_id: str, version: int, index: int) -> str:
@@ -274,6 +311,8 @@ def assemble_chunks(
     chunking: ChunkingSection,
     count_tokens: Callable[[str], int],
     default_language: str | None = None,
+    source_name: str | None = None,
+    title: str | None = None,
 ) -> list[Chunk]:
     """Turn chunker pieces into chunks with provenance.
 
@@ -282,6 +321,8 @@ def assemble_chunks(
     - Consecutive text pieces with the same heading path merge while headings + text fit ``content_budget``.
     - A chunk that continues the section of the previous text chunk starts with that chunk's tail
       (``overlap_tokens``) in ``overlap_text``; tables neither give nor receive overlap.
+    - Every chunk is labelled with its document (``source_name`` and ``title``, see ``document_label``); the title
+      is left out of the label where the chunk's heading path already starts with it.
     """
     by_ref = {t.ref: t for t in tables}
     budget = content_budget(chunking)
@@ -328,6 +369,9 @@ def assemble_chunks(
         )
         cid = chunk_id(document_id, version, i)
         heading_path = list(b.headings)
+        label = ""
+        if source_name or title:
+            label = document_label(source_name or "", None if heading_path[:1] == [title] else title)
         chunks.append(
             Chunk(
                 chunk_id=cid,
@@ -344,7 +388,8 @@ def assemble_chunks(
                 text=text,
                 overlap_text=overlap,
                 table_index=b.table.index if b.table is not None else None,
-                token_count=count_tokens(compose_embed_text(heading_path, overlap, text)),
+                token_count=count_tokens(compose_embed_text(heading_path, overlap, text, label)),
+                document_label=label,
             )
         )
     return chunks
@@ -526,6 +571,8 @@ class DoclingParser(DocumentParser):
             chunking=chunking,
             count_tokens=tok.count_tokens,
             default_language=document.language,
+            source_name=document.source_name,
+            title=document_title(document),
         )
 
     def _chunk_tokenizer(self, max_tokens: int) -> Any:
