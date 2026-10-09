@@ -63,6 +63,47 @@ docker compose -f infra/docker-compose.yml --profile full up -d
 
 Frontend: set one variable, `BACKEND_URL` (e.g. `https://api.gibberlink.example.com`). It is read at runtime, so the same frontend image works for any environment. Everything else the UI needs (languages, voice on/off, auth client id) comes from the backend's `GET /api/config/public`, built from the `client` and `auth` sections.
 
+## Live web search (optional)
+
+Questions that need current data ("how is the stock doing today?") can be answered from the documents plus a web search (docs/DESIGN.md §3.7). It is **off** in every local config: it is the one feature that sends something off the machine, namely the short English search query (never document text or the transcript; see `backend/README.md`, "Live data"). Locally it goes through a self-hosted SearXNG, which forwards the query to public search engines (they see the query and this machine's IP, no cookies or account).
+
+To turn it on:
+
+1. Start SearXNG (Compose profile `websearch`; pinned image, `127.0.0.1:8888` only, 256 MB):
+
+   ```bash
+   export SEARXNG_SECRET=$(openssl rand -hex 24)   # optional: unset, a random secret is generated at each start
+   docker compose -f infra/docker-compose.yml --profile websearch up -d searxng
+   curl -s http://127.0.0.1:8888/healthz          # OK
+   ```
+
+   Its settings are `infra/searxng/settings.yml` (JSON output on, limiter off for this single local client, engines: DuckDuckGo, Bing, Brave, Yahoo, Wikipedia and the news engines). Stop it with `docker compose -f infra/docker-compose.yml --profile websearch rm -sf searxng`. Don't use `--profile websearch down`: `down` acts on the whole project and would also remove the Qdrant container.
+
+2. In the config file (top-level keys are file-only), allow the capability through the offline guard and switch the tool on:
+
+   ```json
+   "strict_offline_exceptions": ["web_search"],
+   "tools": { "web_search": { "enabled": true, … } }
+   ```
+
+   (`TOOLS__WEB_SEARCH__ENABLED=true` works too, but the exception must be in the file: with `strict_offline: true` and no exception, startup fails.) Restart the backend; `/health` reports `web_search` as `ok` (or `degraded` naming configured engines SearXNG doesn't have) and `GET /api/config/public` has `features.web_search: true`. The voice filler ("Let me look that up.") is synthesized at startup.
+
+| `tools.web_search` key | Local value | Meaning |
+|---|---|---|
+| `enabled` | `false` | The tool runs only when true (and allowed by the offline guard). |
+| `provider` | `searxng` | `search_api` is the production placeholder (Brave / Tavily / Exa …), not implemented. |
+| `url` / `api_key` | `http://127.0.0.1:8888` / `null` | SearXNG's address (Docker: `http://searxng:8080`); the key is for a search API. |
+| `max_results` | `5` | Results per search (1–10), across all engines. |
+| `timeout_s` | `5` | The whole search. No results by then: the answer says live data couldn't be fetched and answers from the documents. |
+| `stream_partial_results` | `true` | Start the answer on the first results and continue with later ones; `false` waits for the whole search. |
+| `engines` | `["duckduckgo", "duckduckgo news", "bing", "bing news", "brave", "yahoo", "wikipedia"]` | One SearXNG request per engine, so the fastest engine answers first. Engines SearXNG doesn't have are skipped. `[]`: one request with SearXNG's defaults. |
+| `request_timeout_s` | `3.5` | One engine request. |
+| `partial_wait_ms` | `150` | After the first result, how long to wait for other engines before the answer starts. |
+| `max_continuations` | `1` | Short continuations (one more model call each) for results that arrive after the answer started; `0`: none. |
+| `fetch_pages` | `1` | Top result pages fetched (public addresses only, ≤ 400 KB, text only) for the continuation; `0`: snippets only, nothing fetched besides the search. |
+
+Public engines rate-limit and block automated traffic (CAPTCHAs, "too many requests"), so some engines often return nothing; that is why several are asked in parallel. Fine for a demo, not for production (DESIGN §3.7).
+
 ## Provider status
 
 What the POC builds vs. what stays a placeholder. (No application code exists yet — see `docs/DESIGN.md` §10 for build phases.)
@@ -83,6 +124,6 @@ What the POC builds vs. what stays a placeholder. (No application code exists ye
 | auth | `none` | `oidc` |
 | job_queue / session_store / event_bus | `in_process` / `in_memory` | `redis` |
 | observability | `none` | `prometheus`, `otlp` |
-| tools.web_search | `searxng` (local; off until phase 8) | `search_api` (production) |
+| tools.web_search | `searxng` (local; off by default, see "Live web search") | `search_api` (production) |
 
 So `cloud.config.json` as written would start only once the placeholder providers it names are implemented. The self-hosted pieces (Qdrant, BGE-M3, reranker, faster-whisper, Kokoro, Docling on a CUDA server) already work with config changes alone.

@@ -166,8 +166,13 @@
       "url": "https://api.search-vendor.example.com/v1/search",
       "api_key": "${WEB_SEARCH_API_KEY}",
       "max_results": 5,
-      "timeout_s": 8,
-      "stream_partial_results": true
+      "timeout_s": 5,
+      "stream_partial_results": true,
+      "engines": [],
+      "request_timeout_s": 3.5,
+      "partial_wait_ms": 150,
+      "max_continuations": 1,
+      "fetch_pages": 0
     }
   },
   "strict_offline_exceptions": [],
