@@ -45,7 +45,7 @@ from ..settings import Language, Settings
 from .base import InvalidInput, Service, Unavailable
 from .chat_sources import ChatSources, number_markers, ref_label
 from .chats import ChatService
-from .markdown_text import escape_block_markers
+from .markdown_text import escape_block_markers, escape_inline
 from .messages import MessageService
 from .revisit_prompts import (
     FOLLOW_UP_CHARS,
@@ -229,8 +229,12 @@ def ground(draft: SummaryDraft, allowed: set[int]) -> SummaryDraft:
 
 
 def inline_citation(refs: Sequence[SourceRef], language: Language = "en") -> str:
-    """ "(annual_report.pdf, p. 2; investor_deck.pdf, p. 7)"."""
-    return "(" + "; ".join(ref_label(r, language) for r in refs) + ")"
+    """ "(annual_report.pdf, p. 2; investor_deck.pdf, p. 7)"; a web result's title is text from the web, escaped."""
+    return (
+        "("
+        + "; ".join(escape_inline(ref_label(r, language)) if r.kind == "web" else ref_label(r, language) for r in refs)
+        + ")"
+    )
 
 
 def render_summary_markdown(
@@ -458,7 +462,13 @@ class ChatSummarizer(Service):
 
 
 def _legend(sources: ChatSources, numbers: set[int]) -> list[str]:
-    return [f"[{n}] {ref_label(e.ref())}" for n in sorted(numbers) if (e := sources.get(n)) is not None]
+    """ "[3] annual_report.pdf, p. 2", "[4] web: livemint.com — Infosys share price" (a web title can't plant a
+    "[n]" of its own: brackets become parentheses)."""
+    return [
+        f"[{n}] {ref_label(e.ref()).replace('[', '(').replace(']', ')')}"
+        for n in sorted(numbers)
+        if (e := sources.get(n)) is not None
+    ]
 
 
 def _key_point(point: DraftPoint, sources: ChatSources) -> KeyPoint:

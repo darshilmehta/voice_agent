@@ -24,6 +24,7 @@ from ..settings import Language
 _MARKER = re.compile(r"(\s*)\[\s*([SW]\d+(?:\s*[,;]\s*[SW]\d+)*)\s*\]", re.IGNORECASE)
 _ID = re.compile(r"([SW])(\d+)", re.IGNORECASE)
 EN_DASH = "\u2013"
+EM_DASH = "\u2014"
 _REPEAT = re.compile(r"(\[(\d+)\])(?:\[\2\])+")  # [3][3] → [3]
 
 
@@ -41,13 +42,22 @@ class SourceEntry:
     title: str | None = None  # web results
 
     def ref(self) -> SourceRef:
+        web = {"kind": "web", "url": self.url, "title": self.title} if self.kind == "web" else {}
         return SourceRef(
-            document_id=self.document_id, filename=self.filename, page_start=self.page_start, page_end=self.page_end
+            document_id=self.document_id,
+            filename=self.filename,
+            page_start=self.page_start,
+            page_end=self.page_end,
+            **web,
         )
 
 
-def ref_key(ref: SourceRef) -> tuple[str, str, int | None, int | None]:
-    return ref.document_id, ref.filename, ref.page_start, ref.page_end
+RefKey = tuple[str, str, int | None, int | None, str | None]
+
+
+def ref_key(ref: SourceRef) -> RefKey:
+    """Documents by document and pages, web results by URL (two results from one site are two sources)."""
+    return ref.document_id, ref.filename, ref.page_start, ref.page_end, ref.url if ref.kind == "web" else None
 
 
 class ChatSources:
@@ -55,7 +65,7 @@ class ChatSources:
 
     def __init__(self) -> None:
         self.entries: list[SourceEntry] = []
-        self._by_key: dict[tuple[str, str, int | None, int | None], SourceEntry] = {}
+        self._by_key: dict[RefKey, SourceEntry] = {}
         self._by_url: dict[str, SourceEntry] = {}
 
     def __len__(self) -> int:
@@ -63,12 +73,24 @@ class ChatSources:
 
     def add(self, ref: SourceRef, *, snippet: str = "", cited_by: int | None = None) -> SourceEntry:
         entry = self._by_key.get(ref_key(ref))
+        if entry is None and ref.kind == "web" and ref.url:
+            entry = self._by_url.get(ref.url)
         if entry is None:
             entry = SourceEntry(
-                len(self.entries) + 1, ref.document_id, ref.filename, ref.page_start, ref.page_end, snippet
+                len(self.entries) + 1,
+                ref.document_id,
+                ref.filename,
+                ref.page_start,
+                ref.page_end,
+                snippet,
+                kind=ref.kind,
+                url=ref.url,
+                title=ref.title,
             )
             self.entries.append(entry)
             self._by_key[ref_key(ref)] = entry
+            if ref.kind == "web" and ref.url:
+                self._by_url[ref.url] = entry
         if cited_by is not None and cited_by not in entry.cited_by:
             entry.cited_by.append(cited_by)
         return entry
@@ -97,7 +119,7 @@ class ChatSources:
             )
             self.entries.append(entry)
             self._by_url[key] = entry
-            self._by_key.setdefault(ref_key(entry.ref()), entry)  # a summary names it by its site
+            self._by_key[ref_key(entry.ref())] = entry  # a summary names it by its URL
         if cited_by is not None and cited_by not in entry.cited_by:
             entry.cited_by.append(cited_by)
         return entry
@@ -135,7 +157,10 @@ def pages_label(start: int | None, end: int | None, language: Language = "en", *
 
 
 def ref_label(ref: SourceRef, language: Language = "en", *, short: bool = True) -> str:
-    """ "annual_report.pdf, p. 2"."""
+    """ "annual_report.pdf, p. 2"; a web result "web: livemint.com — Infosys share price"."""
+    if ref.kind == "web":
+        title = " ".join((ref.title or "").split())
+        return f"web: {ref.filename}" + (f" {EM_DASH} {title}" if title else "")
     pages = pages_label(ref.page_start, ref.page_end, language, short=short)
     name = ref.filename or "(unknown document)"
     return f"{name}, {pages}" if pages else name

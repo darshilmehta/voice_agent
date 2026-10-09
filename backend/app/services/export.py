@@ -33,7 +33,7 @@ from .base import Service
 from .chat_sources import EN_DASH, ChatSources, number_markers, pages_label
 from .chat_summary import render_summary_markdown, summary_view
 from .chats import ChatService
-from .markdown_text import escape_block_markers
+from .markdown_text import escape_block_markers, escape_inline, safe_link
 from .messages import MessageService
 from .projects import ProjectService
 from .summaries import SummaryService
@@ -399,10 +399,13 @@ def _render_message(m: ExportMessage) -> list[str]:
 def _render_source(s: ExportSource) -> str:
     pages = pages_label(s.page_start, s.page_end)
     where = f"**{s.filename or '(unknown document)'}**" + (f", {pages}" if pages else "")
-    if s.kind == "web":  # a live web result: its title, the site and the link
-        title = _SPACE.sub(" ", s.title or s.filename or s.url or "web result").strip()
-        where = f"**{title}** (web: {s.filename})" + (f" <{s.url}>" if s.url else "")
-    snippet = f" — “{_SPACE.sub(' ', s.snippet).strip()}”" if s.snippet.strip() else ""
+    snippet_text = _SPACE.sub(" ", s.snippet).strip()
+    if s.kind == "web":  # a live web result: its title, the site and the link, all text from the web: escaped
+        title = escape_inline(s.title or s.filename or "web result")
+        link = safe_link(s.url)
+        where = f"**{title}** (web: {escape_inline(s.filename)})" + (f" <{link}>" if link else "")
+        snippet_text = escape_inline(snippet_text)
+    snippet = f" — “{snippet_text}”" if snippet_text else ""
     cited = ""
     if s.cited_by:
         cited = f" _(cited in message{'s' if len(s.cited_by) > 1 else ''} {', '.join(f'#{n}' for n in s.cited_by)})_"

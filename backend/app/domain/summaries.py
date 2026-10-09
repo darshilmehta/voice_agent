@@ -8,18 +8,30 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Literal, NotRequired, TypedDict
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, SerializerFunctionWrapHandler, model_serializer
 
 from ..settings import Language
 
 SUMMARY_SCHEMA_VERSION = 1
 
 
+class SourceRefJSON(TypedDict):
+    document_id: str
+    filename: str
+    page_start: int | None
+    page_end: int | None
+    kind: NotRequired[Literal["document", "web"]]
+    url: NotRequired[str | None]
+    title: NotRequired[str | None]
+
+
 class SourceRef(BaseModel):
     """A document and page range cited somewhere in a chat. ``page_start``/``page_end`` are None when the source has
-    no page (plain text)."""
+    no page (plain text). A live web result an answer cited (docs/DESIGN.md §3.7) is ``kind: "web"`` with its
+    ``url`` and ``title`` (``filename`` is its site, no pages); two results from one site stay two sources. Document
+    references serialize as before (no ``kind``)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -27,6 +39,17 @@ class SourceRef(BaseModel):
     filename: str
     page_start: int | None
     page_end: int | None
+    kind: Literal["document", "web"] = "document"
+    url: str | None = None
+    title: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _without_web_fields(self, handler: SerializerFunctionWrapHandler) -> SourceRefJSON:
+        data = handler(self)
+        if self.kind == "document":
+            for name in ("kind", "url", "title"):
+                data.pop(name, None)
+        return data
 
 
 class KeyPoint(BaseModel):
