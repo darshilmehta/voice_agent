@@ -11,10 +11,11 @@ and which one.
              → for a "requested" visual the model can't place (timeout, invalid): a default chart of the best
                candidate (``source: "heuristic"``)
 
-A turn calls ``VisualPlanner.plan`` once its answer's text is complete (``CanvasService.prepare_visual`` through
-``conversation.TurnVisual``), and a spoken edit the rules can't read asks it again with the visual as context.
-Candidates are company-aware (``rank_candidates``): a question that names one company's documents is offered only
-their tables.
+A turn draws a draft first (``draft.py``: code, the same candidates) and calls ``VisualPlanner.plan_detailed`` only when
+the draft isn't confident, once its answer's text is complete (``CanvasService.prepare_visual`` through
+``conversation.TurnVisual``), with the draft's candidates; a spoken edit the rules can't read asks it again with the
+visual as context. Candidates are company-aware (``rank_candidates``): a question that names one company's documents
+is offered only their tables.
 """
 
 from __future__ import annotations

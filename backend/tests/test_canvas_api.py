@@ -350,7 +350,9 @@ def test_prepare_visual_yields_contract_events(app, fakes):
     def route(messages):
         user = messages[-1].content
         labels["prompt"] = user
-        return {"kind": "line", "datasets": ["D1"], "series": ["D1 · Revenue"], "title": "Quarterly revenue"}
+        # the quarterly table, wherever it is among the candidates
+        alias = next(line.split(" ", 1)[0] for line in user.splitlines() if "periods in rows" in line)
+        return {"kind": "line", "datasets": [alias], "series": [f"{alias} · Revenue"], "title": "Quarterly revenue"}
 
     fakes.llm.route = route
 
@@ -366,7 +368,27 @@ def test_prepare_visual_yields_contract_events(app, fakes):
     assert isinstance(board, CanvasEvent) and [v.id for v in board.panels] == [ready.visual.id]
     assert ready.ws_message()["type"] == "visual" and ready.payload()["phase"] == "ready"
     assert set(board.ws_message()) == {"type", "panels"}
-    assert '"Quarterly performance' in labels["prompt"] or "D1" in labels["prompt"]
+    assert fakes.llm.json_calls == []  # a confident draft: drawn by code, no model call
+
+    async def unsure():  # which table? the draft (a guess), then the planner's chart in its place
+        return [
+            e async for e in canvas(app).prepare_visual(c, "Show me revenue", language="en", answer="Revenue rose.")
+        ]
+
+    events = run(app, unsure)
+    assert [(type(e).__name__, getattr(e, "phase", None)) for e in events] == [
+        ("VisualEvent", "preparing"),
+        ("VisualEvent", "ready"),  # the draft
+        ("CanvasEvent", None),
+        ("VisualEvent", "ready"),  # the planner's, in place
+        ("CanvasEvent", None),
+    ]
+    draft, refined = events[1], events[3]
+    assert isinstance(draft, VisualEvent) and isinstance(refined, VisualEvent) and refined.visual is not None
+    assert refined.visual_id == draft.visual_id and refined.visual.kind == "line"
+    assert "D1" in labels["prompt"] and "Spoken answer: Revenue rose." in labels["prompt"]
+    panels = app.get(f"/api/chats/{c}/canvas").json()["panels"]
+    assert [v["kind"] for v in panels] == ["line", "line"]  # the first question's and this one: one panel each
 
 
 def test_prepare_visual_stays_quiet_for_plain_questions(app, fakes):
@@ -379,8 +401,15 @@ def test_prepare_visual_stays_quiet_for_plain_questions(app, fakes):
     assert run(app, collect, "Who is the company secretary?") == []
     assert fakes.llm.json_calls == []
     fakes.llm.route = {"kind": "none", "datasets": ["D1"], "series": []}
-    events = run(app, collect, "Compare EBITDA across segments")
-    assert [(e.phase, e.detail) for e in events] == [("preparing", None), ("failed", "no table fits this question")]  # type: ignore[union-attr]
+    events = run(app, collect, "Show me the figures")  # a guess of a draft; the planner finds no table fits
+    assert [(e.name, getattr(e, "phase", None), getattr(e, "detail", None)) for e in events] == [
+        ("visual", "preparing", None),
+        ("visual", "ready", None),
+        ("canvas", None, None),
+        ("visual", "failed", "no table fits this question"),  # the draft is withdrawn
+        ("canvas", None, None),
+    ]
+    assert events[-1].panels == []  # type: ignore[union-attr]
 
 
 # ------------------------------------------------------------------ "add": an existing visual onto a chat

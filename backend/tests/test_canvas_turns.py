@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from app.domain.canvas import CanvasEvent, VisualEvent
 from app.providers.llm import LLMError
 from app.services.canvas.conversation import settled_callbacks
+from app.services.canvas.draft import Draft
 from app.services.chat_turns import AgentMessageEvent, ChatTurnService, DeltaEvent, wait_for_background
 from app.services.prompts import VISUAL_NOTE
 
@@ -23,6 +24,7 @@ from .canvas_turn_helpers import (
     Script,
     add_visual,
     choose,
+    choose_table,
     donut_of_segments,
     line_of_revenue,
     planner_calls,
@@ -30,7 +32,8 @@ from .canvas_turn_helpers import (
 )
 from .test_chat_api import names, parse_sse, payload
 
-SHOW = "Show me revenue by quarter"
+SHOW = "Show me revenue by quarter"  # a confident draft: the line of quarterly revenue
+UNSURE = "Show me revenue"  # which table? a draft (segment revenue), for the planner to check
 
 
 def run(api: TestClient, fn, *args, **kwargs):
@@ -67,14 +70,15 @@ def app_with_report(make_app, fakes):
 # ------------------------------------------------------------------ the answer's visual on the SSE stream
 
 
-def test_a_requested_visual_follows_the_answer_on_the_stream(app_with_report):
+def test_a_requested_visuals_draft_arrives_with_the_answers_first_delta(app_with_report):
     api, chat_id, _, fakes = app_with_report
     Script(planner=choose("line", "Revenue")).install(fakes.llm)
+    fakes.llm.delay = 0.05  # the answer's first words take a moment (0.8 s on the real model): the draft is ready
     events = ask(api, chat_id, SHOW)
     order = names(events)
-    # the answer first, all of it; the skeleton once its text is complete; the visual after the answer is saved
-    assert order[:2] == ["user_message", "sources"] and order[-4:] == ["visual", "agent_message", "visual", "canvas"]
-    assert set(order[2:-4]) == {"delta"}
+    # the draft (code, built when the retrieval returned) comes with the answer's first words, never before them
+    assert order[:6] == ["user_message", "sources", "delta", "visual", "visual", "canvas"]
+    assert order[-1] == "agent_message" and set(order[6:-1]) == {"delta"}
     assert visuals(events) == [("preparing", None), ("ready", None)]
     preparing, ready = (d for e, d in events if e == "visual")
     assert preparing["visual_id"] == ready["visual_id"] == ready["visual"]["id"]
@@ -87,64 +91,120 @@ def test_a_requested_visual_follows_the_answer_on_the_stream(app_with_report):
         if source["chunk_id"] in turn_sources:
             assert source["source_id"] == turn_sources[source["chunk_id"]]
     assert payload(events, "canvas")["panels"][0]["id"] == visual["id"]
-    # persisted: what was asked for and the visual it got (the transcript's "chart added")
+    # a confident draft is the visual: no model call for it at all
+    assert planner_calls(fakes.llm) == []
+    # persisted: what was asked for, the visual it got, and how it was made
     agent = messages(api, chat_id)[-1]
     assert agent["route"]["visual"] == "requested"
     assert agent["route"]["visual_status"] == "ready" and agent["route"]["visual_id"] == visual["id"]
+    plan = agent["route"]["visual_plan"]
+    assert plan["draft"] == "confident" and plan["planner"] == "skipped"
     assert [v["id"] for v in canvas(api, chat_id)] == [visual["id"]]
     # the answer prompt knew a chart was asked for: no "I can't show charts", no promise
     assert VISUAL_NOTE in fakes.llm.calls[-1]["messages"][-1].content
 
 
-def test_the_planner_runs_only_after_the_answers_text_is_complete(app_with_report):
+async def timed_turn(api, text: str, chat_id: str) -> tuple[list[tuple[float, Any]], float]:
+    """A turn's events with when each came (s from the start), and when the planner was called."""
+    service = ChatTurnService.from_container(api.app.state.container, canvas=api.app.state.canvas)
+    t = await service.begin(chat_id, text)
+    t0 = time.perf_counter()
+    got = [(time.perf_counter() - t0, event) async for event in service.run(t)]
+    await wait_for_background()
+    return got, t0
+
+
+def test_an_unsure_draft_is_refined_after_the_answer_and_replaced_in_place(app_with_report):
     api, chat_id, _, fakes = app_with_report
-    script = Script(planner=choose("line", "Revenue")).install(fakes.llm)
-    script.planner_delay = 0.4
+    script = Script(planner=choose_table("line", "Q1 FY24", "Revenue")).install(fakes.llm)
+    script.planner_delay = 0.3
     fakes.llm.delay = 0.02  # every piece of the answer takes a moment
-
-    async def turn() -> dict[str, float]:
-        service = ChatTurnService.from_container(api.app.state.container, canvas=api.app.state.canvas)
-        t = await service.begin(chat_id, SHOW)
-        t0 = time.perf_counter()
-        marks: dict[str, float] = {}
-        async for event in service.run(t):
-            now = time.perf_counter() - t0
-            if isinstance(event, DeltaEvent):
-                marks.setdefault("first_delta", now)
-                marks["last_delta"] = now
-            elif isinstance(event, AgentMessageEvent):
-                marks["agent_message"] = now
-            elif isinstance(event, VisualEvent):
-                marks[event.phase] = now
-        marks["planner"] = script.planner_at[0] - t0
-        await wait_for_background()
-        return marks
-
-    m = run(api, turn)
-    assert m["first_delta"] < 0.2  # the planner's 0.4 s are nowhere before the answer
-    assert m["planner"] >= m["last_delta"]  # Ollama is serial: never ahead of the answer's own request
-    assert m["agent_message"] < m["planner"] + 0.2  # the answer is saved and sent without waiting for the visual
-    assert m["ready"] >= m["planner"] + 0.4  # the visual lands after the planner, on the same stream
+    got, t0 = run(api, timed_turn, api, UNSURE, chat_id)
+    deltas = [t for t, e in got if isinstance(e, DeltaEvent)]
+    readies = [(t, e) for t, e in got if isinstance(e, VisualEvent) and e.phase == "ready"]
+    (agent_at,) = [t for t, e in got if isinstance(e, AgentMessageEvent)]
+    planner_at = script.planner_at[0] - t0
+    (draft_at, draft), (refined_at, refined) = readies
+    assert deltas[0] <= draft_at < deltas[1]  # the draft with the first delta, not after the answer
+    assert draft.visual is not None and draft.visual.kind == "donut"  # (the words don't tell: segments, a guess)
+    assert planner_at >= deltas[-1]  # Ollama is serial: the planner never goes ahead of the answer's request
+    assert agent_at < planner_at + 0.2  # the answer is saved and sent without waiting for the planner
+    assert refined_at >= planner_at + 0.3
+    # replaced in place: the same visual, now the planner's chart; one panel for the turn, never two
+    assert refined.visual_id == draft.visual_id and refined.visual is not None and refined.visual.kind == "line"
+    panels = canvas(api, chat_id)
+    assert [(p["id"], p["kind"]) for p in panels] == [(draft.visual_id, "line")]
+    run(api, settled_callbacks)
+    route = messages(api, chat_id)[-1]["route"]
+    assert route["visual_id"] == draft.visual_id
+    assert route["visual_plan"]["draft"] == "refine" and route["visual_plan"]["planner"] == "changed"
 
 
-def test_planner_failure_is_a_failed_event_and_the_answer_stands(app_with_report):
+def test_a_planner_that_agrees_with_the_draft_changes_nothing(app_with_report):
+    api, chat_id, _, fakes = app_with_report
+    Script(planner=choose_table("donut", "Specialty Chemicals", "Revenue FY24")).install(fakes.llm)
+    events = ask(api, chat_id, UNSURE)
+    assert len(planner_calls(fakes.llm)) == 1
+    assert visuals(events) == [("preparing", None), ("ready", None)]  # nothing to replace
+    assert messages(api, chat_id)[-1]["route"]["visual_plan"]["planner"] == "same"
+
+
+def test_a_planner_finding_no_table_withdraws_an_unsure_draft(app_with_report):
     api, chat_id, _, fakes = app_with_report
     Script(planner={"kind": "none", "datasets": ["D1"], "series": []}).install(fakes.llm)
-    events = ask(api, chat_id, SHOW)
-    assert visuals(events) == [("preparing", None), ("failed", "no table fits this question")]
-    assert "canvas" not in names(events)
+    events = ask(api, chat_id, UNSURE)
+    assert visuals(events) == [("preparing", None), ("ready", None), ("failed", "no table fits this question")]
+    snapshots = [d["panels"] for e, d in events if e == "canvas"]
+    assert len(snapshots[0]) == 1 and snapshots[-1] == []  # the draft, then the canvas without it
     assert payload(events, "agent_message")["text"] == "The answer [S1]."
     route = messages(api, chat_id)[-1]["route"]
-    assert route["visual"] == "requested" and route["visual_status"] == "failed" and "visual_id" not in route
+    assert route["visual"] == "requested" and route["visual_status"] == "failed" and not route.get("visual_id")
     assert canvas(api, chat_id) == []
 
 
-def test_a_planner_that_is_down_still_draws_a_requested_chart_from_the_best_table(app_with_report):
+def test_a_planner_that_is_down_leaves_the_draft(app_with_report):
+    api, chat_id, _, fakes = app_with_report
+    Script(planner=LLMError("model unavailable")).install(fakes.llm)
+    events = ask(api, chat_id, UNSURE)
+    assert visuals(events) == [("preparing", None), ("ready", None)]
+    assert messages(api, chat_id)[-1]["route"]["visual_plan"]["planner"] == "failed"
+    assert len(canvas(api, chat_id)) == 1
+
+
+@pytest.fixture
+def no_draft(monkeypatch):
+    """Drafts that can't be built: the planner alone, as before the draft existed."""
+    import app.services.canvas.service as service
+
+    monkeypatch.setattr(service, "draft_visual", lambda *a, **kw: Draft(None, False, ["nothing builds"]))
+
+
+def test_without_a_draft_the_planner_draws_it_after_the_answer(app_with_report, no_draft):
+    api, chat_id, _, fakes = app_with_report
+    Script(planner=choose_table("line", "Q1 FY24", "Revenue")).install(fakes.llm)
+    events = ask(api, chat_id, SHOW)
+    order = names(events)
+    assert order[:4] == ["user_message", "sources", "delta", "visual"]  # the skeleton with the first delta
+    assert order[-3:] == ["agent_message", "visual", "canvas"]  # the planner's visual after the answer
+    assert visuals(events) == [("preparing", None), ("ready", None)]
+    plan = messages(api, chat_id)[-1]["route"]["visual_plan"]
+    assert plan["draft"] == "none" and plan["planner"] == "planned"
+
+
+def test_without_a_draft_a_planner_that_is_down_still_draws_a_requested_chart(app_with_report, no_draft):
     api, chat_id, _, fakes = app_with_report
     Script(planner=LLMError("model unavailable")).install(fakes.llm)
     events = ask(api, chat_id, SHOW)
     assert visuals(events) == [("preparing", None), ("ready", None)]  # the planner's heuristic fallback
     assert names(events)[-3:] == ["agent_message", "visual", "canvas"]
+
+
+def test_without_a_draft_a_planner_finding_nothing_is_a_failed_event(app_with_report, no_draft):
+    api, chat_id, _, fakes = app_with_report
+    Script(planner={"kind": "none", "datasets": ["D1"], "series": []}).install(fakes.llm)
+    events = ask(api, chat_id, SHOW)
+    assert visuals(events) == [("preparing", None), ("failed", "no table fits this question")]
+    assert "canvas" not in names(events) and canvas(api, chat_id) == []
 
 
 @pytest.mark.parametrize(
@@ -164,6 +224,29 @@ def test_no_visual_for_general_ack_stop_or_abstained_turns(app_with_report, utte
     assert planner_calls(fakes.llm) == []
     agent = messages(api, chat_id)[-1]
     assert "visual_id" not in (agent["route"] or {}) and "visual_status" not in (agent["route"] or {})
+    assert canvas(api, chat_id) == []
+
+
+def test_an_answer_that_says_the_documents_dont_cover_it_withdraws_its_draft(app_with_report):
+    api, chat_id, _, fakes = app_with_report
+    Script(planner=choose("line", "Revenue")).install(fakes.llm)
+    fakes.llm.reply = "The documents don't cover quarterly revenue."  # the gate let it through; the answer abstains
+    events = ask(api, chat_id, UNSURE)
+    assert visuals(events) == [("preparing", None), ("ready", None), ("failed", "cancelled")]  # no note: just gone
+    assert [d["panels"] for e, d in events if e == "canvas"][-1] == []
+    assert planner_calls(fakes.llm) == []
+    route = messages(api, chat_id)[-1]["route"]
+    assert route["abstained"] is True and not route.get("visual_id") and route["visual_status"] == "cancelled"
+    assert canvas(api, chat_id) == []
+
+
+def test_an_answer_that_fails_takes_its_unseen_draft_with_it(app_with_report):
+    api, chat_id, _, fakes = app_with_report
+    Script(planner=choose("line", "Revenue")).install(fakes.llm)
+    fakes.llm.fail_with = LLMError("model crashed")  # before any of the answer's words
+    events = ask(api, chat_id, SHOW)
+    assert "error" in names(events) and "visual" not in names(events)
+    assert planner_calls(fakes.llm) == [] and canvas(api, chat_id) == []
 
 
 def test_an_answers_own_figures_suggest_a_visual_that_appears_quietly(app_with_report):
@@ -295,7 +378,7 @@ def test_chats_without_a_canvas_keep_the_routers_prompt(app_with_report):
     assert "On screen" not in fakes.llm.json_calls[0]["messages"][-1].content
 
 
-# ------------------------------------------------------------------ the next turn and a visual still being planned
+# ------------------------------------------------------------------ the next turn and a visual still being refined
 
 
 async def turn_with_sink(api, chat_id: str, text: str) -> tuple[ChatTurnService, list[Any], list[Any]]:
@@ -310,73 +393,99 @@ async def turn_with_sink(api, chat_id: str, text: str) -> tuple[ChatTurnService,
     return service, events, sink
 
 
-def test_a_new_question_cancels_a_visual_still_being_planned(app_with_report):
+def phases(sink: list[Any]) -> list[tuple[str, str | None]]:
+    return [(e.phase, e.detail) for e in sink if isinstance(e, VisualEvent)]
+
+
+def test_a_new_question_cancels_the_refinement_and_the_draft_stays(app_with_report):
     api, chat_id, _, fakes = app_with_report
-    script = Script(planner=choose("line", "Revenue")).install(fakes.llm)
+    script = Script(planner=choose_table("line", "Q1 FY24", "Revenue")).install(fakes.llm)
     script.planner_delay = 5.0
 
     async def scenario() -> tuple[list[Any], list[Any]]:
-        _, first, sink = await turn_with_sink(api, chat_id, SHOW)
-        assert isinstance(first[-1], AgentMessageEvent)  # the answer is done, the visual isn't
+        _, first, sink = await turn_with_sink(api, chat_id, UNSURE)
+        assert isinstance(first[-1], AgentMessageEvent)  # the answer is done, the refinement isn't
         await asyncio.sleep(0.05)
         _, second, _ = await turn_with_sink(api, chat_id, "Who is the chairperson of the board?")
         await wait_for_background()
         return sink, second
 
     sink, second = run(api, scenario)
-    assert [(e.phase, e.detail) for e in sink] == [("preparing", None), ("failed", "cancelled")]
+    assert phases(sink) == [("preparing", None), ("ready", None)]  # no "failed": the draft is the turn's visual
     assert isinstance(second[-1], AgentMessageEvent)
     assert fakes.llm.json_cancelled >= 1  # the planner's request was closed: the model is free for the question
+    assert [p["kind"] for p in canvas(api, chat_id)] == ["donut"]
+    run(api, settled_callbacks)
+    route = messages(api, chat_id)[1]["route"]
+    assert route["visual_status"] == "ready" and route["visual_plan"]["planner"] == "cancelled"
+
+
+def test_without_a_draft_a_new_question_cancels_the_visual(app_with_report, no_draft):
+    api, chat_id, _, fakes = app_with_report
+    script = Script(planner=choose("line", "Revenue")).install(fakes.llm)
+    script.planner_delay = 5.0
+
+    async def scenario() -> list[Any]:
+        _, _, sink = await turn_with_sink(api, chat_id, SHOW)
+        await asyncio.sleep(0.05)
+        await turn_with_sink(api, chat_id, "Who is the chairperson of the board?")
+        await wait_for_background()
+        return sink
+
+    sink = run(api, scenario)
+    assert phases(sink) == [("preparing", None), ("failed", "cancelled")]
     assert canvas(api, chat_id) == []
     run(api, settled_callbacks)
     assert messages(api, chat_id)[1]["route"]["visual_status"] == "cancelled"
 
 
-def test_an_acknowledgement_leaves_the_visual_alone(app_with_report):
+def test_an_acknowledgement_leaves_the_refinement_alone(app_with_report):
     api, chat_id, _, fakes = app_with_report
-    script = Script(planner=choose("line", "Revenue")).install(fakes.llm)
+    script = Script(planner=choose_table("line", "Q1 FY24", "Revenue")).install(fakes.llm)
     script.planner_delay = 0.3
 
     async def scenario() -> list[Any]:
-        _, _, sink = await turn_with_sink(api, chat_id, SHOW)
+        _, _, sink = await turn_with_sink(api, chat_id, UNSURE)
         _, ack, _ = await turn_with_sink(api, chat_id, "okay")
         assert ack[-2].text == "Anything else?"  # type: ignore[attr-defined]
         await wait_for_background()
         return sink
 
     sink = run(api, scenario)
-    assert [e.phase for e in sink if isinstance(e, VisualEvent)] == ["preparing", "ready"]
-    assert len(canvas(api, chat_id)) == 1
+    assert [e.phase for e in sink if isinstance(e, VisualEvent)] == ["preparing", "ready", "ready"]
+    assert [p["kind"] for p in canvas(api, chat_id)] == ["line"]
 
 
-def test_an_edit_waits_for_the_visual_being_planned(app_with_report):
+def test_an_edit_waits_for_the_refinement(app_with_report):
     api, chat_id, _, fakes = app_with_report
-    script = Script(planner=choose("line", "Revenue")).install(fakes.llm)
+    script = Script(planner=choose_table("line", "Q1 FY24", "Revenue")).install(fakes.llm)
     script.planner_delay = 0.3
 
     async def scenario() -> tuple[list[Any], list[Any]]:
-        _, _, sink = await turn_with_sink(api, chat_id, SHOW)
-        _, edit_events, _ = await turn_with_sink(api, chat_id, "make it a bar chart")  # said while it is drawn
+        _, _, sink = await turn_with_sink(api, chat_id, UNSURE)
+        _, edit_events, _ = await turn_with_sink(api, chat_id, "make it a bar chart")  # said while it is refined
         await wait_for_background()
         return sink, edit_events
 
     sink, edit_events = run(api, scenario)
-    ready = next(e for e in sink if isinstance(e, VisualEvent) and e.phase == "ready")
+    refined = [e for e in sink if isinstance(e, VisualEvent) and e.phase == "ready"][-1]
+    assert refined.visual is not None and refined.visual.kind == "line"
     edited = next(e for e in edit_events if isinstance(e, VisualEvent))
-    assert edited.visual_id == ready.visual_id and edited.visual is not None and edited.visual.kind == "bar"
+    assert edited.visual_id == refined.visual_id and edited.visual is not None and edited.visual.kind == "bar"
+    assert [r.x for r in edited.visual.rows] == ["Q1 FY24", "Q2 FY24", "Q3 FY24", "Q4 FY24"]  # the refined one, edited
     assert edit_events[-1].message.text == "Done."  # type: ignore[union-attr]
 
 
-def test_the_next_prompts_warm_up_waits_for_the_visual(app_with_report):
+def test_the_next_prompts_warm_up_waits_for_the_refinement(app_with_report):
     api, chat_id, _, fakes = app_with_report
-    script = Script(planner=choose("line", "Revenue")).install(fakes.llm)
+    script = Script(planner=choose_table("line", "Q1 FY24", "Revenue")).install(fakes.llm)
     script.planner_delay = 0.3
 
     async def scenario() -> tuple[int, int]:
         warmed_at_start = len(fakes.llm.warmed)
-        await turn_with_sink(api, chat_id, SHOW)
+        await turn_with_sink(api, chat_id, UNSURE)
         await asyncio.sleep(0.1)
-        during = len(fakes.llm.warmed) - warmed_at_start  # the visual is still being planned
+        during = len(fakes.llm.warmed) - warmed_at_start  # the draft is shown, the planner still refining it
         await wait_for_background()
         await asyncio.sleep(0.05)
         await wait_for_background()
@@ -384,3 +493,19 @@ def test_the_next_prompts_warm_up_waits_for_the_visual(app_with_report):
 
     during, after = run(api, scenario)
     assert during == 0 and after == 1  # it would queue behind the planner on the one model
+
+
+def test_a_confident_draft_lets_the_warm_up_go_at_once(app_with_report):
+    api, chat_id, _, fakes = app_with_report
+    Script(planner=choose("line", "Revenue")).install(fakes.llm)
+
+    async def scenario() -> int:
+        warmed_at_start = len(fakes.llm.warmed)
+        await turn_with_sink(api, chat_id, SHOW)
+        await wait_for_background()
+        await asyncio.sleep(0.05)
+        await wait_for_background()
+        return len(fakes.llm.warmed) - warmed_at_start
+
+    assert run(api, scenario) == 1
+    assert planner_calls(fakes.llm) == []

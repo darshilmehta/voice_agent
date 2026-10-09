@@ -38,9 +38,12 @@
   continuation; speech after the complete answer has been played, while only a continuation was still to come,
   isn't a barge-in: the turn just ends (the answer saved complete) and the speech is the next turn.
 - The canvas (§12.1): the answer's visual comes from the turn (``run(on_visual=…)``) as ``visual`` / ``canvas`` with
-  the turn's id, before or after its ``agent_message``; ready while the answer is still being heard, it is followed
-  by the tail ("It's on screen now.", ``audio_chunk {tail: true}``, not part of the answer). ``stop`` and the session
-  ending cancel a visual still being planned; the next question cancels it in the turn service.
+  the turn's id. Its draft is ready while the answer is still being written: it is held until the answer's first
+  audio and sent right after it (never before); a planner's refinement replaces it in place, before or after
+  ``agent_message``. Ready while the answer is still being heard (and, for a draft the planner is checking, kept by
+  it), it is followed by the tail ("It's on screen now.", ``audio_chunk {tail: true}``, not part of the answer). A turn
+  cut before its first audio withdraws its draft; ``stop`` and the session ending cancel a refinement (the draft
+  stays); the next question cancels it in the turn service.
 """
 
 from __future__ import annotations
@@ -63,7 +66,7 @@ from ...providers.speech import SpeechRecognizer, SpeechSynthesizer, Transcript,
 from ...providers.storage import MetadataDB
 from ...settings import Language, Settings
 from ..base import InvalidInput, NotFound
-from ..canvas.conversation import visual_in_progress
+from ..canvas.conversation import TurnVisual, visual_in_progress
 from ..chat_turns import (
     AgentMessageEvent,
     AnswerStop,
@@ -209,6 +212,8 @@ class AgentTurn:
     answer_ms: float | None = None  # the answer's audio, once all of it is sent (the visual's tail comes after)
     tail_wanted: bool = False  # the visual is ready while the answer is still being spoken: say so after it
     tail_sent: bool = False
+    held_visual: list[VisualEvent | CanvasEvent] = field(default_factory=list)  # ready before the first audio
+    visual_released: bool = False  # the answer's first audio is out: its visual's events go out as they come
 
 
 @dataclass(eq=False)
@@ -784,6 +789,11 @@ class VoiceSession:
         # Every chunk and its frames are out: agent_message closes the turn (the client sends playback_done after it).
         agent.answer_ms = agent.sent_ms
         agent.audio_done = True
+        if not agent.visual_released:  # no audio at all (speech failed, or the answer did)
+            if agent.errored or agent.cut or agent.message is None:
+                self._withdraw_visual(agent)
+            else:
+                await self._release_visual(agent)
         if agent.tail_wanted and not agent.cut and agent.first_audio_at is not None and not agent.errored:
             await self._send_tail(agent)  # the visual became ready while the answer was spoken (§12.1)
         if agent.message is not None:
@@ -840,13 +850,57 @@ class VoiceSession:
     async def _on_visual(self, agent: AgentTurn, event: VisualEvent | CanvasEvent) -> None:
         """The answer's visual, as it comes (``visual`` / ``canvas`` with the turn's id; possibly after its
         agent_message, and even after the turn was cut: a visual being planned is cancelled by the next turn that
-        needs the model, not by the cut). When it is ready while the answer is still being heard, say so."""
+        needs the model, not by the cut). Its draft is ready while the answer is still being written (§12.1): it is
+        held until the answer's first audio, then sent at once (``_release_visual``; §3.10: never before the first
+        audio). When it is ready while the answer is still being heard, say so."""
+        if not agent.visual_released:
+            if not agent.cut:
+                agent.held_visual.append(event)
+            return
+        await self._send_visual(agent, event)
+
+    async def _release_visual(self, agent: AgentTurn) -> None:
+        """The answer's first audio is out (or its audio is done without any): its visual's held events now, in order,
+        then the rest as they come. A draft already withdrawn by then (the answer turned out to abstain before its
+        first audio) is never shown: only a requested one's failure note is left to send."""
+        visual = agent.stop.visual
+        if visual is not None and visual.status != "ready" and agent.held_visual:
+            agent.held_visual = [
+                e
+                for e in agent.held_visual
+                if isinstance(e, VisualEvent) and e.phase != "ready" and visual.status != "cancelled"
+            ]
+        while agent.held_visual and not agent.cut:
+            await self._send_visual(agent, agent.held_visual.pop(0))
+        agent.visual_released = not agent.cut
+
+    def _withdraw_visual(self, agent: AgentTurn) -> None:
+        """A turn cut (or failed) before its first audio: the client never saw its visual, so there is none."""
+        agent.held_visual.clear()
+        if agent.stop.visual is not None and not agent.visual_released:
+            agent.stop.visual.withdraw()
+
+    async def _send_visual(self, agent: AgentTurn, event: VisualEvent | CanvasEvent) -> None:
         await self._send({"type": event.name, "turn_id": agent.id, **event.payload()})
+        if isinstance(event, VisualEvent) and event.phase == "ready" and agent.stop.visual is not None:
+            agent.stop.visual.delivered = True
         language = agent.voice_language or agent.turn.language
         if language not in self._tails:  # synthesized while the visual is planned (seconds), once per language
             self._tails.add(language)
             self._spawn(self._warm_tail(language), f"{self.id}-tail-audio")
         if isinstance(event, VisualEvent) and event.phase == "ready":
+            visual = agent.stop.visual
+            if visual is not None and visual.status != "ready":
+                return  # withdrawn meanwhile: nothing to announce
+            if visual is not None and visual.trace.draft == "refine" and visual.trace.planner is None:
+                # A draft the planner is still to check (it may withdraw it): the tail waits for its verdict, so it
+                # never announces a visual that goes.
+                visual.when_settled(lambda v: self._tail_once_settled(agent, v))
+            else:
+                await self._visual_tail(agent)
+
+    async def _tail_once_settled(self, agent: AgentTurn, visual: TurnVisual) -> None:
+        if visual.status == "ready":
             await self._visual_tail(agent)
 
     async def _warm_tail(self, language: Language) -> None:
@@ -985,6 +1039,7 @@ class VoiceSession:
                 await self._send_bytes_unlocked(frame)
         if first_answer_chunk and not agent.cut:
             await self._set_state("speaking")
+            await self._release_visual(agent)  # the draft, ready since the sources: on screen as the answer starts
 
     def _answer_heard(self, agent: AgentTurn, played_ms: float | None) -> bool:
         """The answer is complete, all of it was spoken, and the client has played it: only a live-data continuation
@@ -1045,6 +1100,7 @@ class VoiceSession:
         deltas, audio chunks or frames are sent, and it is no longer the active turn. True if a barge-in decision for
         it was pending (the client is waiting for one)."""
         agent.cut = True
+        self._withdraw_visual(agent)  # (only if its first audio never went out)
         if agent.playback_timer is not None:
             agent.playback_timer.cancel()
             agent.playback_timer = None

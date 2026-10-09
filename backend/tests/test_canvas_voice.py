@@ -1,10 +1,13 @@
 """The canvas in a voice session (docs/DESIGN.md §12.1, §3.10), fake speech: the answer's visual arrives as `visual` and
-`canvas` messages with the turn's id, never ahead of the first audio, possibly after `agent_message`; the spoken tail
-("It's on screen now.") only once the visual is ready and while the answer is still being heard; barge-in, a new
-question or the stop button while a visual is being planned; spoken canvas edits (English and Hindi)."""
+`canvas` messages with the turn's id. Its draft is built as soon as the retrieval returns and held until the answer's
+first audio, then sent at once (never before it); a draft the planner refines is replaced in place, possibly after
+`agent_message`. The spoken tail ("It's on screen now.") only for a visual that stays and while the answer is still
+being heard; barge-in, a new question or the stop button during the refinement keep the draft; a turn cut before its
+first audio never shows one. Spoken canvas edits (English and Hindi)."""
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -13,10 +16,10 @@ import pytest
 from app.services.voice.fillers import VISUAL_TAILS
 from app.services.voice.protocol import parse_frame
 
-from .canvas_turn_helpers import Script, choose, line_of_revenue, planner_calls, report_chat
+from .canvas_turn_helpers import Script, choose, choose_table, line_of_revenue, planner_calls, report_chat
 from .test_voice_api import Item, Voice, VoiceClient, kinds, of, one
 
-SHOW, NEXT, EDIT, HINDI_EDIT = 30, 40, 50, 60  # tones: what the user "says"
+SHOW, NEXT, EDIT, HINDI_EDIT, UNSURE = 30, 40, 50, 60, 70  # tones: what the user "says"
 REPLY = "Revenue rose in every quarter of FY24 [S1]. It ended the year at its highest level."
 TAIL = VISUAL_TAILS["en"]
 
@@ -26,10 +29,11 @@ def voice(make_app, fakes) -> Iterator[Voice]:
     fakes.llm.reply = REPLY
     fakes.stt.scripts.update(
         {
-            SHOW: "Show me revenue by quarter",
+            SHOW: "Show me revenue by quarter",  # a confident draft: the line of quarterly revenue
             NEXT: "Who is the chairperson of the board?",
             EDIT: "Make it a bar chart.",
             HINDI_EDIT: "इसे टेबल में दिखाओ",
+            UNSURE: "Show me revenue",  # which table? a draft for the planner to check
         }
     )
     with make_app() as api:
@@ -49,108 +53,147 @@ def tail_chunks(items: list[Item]) -> list[dict[str, Any]]:
     return [m for m in of(items, "audio_chunk") if m.get("tail")]
 
 
-def test_the_visual_arrives_after_the_first_audio_and_the_tail_is_spoken_once_it_is_ready(voice):
-    script = Script(planner=choose("line", "Revenue")).install(voice.fakes.llm)
-    script.planner_delay = 0.3
+def main_of(items: list[Item]) -> list[Item]:
+    return [m for m in items if not (isinstance(m, dict) and m["type"] == "transcript_partial")]
+
+
+def refined(m: Item) -> bool:
+    """The canvas once the planner's line chart replaced the draft."""
+    return isinstance(m, dict) and m.get("type") == "canvas" and m["panels"][0]["kind"] == "line"
+
+
+def canvas_kinds(voice: Voice) -> list[str]:
+    return [p["kind"] for p in voice.api.get(f"/api/chats/{voice.chat}/canvas").json()["panels"]]
+
+
+def test_the_draft_is_sent_with_the_first_audio_and_the_tail_follows_the_answer(voice):
+    Script(planner=choose("line", "Revenue")).install(voice.fakes.llm)
+    voice.fakes.tts.delay = 0.2  # the first audio takes a while: the draft is ready long before it, and waits
     with voice.connect() as ws:
         c = VoiceClient(ws)
         c.start()
         c.say(SHOW)
-        items = c.until(lambda m: isinstance(m, dict) and m.get("tail") is True)
-        items += c.quiet(0.3)
-        main = [m for m in items if not (isinstance(m, dict) and m["type"] == "transcript_partial")]
-        first_audio = main.index(of(items, "audio_chunk")[0])
+        items = c.until("agent_message")
+        main = main_of(items)
+        chunks = of(items, "audio_chunk")
+        first_audio, second_audio = main.index(chunks[0]), main.index(chunks[1])
         preparing = main.index(next(m for m in of(items, "visual") if m["phase"] == "preparing"))
-        assert first_audio < preparing  # the planner starts once the answer's text is complete
-        assert visual_messages(items) == [("visual", "preparing", 1), ("visual", "ready", 1), ("canvas", None, 1)]
         ready = next(m for m in of(items, "visual") if m["phase"] == "ready")
+        # never before the first audio; sent at once with it, not after the answer
+        assert first_audio < preparing < main.index(ready) < second_audio
+        assert visual_messages(items) == [("visual", "preparing", 1), ("visual", "ready", 1), ("canvas", None, 1)]
+        assert ready["visual"]["kind"] == "line"
+        # ready while the answer is spoken: the tail is its last chunk, before agent_message
         (tail,) = tail_chunks(items)
-        assert main.index(ready) < main.index(tail)  # never before the visual is on screen
-        answer_chunks = [m for m in of(items, "audio_chunk") if not m.get("tail")]
-        assert tail["chunk_index"] == answer_chunks[-1]["chunk_index"] + 1 and tail["text"] == TAIL
-        assert tail["turn_id"] == 1
-        # here the answer's audio was all sent before the visual was ready: the tail follows agent_message, while
-        # the answer is still playing (§3.10's exception), with its frames
-        assert main.index(one(items, "agent_message")) < main.index(tail)
+        assert chunks[-1] is tail and tail["text"] == TAIL and tail["turn_id"] == 1
+        assert main.index(tail) < main.index(one(items, "agent_message"))
         frames = [parse_frame(m) for m in main[main.index(tail) + 1 :] if isinstance(m, bytes)]
         assert frames and {(t, i) for t, i, _, _ in frames} == {(1, tail["chunk_index"])}
         agent = one(items, "agent_message")["message"]
         assert TAIL not in agent["text"] and agent["heard_text"] is None
         c.send("playback_done", turn_id=1)
         c.until(lambda m: m == {"type": "state", "state": "listening"})
+    assert planner_calls(voice.fakes.llm) == []  # a confident draft: no model call
     route = voice.transcript()[-1]["route"]
     assert route["visual"] == "requested" and route["visual_id"] == ready["visual_id"]
+    assert route["visual_plan"]["draft"] == "confident"
 
 
-def test_a_tail_ready_while_the_answer_is_still_spoken_comes_before_agent_message(voice):
-    script = Script(planner=choose("line", "Revenue")).install(voice.fakes.llm)
-    script.planner_delay = 0.05
-    voice.fakes.tts.delay = 0.25  # speech is slower than the planner
+def test_a_refined_visual_replaces_the_draft_in_place_after_the_answer(voice):
+    script = Script(planner=choose_table("line", "Q1 FY24", "Revenue")).install(voice.fakes.llm)
+    script.planner_delay = 0.3
     with voice.connect() as ws:
         c = VoiceClient(ws)
         c.start()
-        c.say(SHOW)
-        items = c.until("agent_message")
-        main = [m for m in items if not (isinstance(m, dict) and m["type"] == "transcript_partial")]
-        (tail,) = tail_chunks(items)
-        chunks = of(items, "audio_chunk")
-        assert chunks[-1] is tail  # after the answer's last chunk
-        assert main.index(next(m for m in of(items, "visual") if m["phase"] == "ready")) < main.index(tail)
-        assert main.index(tail) < main.index(one(items, "agent_message"))  # the usual order holds
+        c.say(UNSURE)
+        items = c.until(refined)
+        items += c.quiet(0.3)
+    readies = [m for m in of(items, "visual") if m["phase"] == "ready"]
+    assert [r["visual"]["kind"] for r in readies] == ["donut", "line"]  # the draft, then the planner's chart
+    assert readies[0]["visual_id"] == readies[1]["visual_id"]  # in place: one panel for the turn
+    main = main_of(items)
+    assert main.index(of(items, "audio_chunk")[0]) < main.index(readies[0])
+    assert canvas_kinds(voice) == ["line"]
+    # the draft wasn't sure: the tail waited for the planner's verdict, and the answer was still playing
+    assert [m["text"] for m in tail_chunks(items)] == [TAIL]
 
 
-def test_no_tail_when_the_visual_fails(voice):
+def test_no_tail_when_the_planner_withdraws_the_draft(voice):
     Script(planner={"kind": "none", "datasets": ["D1"], "series": []}).install(voice.fakes.llm)
     with voice.connect() as ws:
         c = VoiceClient(ws)
         c.start()
-        c.say(SHOW)
+        c.say(UNSURE)
         items = c.until(lambda m: isinstance(m, dict) and m.get("type") == "visual" and m["phase"] == "failed")
         items += c.quiet(0.4)
-    assert visual_messages(items) == [("visual", "preparing", 1), ("visual", "failed", 1)]
-    assert tail_chunks(items) == []  # nothing is promised that didn't come
+    assert visual_messages(items) == [
+        ("visual", "preparing", 1),
+        ("visual", "ready", 1),
+        ("canvas", None, 1),
+        ("visual", "failed", 1),
+        ("canvas", None, 1),
+    ]
+    assert tail_chunks(items) == []  # nothing is promised that didn't stay
+    assert canvas_kinds(voice) == []
+
+
+def test_an_answer_that_abstains_before_its_first_audio_shows_no_visual(voice):
+    Script(planner=choose("line", "Revenue")).install(voice.fakes.llm)
+    voice.fakes.llm.reply = "The documents don't cover quarterly revenue."  # the answer itself abstains (B9)
+    voice.fakes.tts.delay = 0.3  # its text is complete before its first audio: the draft is withdrawn while held
+    with voice.connect() as ws:
+        c = VoiceClient(ws)
+        c.start()
+        c.say(UNSURE)
+        items = c.until("agent_message")
+        items += c.quiet(0.4)
+    assert visual_messages(items) == [] and tail_chunks(items) == []
+    assert canvas_kinds(voice) == [] and planner_calls(voice.fakes.llm) == []
 
 
 def test_no_tail_once_the_answer_was_heard(voice):
-    script = Script(planner=choose("line", "Revenue")).install(voice.fakes.llm)
+    script = Script(planner=choose_table("line", "Q1 FY24", "Revenue")).install(voice.fakes.llm)
     script.planner_delay = 0.6
     with voice.connect() as ws:
         c = VoiceClient(ws)
         c.start()
-        c.say(SHOW)
+        c.say(UNSURE)
         c.until("agent_message")
         c.send("playback_done", turn_id=1)  # the answer has been heard: the turn is over
-        items = c.until(lambda m: isinstance(m, dict) and m.get("type") == "canvas")
+        items = c.until(refined)
         items += c.quiet(0.3)
-    assert ("visual", "ready", 1) in visual_messages(items)  # the chart still lands
+    assert ("visual", "ready", 1) in visual_messages(items)  # the refined chart still lands
     assert tail_chunks(items) == []  # but nobody is told about it out of the blue
 
 
-def test_a_barge_in_while_the_visual_is_planned_stops_the_answer_and_the_new_question_cancels_the_visual(voice):
-    script = Script(planner=choose("line", "Revenue")).install(voice.fakes.llm)
+def test_a_barge_in_during_the_refinement_keeps_the_draft_and_the_new_question_cancels_the_planner(voice):
+    script = Script(planner=choose_table("line", "Q1 FY24", "Revenue")).install(voice.fakes.llm)
     script.planner_delay = 5.0
+    voice.fakes.llm.delay = 0.03  # the answer's words take a moment, as on the real model: the draft is ready
     with voice.connect() as ws:
         c = VoiceClient(ws)
         c.start()
-        c.say(SHOW)
-        first = c.until("agent_message")  # the answer's text is complete: its visual is being planned
-        assert ("visual", "preparing", 1) in visual_messages(first)
+        c.say(UNSURE)
+        first = c.until("agent_message")  # the answer's text is complete: the planner is refining the draft
+        assert visual_messages(first)[:2] == [("visual", "preparing", 1), ("visual", "ready", 1)]
         c.send("barge_in_start", turn_id=1, played_ms=300)
         c.say(NEXT, ms=500)
         items = c.until(lambda m: isinstance(m, dict) and m.get("type") == "agent_message" and m["message"]["seq"] == 4)
+        items += c.quiet(0.2)
     assert one(items, "barge_in") == {"type": "barge_in", "turn_id": 1, "decision": "stop"}
-    # the new question needs the model (one request at a time): the visual still being planned gives way
-    visual_id = of(first, "visual")[0]["visual_id"]
-    cancelled = {"type": "visual", "turn_id": 1, "phase": "failed", "visual_id": visual_id, "detail": "cancelled"}
-    assert cancelled in of(items, "visual")
-    assert tail_chunks(first + items) == []
+    # the new question needs the model (one request at a time): the refinement gives way, the draft stays
     assert voice.fakes.llm.json_cancelled >= 1
+    assert [m for m in of(items, "visual") if m["phase"] == "failed"] == []
+    assert canvas_kinds(voice) == ["donut"]
+    assert tail_chunks(first + items) == []
     assert of(items, "user_message")[0]["message"]["text"] == "Who is the chairperson of the board?"
+    first_answer = voice.transcript()[1]["route"]
+    assert first_answer["visual_status"] == "ready" and first_answer["visual_plan"]["planner"] == "cancelled"
 
 
-def test_a_barge_in_before_the_answer_is_complete_never_starts_a_visual(voice):
+def test_a_stop_before_the_first_audio_never_shows_the_draft(voice):
     Script(planner=choose("line", "Revenue")).install(voice.fakes.llm)
-    voice.fakes.llm.hold_after = 3  # the model is still writing the answer
+    voice.fakes.llm.hold_after = 3  # the model is still writing the answer's first words
     with voice.connect() as ws:
         c = VoiceClient(ws)
         c.start()
@@ -160,21 +203,29 @@ def test_a_barge_in_before_the_answer_is_complete_never_starts_a_visual(voice):
         c.send("stop")
         items = c.until("agent_message")
         items += c.quiet(0.3)
+    assert of(items, "audio_chunk") == []
     assert visual_messages(items) == [] and planner_calls(voice.fakes.llm) == []
     assert one(items, "agent_message")["message"]["route"]["stopped"] is True
+    assert canvas_kinds(voice) == []  # the draft built for it is withdrawn: nobody saw it
 
 
-def test_the_stop_button_cancels_a_visual_being_planned(voice):
-    script = Script(planner=choose("line", "Revenue")).install(voice.fakes.llm)
+def test_the_stop_button_during_the_refinement_keeps_the_draft(voice):
+    script = Script(planner=choose_table("line", "Q1 FY24", "Revenue")).install(voice.fakes.llm)
     script.planner_delay = 5.0
+    voice.fakes.llm.delay = 0.03  # the answer's words take a moment, as on the real model: the draft is ready
     with voice.connect() as ws:
         c = VoiceClient(ws)
         c.start()
-        c.say(SHOW)
+        c.say(UNSURE)
         c.until("agent_message")
+        deadline = time.monotonic() + 5
+        while not script.planner_at and time.monotonic() < deadline:  # the planner is refining the draft
+            time.sleep(0.01)
         c.send("stop")
-        items = c.until(lambda m: isinstance(m, dict) and m.get("type") == "visual" and m["phase"] == "failed")
-    assert of(items, "visual")[-1]["detail"] == "cancelled" and of(items, "visual")[-1]["turn_id"] == 1
+        items = c.quiet(0.5)
+    assert voice.fakes.llm.json_cancelled >= 1  # the planner's request is closed
+    assert [m for m in of(items, "visual") if m["phase"] == "failed"] == []
+    assert canvas_kinds(voice) == ["donut"]
 
 
 def test_spoken_canvas_edits_in_english_and_hindi(voice):

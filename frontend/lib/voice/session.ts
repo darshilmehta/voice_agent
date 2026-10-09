@@ -22,7 +22,7 @@
 
 import type { Language, Message, SourcesPayload } from "../api";
 import { publishRawCanvasEvent } from "../canvas/events";
-import { withVisual } from "../route";
+import { withVisual, withoutVisual } from "../route";
 import { applyTool, endSearch, NO_WEB, parseTool, type WebSearchState, type WebTurn } from "../web-search";
 import { MIC_ERROR_TEXT, MicError, openMic, voiceSupport, type MicCapture, type MicErrorKind } from "./capture";
 import { AgentPlayer } from "./playback";
@@ -805,6 +805,8 @@ export class VoiceSession {
         publishRawCanvasEvent(this.opts.chatId, msg.type, msg);
         if (msg.type === "visual" && msg.phase === "ready" && typeof msg.turn_id === "number") {
           this.noteVisual(msg.turn_id, msg.visual_id);
+        } else if (msg.type === "visual" && msg.phase === "failed" && typeof msg.turn_id === "number") {
+          this.forgetVisual(msg.turn_id, msg.visual_id); // a draft shown, then withdrawn
         }
         break;
       case "error":
@@ -825,6 +827,16 @@ export class VoiceSession {
       const marked = withVisual(answer, visualId);
       this.set({ messages: this.withMessage(marked), turn: { ...turn, message: marked } });
     }
+  }
+
+  /** A turn's visual was withdrawn after it was shown (§12.1): its answer no longer says "Chart added". */
+  private forgetVisual(turnId: number, visualId: string): void {
+    if (this.visualOfTurn.get(turnId) !== visualId) return;
+    this.visualOfTurn.delete(turnId);
+    const messages = this.snap.messages.map((m) => withoutVisual(m, visualId));
+    const turn = this.snap.turn;
+    const message = turn?.message ? withoutVisual(turn.message, visualId) : null;
+    this.set({ messages, ...(turn && message ? { turn: { ...turn, message } } : {}) });
   }
 
   /** The saved messages with `m` added, or, when one with its id is already there, replaced in place (never twice). */
