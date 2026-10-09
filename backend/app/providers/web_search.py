@@ -7,12 +7,16 @@
                    de-duplicated by URL, at most a fair share per engine, with a per-request timeout
                    (request_timeout_s) and an overall deadline (timeout_s → WebSearchTimeout after what arrived)
       search_api   a production search API (Brave, Tavily, …): placeholder
-    WebSearch.fetch_page(url) → the page as plain text: http(s) only, public addresses only (no loopback or private
-      networks, redirects checked too), HTML or plain text only, at most PAGE_MAX_BYTES read, PAGE_TEXT_CHARS kept
+    WebSearch.fetch_page(url) → the page as plain text: http(s) on ports 80/443 only, public addresses only (no
+      loopback, private, link-local or IPv6 forms of them; redirects checked too; the connection goes to the very
+      address that was checked, GuardedNetwork, so DNS rebinding can't redirect it), HTML or plain text only, at most
+      PAGE_MAX_BYTES read and inflated (Accept-Encoding: identity; one gzip/deflate layer inflated by us with a cap;
+      anything else refused), PAGE_TEXT_CHARS kept, parsed off the event loop
 
 Privacy: the query string is the only thing sent to SearXNG (which forwards it to public engines). Callers pass the
 rewritten English search question, never document text or the transcript (services/live_data.py builds it). Page
-fetches GET a result's own URL with no cookies kept and nothing else attached.
+fetches GET a result's own URL with a common browser User-Agent, no cookies kept, no proxy settings from the
+environment, and nothing else attached.
 
 Guard: ``stream`` and ``fetch_page`` refuse (``WebSearchRefused``) unless ``tools.web_search.enabled`` and, under
 ``strict_offline``, ``"web_search"`` is in ``strict_offline_exceptions``; the registry also refuses to start
@@ -30,12 +34,14 @@ import math
 import re
 import socket
 import time
-from collections.abc import AsyncIterator
+import zlib
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
+import httpcore  # httpx's own transport layer (installed with httpx): its network backend is what we guard
 import httpx
 
 from .base import HealthStatus, PlaceholderProvider, Provider, ProviderHealth
@@ -47,7 +53,10 @@ PAGE_MAX_BYTES = 400_000  # read at most this much of a page
 PAGE_TEXT_CHARS = 1_500  # keep at most this much of its text
 PAGE_MAX_REDIRECTS = 3
 UNHEALTHY_COOLDOWN_S = 30.0
-USER_AGENT = "Mozilla/5.0 (compatible; gibberlink-local/0.1; +https://github.com/darshilmehta/voice_agent)"
+# A common browser's: nothing that names this project or ties the machine to an account.
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 _TRACKING_PARAMS = re.compile(r"^(utm_.*|fbclid|gclid|msclkid|ref|ref_src|igshid|mc_cid|mc_eid)$", re.IGNORECASE)
 _SPACE = re.compile(r"\s+")
 
@@ -226,12 +235,105 @@ def page_text(body: str, content_type: str, limit: int = PAGE_TEXT_CHARS) -> str
     return text
 
 
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+_IPV4_COMPATIBLE = ipaddress.ip_network("::/96")
+
+
 def public_address(address: str) -> bool:
+    """A global unicast address. IPv6 forms that carry an IPv4 address count by that address (NAT64
+    64:ff9b::/96, 6to4 2002::/16, Teredo); IPv4-mapped (::ffff:…), IPv4-compatible (::/96) and site-local
+    (fec0::/10) addresses are refused outright."""
     try:
         ip = ipaddress.ip_address(address.split("%", 1)[0])
     except ValueError:
         return False
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None or ip in _IPV4_COMPATIBLE or ip.is_site_local:
+            return False
+        if ip in _NAT64:
+            return public_address(str(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)))
+        if ip.sixtofour is not None:
+            return public_address(str(ip.sixtofour))
+        if ip.teredo is not None:
+            return all(public_address(str(v4)) for v4 in ip.teredo)
     return ip.is_global and not ip.is_multicast
+
+
+PAGE_PORTS = (80, 443)
+
+
+async def _read_capped(response: httpx.Response) -> bytes | None:
+    """At most PAGE_MAX_BYTES of the body, decompressed by us with that cap (never by httpx, which would inflate a
+    whole stacked-gzip bomb before any size check): identity, or one layer of gzip or deflate; any other encoding
+    (stacked, br, zstd) is refused (None). At most PAGE_MAX_BYTES are read from the network either way."""
+    encoding = response.headers.get("content-encoding", "identity").strip().lower()
+    if encoding in ("", "identity"):
+        decoder = None
+    elif encoding in ("gzip", "x-gzip"):
+        decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    elif encoding == "deflate":
+        decoder = zlib.decompressobj()
+    else:
+        return None
+    if response.is_stream_consumed:  # already read and decoded by httpx (a test's in-memory response, not a page)
+        return response.content[:PAGE_MAX_BYTES]
+    body = bytearray()
+    received = 0
+    async for chunk in response.aiter_raw():
+        received += len(chunk)
+        body += decoder.decompress(chunk, PAGE_MAX_BYTES - len(body)) if decoder is not None else chunk
+        if len(body) >= PAGE_MAX_BYTES or received >= PAGE_MAX_BYTES:
+            break
+    return bytes(body[:PAGE_MAX_BYTES])
+
+
+class GuardedNetwork(httpcore.AsyncNetworkBackend):
+    """Page fetches connect only to the public address they were checked against: the host is resolved once,
+    every address must be public, and the connection goes to that IP (TLS still verifies, and SNI and Host still
+    name, the hostname). No DNS rebinding between the check and the connect, and ports 80/443 only."""
+
+    def __init__(self, inner: httpcore.AsyncNetworkBackend, resolve: Callable[[str], Awaitable[list[str]]]) -> None:
+        self.inner = inner
+        self.resolve = resolve
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[Any] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        if port not in PAGE_PORTS:
+            raise httpcore.ConnectError(f"port {port} refused (pages are fetched from 80 and 443 only)")
+        try:
+            ipaddress.ip_address(host)
+            addresses = [host]
+        except ValueError:
+            try:
+                addresses = await asyncio.wait_for(self.resolve(host), 2.0)
+            except (OSError, TimeoutError) as e:
+                raise httpcore.ConnectError(f"{host} doesn't resolve: {describe(e)}") from e
+        if not addresses or not all(public_address(a) for a in addresses):
+            raise httpcore.ConnectError(f"{host} resolves to a non-public address: refused")
+        return await self.inner.connect_tcp(
+            addresses[0], port, timeout=timeout, local_address=local_address, socket_options=socket_options
+        )
+
+    async def connect_unix_socket(self, *args: Any, **kwargs: Any) -> httpcore.AsyncNetworkStream:
+        raise httpcore.ConnectError("unix sockets refused")
+
+    async def sleep(self, seconds: float) -> None:
+        await self.inner.sleep(seconds)
+
+
+def guarded_transport(resolve: Callable[[str], Awaitable[list[str]]]) -> httpx.AsyncHTTPTransport:
+    """httpx's transport with its connection pool's network backend wrapped in ``GuardedNetwork``; no proxies or
+    environment settings (trust_env=False)."""
+    transport = httpx.AsyncHTTPTransport(trust_env=False, retries=0)
+    pool = transport._pool  # httpx 0.28: the httpcore pool behind the transport
+    pool._network_backend = GuardedNetwork(pool._network_backend, resolve)
+    return transport
 
 
 # ------------------------------------------------------------------ SearXNG
@@ -399,7 +501,12 @@ class SearXNGSearch(WebSearch):
 
     def _pages(self) -> httpx.AsyncClient:
         if self.page_client is None:
-            self.page_client = httpx.AsyncClient(follow_redirects=False, headers={"User-Agent": USER_AGENT})
+            self.page_client = httpx.AsyncClient(
+                transport=guarded_transport(self.resolve),
+                follow_redirects=False,
+                trust_env=False,
+                headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"},
+            )
         return self.page_client
 
     async def resolve(self, host: str) -> list[str]:
@@ -413,6 +520,11 @@ class SearXNGSearch(WebSearch):
         parts = urlsplit(url)
         host = (parts.hostname or "").lower()
         if parts.scheme not in ("http", "https") or not host or parts.username or parts.password:
+            return False
+        try:
+            if parts.port not in (None, *PAGE_PORTS):
+                return False
+        except ValueError:  # not a number
             return False
         if host == "localhost" or host.endswith((".localhost", ".local", ".internal", ".lan", ".home.arpa")):
             return False
@@ -436,24 +548,22 @@ class SearXNGSearch(WebSearch):
             for _ in range(PAGE_MAX_REDIRECTS + 1):
                 if not await self._allowed_url(url):
                     return None
-                async with client.stream(
-                    "GET", url, timeout=timeout, headers={"Accept": "text/html,text/plain;q=0.9"}
-                ) as response:
+                headers = {"Accept": "text/html,text/plain;q=0.9", "Accept-Encoding": "identity"}
+                async with client.stream("GET", url, timeout=timeout, headers=headers) as response:
                     if response.is_redirect and "location" in response.headers:
                         url = urljoin(url, response.headers["location"])
                         continue
                     content_type = response.headers.get("content-type", "").lower()
                     if response.status_code != 200 or not content_type.startswith(("text/html", "text/plain")):
                         return None
-                    body = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        body += chunk
-                        if len(body) >= PAGE_MAX_BYTES:
-                            break
-                    text = bytes(body[:PAGE_MAX_BYTES]).decode(response.encoding or "utf-8", errors="replace")
-                    return page_text(text, content_type) or None
+                    body = await _read_capped(response)
+                    if body is None:
+                        return None
+                    text = body.decode(response.encoding or "utf-8", errors="replace")
+                    # Parsing 400 KB of HTML takes tens of ms: not on the event loop (audio frames, VAD).
+                    return await asyncio.to_thread(page_text, text, content_type) or None
             return None
-        except (httpx.HTTPError, LookupError, UnicodeError):
+        except (httpx.HTTPError, httpcore.ConnectError, LookupError, UnicodeError, zlib.error):
             return None
         finally:
             client.cookies.clear()  # nothing a page sets is kept or sent later

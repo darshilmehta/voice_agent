@@ -5,11 +5,14 @@ public addresses only)."""
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import time
+import tracemalloc
 from collections.abc import Callable
 from typing import Any
 
+import httpcore
 import httpx
 import pytest
 
@@ -17,12 +20,14 @@ from app.providers.base import HealthStatus, ProviderContext
 from app.providers.registry import build_container
 from app.providers.web_search import (
     PAGE_MAX_BYTES,
+    GuardedNetwork,
     SearXNGSearch,
     WebSearchError,
     WebSearchRefused,
     WebSearchTimeout,
     clean_query,
     page_text,
+    public_address,
     url_key,
 )
 from app.settings import Settings, load_settings
@@ -378,3 +383,141 @@ def test_page_text_prefers_paragraphs_and_falls_back_to_other_blocks():
     table = "<table><tr><td>Revenue for the year was up sharply on strong demand</td></tr></table>"
     assert page_text(table, "text/html") == "Revenue for the year was up sharply on strong demand"
     assert json.dumps(page_text("<p>short</p>", "text/html")) == '""'
+
+
+# ------------------------------------------------------------------ review fixes
+
+
+class Chunks(httpx.AsyncByteStream):
+    """A response body that arrives in chunks, as from the network (httpx doesn't read or decode it up front)."""
+
+    def __init__(self, data: bytes, size: int = 512) -> None:
+        self.data, self.size = data, size
+        self.sent = 0
+
+    async def __aiter__(self):  # type: ignore[override]
+        for i in range(0, len(self.data), self.size):
+            self.sent += self.size
+            yield self.data[i : i + self.size]
+
+
+def streamed(server: Pages, url: str, data: bytes, encoding: str | None) -> Chunks:
+    body = Chunks(data)
+    headers = {"content-type": "text/html"} | ({"content-encoding": encoding} if encoding else {})
+    server.responses[url] = httpx.Response(200, headers=headers, stream=body)
+    return body
+
+
+@pytest.mark.parametrize("encoding", ["gzip, gzip", "br", "gzip, deflate"])
+async def test_stacked_or_unknown_encodings_are_refused_unread(pages, encoding):
+    """F6: 0.5 KB of gzip-in-gzip is 200 MB of zeros; httpx would inflate it before any size check."""
+    p, server = pages
+    inner = gzip.compress(b"\0" * 20_000_000, 9)
+    body = streamed(server, "https://news.example.com/bomb", gzip.compress(inner, 9), encoding)
+    assert await p.fetch_page("https://news.example.com/bomb") is None
+    assert body.sent == 0
+    assert server.requests[-1].headers["accept-encoding"] == "identity"
+
+
+async def test_one_gzip_layer_is_inflated_by_us_and_capped(pages):
+    p, server = pages
+    html = b"<p>" + b"word " * 10_000_000 + b"</p>"  # 50 MB inflated
+    body = streamed(server, "https://news.example.com/big", gzip.compress(html, 9), "gzip")
+    tracemalloc.start()
+    text = await p.fetch_page("https://news.example.com/big")
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert text is not None and text.startswith("word word") and len(text) <= 1_510
+    assert peak < 20_000_000  # never the whole 50 MB (parsing the capped 400 KB takes a few MB)
+    assert body.sent < len(body.data)  # stopped reading once the cap was reached
+
+
+async def test_a_plain_page_is_read_up_to_the_cap_from_the_network(pages):
+    p, server = pages
+    body = streamed(server, "https://news.example.com/long", b"<p>" + b"word " * 1_000_000 + b"</p>", None)
+    assert (await p.fetch_page("https://news.example.com/long") or "").startswith("word word")
+    assert PAGE_MAX_BYTES <= body.sent < PAGE_MAX_BYTES + 1024
+
+
+@pytest.mark.parametrize(
+    ("address", "public"),
+    [
+        ("8.8.8.8", True),
+        ("2606:4700::1111", True),
+        ("64:ff9b::808:808", True),  # NAT64 of 8.8.8.8
+        ("64:ff9b::7f00:1", False),  # NAT64 of 127.0.0.1
+        ("64:ff9b::a00:1", False),  # NAT64 of 10.0.0.1
+        ("2002:7f00:1::", False),  # 6to4 of 127.0.0.1
+        ("2002:c0a8:101::", False),  # 6to4 of 192.168.1.1
+        ("::127.0.0.1", False),  # IPv4-compatible
+        ("::ffff:8.8.8.8", False),  # IPv4-mapped: refused outright
+        ("::ffff:127.0.0.1", False),
+        ("fec0::1", False),  # site-local
+        ("fe80::1%en0", False),
+        ("::1", False),
+        ("169.254.169.254", False),
+        ("100.64.0.1", False),
+        ("0.0.0.0", False),
+    ],
+)
+def test_public_addresses(address, public):
+    """F8: IPv6 forms that carry a private IPv4 address are not public."""
+    assert public_address(address) is public
+
+
+class FakeNetwork(httpcore.AsyncNetworkBackend):
+    def __init__(self) -> None:
+        self.connects: list[tuple[str, int]] = []
+
+    async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):  # type: ignore[override]
+        self.connects.append((host, port))
+        raise httpcore.ConnectError("test network: not connecting")
+
+    async def connect_unix_socket(self, *args, **kwargs):  # type: ignore[override]
+        raise AssertionError
+
+    async def sleep(self, seconds):  # type: ignore[override]
+        pass
+
+
+async def test_the_connection_goes_to_the_address_that_was_checked():
+    """F7: the host is resolved once, every address must be public, and the connection goes to that IP: DNS can't
+    answer the check with a public address and the connect with 127.0.0.1."""
+    answers = [["93.184.215.14"], ["127.0.0.1"]]
+    resolved: list[str] = []
+
+    async def resolve(host: str) -> list[str]:
+        resolved.append(host)
+        return answers[len(resolved) - 1]
+
+    inner = FakeNetwork()
+    guard = GuardedNetwork(inner, resolve)
+    with pytest.raises(httpcore.ConnectError):
+        await guard.connect_tcp("rebind.example", 443)
+    assert inner.connects == [("93.184.215.14", 443)] and resolved == ["rebind.example"]
+    with pytest.raises(httpcore.ConnectError, match="non-public"):  # the second answer: refused, never connected
+        await guard.connect_tcp("rebind.example", 443)
+    assert inner.connects == [("93.184.215.14", 443)]
+
+
+@pytest.mark.parametrize("port", [22, 6333, 8888, 11434])
+async def test_only_web_ports_are_connected(port):
+    inner = FakeNetwork()
+
+    async def resolve(host: str) -> list[str]:
+        return ["93.184.215.14"]
+
+    with pytest.raises(httpcore.ConnectError, match="port"):
+        await GuardedNetwork(inner, resolve).connect_tcp("news.example.com", port)
+    assert inner.connects == []
+
+
+async def test_the_page_client_uses_the_guard_no_env_proxies_and_a_generic_agent(web_settings, searxng):
+    p = provider(web_settings(), searxng)
+    client = p._pages()
+    assert isinstance(client._transport._pool._network_backend, GuardedNetwork)  # type: ignore[attr-defined]
+    assert client._trust_env is False
+    agent = client.headers["user-agent"]
+    assert "gibberlink" not in agent.casefold() and "github" not in agent.casefold() and agent.startswith("Mozilla/5.0")
+    assert not await p._allowed_url("https://news.example.com:8443/")  # F7: ports 80/443 only
+    await p.close()
