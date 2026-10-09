@@ -121,9 +121,18 @@ def _abstention(summary: Mapping[str, Any]) -> str:
     ab = summary["abstention"]
     t = ab["threshold"]
     overall = ab["overall"]
-    out = [
-        f"Gate: answer when the best reranker score >= `min_rerank_score` = **{t}** (nothing retrieved always abstains).\n"
-    ]
+    gate = (
+        f"Gate (`Confidence.above_threshold`): answer when the best reranker score >= `min_rerank_score` = **{t}** and "
+        "the best passage states every fiscal year the question names (nothing retrieved always abstains)."
+    )
+    score_gate = ab.get("score_gate")
+    if score_gate:
+        gate += (
+            f" {ab.get('vetoed', 0)} questions name a year their best passage doesn't state; without that check the "
+            f"score alone would answer {score_gate['answered_answerable']} answerable and "
+            f"{score_gate['answered_unanswerable']} unanswerable questions."
+        )
+    out = [gate + "\n"]
     out.append(_confusion_table(overall))
     out.append(
         f"\nOf the questions answered, {pct(overall['answer_precision'])} had an answer in the documents (answer precision); "
@@ -161,6 +170,15 @@ def _abstention(summary: Mapping[str, Any]) -> str:
             rows,
         )
     )
+    subtypes = ab.get("by_subtype")
+    if subtypes:
+        out.append("\n**Unanswerable questions by subtype** (answered = the gate let it through)\n")
+        out.append(
+            table(
+                ["subtype", "n", "answered", "hallucination risk"],
+                [[k, v["n"], v["answered"], pct(v["hallucination_risk"])] for k, v in subtypes.items()],
+            )
+        )
     return "\n".join(out)
 
 
@@ -183,7 +201,8 @@ def _sweep(summary: Mapping[str, Any]) -> str:
                 ]
             )
     out = [
-        "**Threshold sweep, all questions** (positive = the documents hold the answer; answered = best score >= threshold)\n"
+        "**Threshold sweep, all questions** (positive = the documents hold the answer; answered = the gate at that "
+        "`min_rerank_score`)\n"
     ]
     out.append(
         table(
@@ -474,7 +493,7 @@ def _gate_errors(rows: Sequence[Mapping[str, Any]], pipeline_variants: set[tuple
         (r for r in sel if not r["abstain"] and not r["answered"]), key=lambda r: -(r["top_score"] or 0)
     )
     false_answer = sorted((r for r in sel if r["abstain"] and r["answered"]), key=lambda r: -(r["top_score"] or 0))
-    out = [f"**Answerable questions the gate would refuse** ({len(false_abstain)}; best score < {threshold})\n"]
+    out = [f"**Answerable questions the gate refuses** ({len(false_abstain)}; `min_rerank_score` {threshold})\n"]
     out.append(
         table(
             ["id", "lang", "question", "best score", "rank of expected page"],
@@ -487,21 +506,22 @@ def _gate_errors(rows: Sequence[Mapping[str, Any]], pipeline_variants: set[tuple
         if false_abstain
         else "(none)"
     )
-    out.append(f"\n**Unanswerable questions the gate would answer** ({len(false_answer)}; best score >= {threshold})\n")
+    out.append(f"\n**Unanswerable questions the gate lets through** ({len(false_answer)})\n")
     out.append(
         table(
-            ["id", "lang", "question", "best score", "top passage"],
+            ["id", "lang", "subtype", "question", "best score", "top passage"],
             [
                 [
                     r["id"],
                     r["language"],
+                    r.get("subtype") or "-",
                     r["question"],
                     num(r["top_score"], 4),
                     (f"{r['top'][0]['document'].split('_')[0]} p{r['top'][0]['pages']}" if r["top"] else "-"),
                 ]
                 for r in false_answer[:MAX_GATE_ERRORS]
             ],
-            align_right_from=3,
+            align_right_from=4,
         )
         if false_answer
         else "(none)"

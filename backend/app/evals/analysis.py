@@ -53,6 +53,8 @@ class QueryRecord:
     timings_ms: dict[str, float] = field(default_factory=dict)
     sources: list[Passage] = field(default_factory=list)  # context handed to the answer step (after budget/dedupe)
     answer: AnswerRecord | None = None
+    veto: bool = False  # the gate refuses it whatever the score (Confidence.missing_periods)
+    subtype: str | None = None  # unanswerable questions: near_miss_year, other_company, ...
 
     def gate(self) -> GateSample:
         evidence = False
@@ -65,7 +67,13 @@ class QueryRecord:
             should_answer=not self.should_abstain,
             language=self.language,
             evidence_retrieved=evidence,
+            veto=self.veto,
+            subtype=self.subtype,
         )
+
+    def answered(self, threshold: float) -> bool:
+        """Did the pipeline's gate let the question through at ``threshold``."""
+        return m.answers(self.gate(), threshold)
 
 
 # ------------------------------------------------------------------ per query
@@ -103,10 +111,13 @@ def query_row(r: QueryRecord, threshold: float) -> dict[str, Any]:
         "top_score": r.top_score,
         "gap": r.gap,
         "dense": r.dense,
-        "answered": r.top_score is not None and r.top_score >= threshold,
+        "answered": r.answered(threshold),
+        "veto": r.veto,
         "top": [_brief(p) for p in r.ranked[:3]],
         "timings_ms": r.timings_ms,
     }
+    if r.subtype:
+        row["subtype"] = r.subtype
     if r.targets:
         row["expected"] = [{"document": t.document, "pages": list(t.pages)} for t in r.targets]
         row["candidate_first_rank"] = _first(r.candidates, r.targets, m.page_hit)
@@ -151,8 +162,8 @@ def _slice(records: Sequence[QueryRecord], threshold: float) -> dict[str, Any]:
     """The compact block used per category and per language."""
     answerable = [r for r in records if not r.should_abstain]
     unanswerable = [r for r in records if r.should_abstain]
-    gate_ok_answerable = _rate(r.top_score is not None and r.top_score >= threshold for r in answerable)
-    gate_ok_unanswerable = _rate(not (r.top_score is not None and r.top_score >= threshold) for r in unanswerable)
+    gate_ok_answerable = _rate(r.answered(threshold) for r in answerable)
+    gate_ok_unanswerable = _rate(not r.answered(threshold) for r in unanswerable)
     out: dict[str, Any] = {"n": len(records), "n_answerable": len(answerable), "n_unanswerable": len(unanswerable)}
     if answerable:
         out["candidate"] = _ranking_block(records, "candidate", m.page_hit)
@@ -211,6 +222,9 @@ def summarize(records: Sequence[QueryRecord], *, threshold: float) -> dict[str, 
         "threshold": threshold,
         "overall": m.confusion(samples, threshold),
         "by_language": {lang: m.confusion([s for s in samples if s.language == lang], threshold) for lang in languages},
+        "by_subtype": m.hallucination_by_subtype(samples, threshold),
+        "score_gate": m.confusion(samples, threshold, gate=False),  # without vetoes, for comparison
+        "vetoed": sum(1 for s in samples if s.veto),
     }
     out["sweep"] = {
         "overall": m.sweep(samples),

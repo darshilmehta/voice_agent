@@ -277,17 +277,25 @@ async def test_the_clean_variant_is_run_for_asr_questions_only(harness, docs):
     assert [r["id"] for r in rows] == ["q7"] and rows[0]["query"].startswith("What was the EBITDA margin")
 
 
-async def test_the_confusion_matrix_exposes_a_near_miss_answered_by_the_gate(harness, docs):
+async def test_the_confusion_matrix_uses_the_pipeline_gate(harness, docs):
     results, _ = await run(harness, docs)
-    conf = results["runs"][0]["variants"]["pipeline"]["abstention"]["overall"]
+    ab = results["runs"][0]["variants"]["pipeline"]["abstention"]
+    conf = ab["overall"]
     assert conf["threshold"] == pytest.approx(0.3)  # min_rerank_score as the fixture pins it
+    assert ab["vetoed"] == 1
     assert conf["answered_answerable"] == 5 and conf["abstained_answerable"] == 0
-    # the weather question scores 0 and is refused; "Alpha's FY25 margin" shares words with the FY24 page
-    # and slips through
-    assert conf["abstained_unanswerable"] == 1 and conf["answered_unanswerable"] == 1
-    assert conf["hallucination_risk"] == 0.5
+    # the weather question scores 0; "Alpha's FY25 margin" shares words with the FY24 page, so its score passes,
+    # but the gate refuses it: the page states FY24, not FY25
+    assert conf["abstained_unanswerable"] == 2 and conf["hallucination_risk"] == 0.0
+    assert ab["score_gate"]["answered_unanswerable"] == 1  # the best score alone would have answered it
+    assert ab["by_subtype"] == {
+        "near_miss_year": {"n": 1, "answered": 0, "hallucination_risk": 0.0},
+        "off_topic": {"n": 1, "answered": 0, "hallucination_risk": 0.0},
+    }
     rows = {r["id"]: r for r in results["runs"][0]["rows"] if r["variant"] == "raw"}
-    assert rows["q6"]["answered"] and not rows["q5"]["answered"]
+    assert rows["q6"]["top_score"] >= 0.3 and rows["q6"]["veto"] and not rows["q6"]["answered"]
+    assert rows["q6"]["subtype"] == "near_miss_year"
+    assert not rows["q5"]["answered"]
 
 
 async def test_the_threshold_option_changes_the_gate_not_the_ranking(harness, docs):
@@ -369,10 +377,8 @@ async def test_answers_mode_checks_answer_strings_and_cited_pages(harness, docs)
     a = pipe["answers"]
     assert a["answerable"]["n"] == 5 and a["answerable"]["contains_ok"] == 1.0
     assert a["answerable"]["cites_a_correct_page"] == 1.0 and a["answerable"]["no_citation"] == 0.0
-    assert a["unanswerable"]["abstained"] == 0.5 and a["unanswerable"]["answered_anyway"] == ["q6"]
-    assert (
-        len(harness.llm.calls) == 6
-    )  # five answerable + the near miss the gate lets through; the weather question never reaches the LLM
+    assert a["unanswerable"]["abstained"] == 1.0 and a["unanswerable"]["answered_anyway"] == []
+    assert len(harness.llm.calls) == 5  # the five answerable; refused questions never reach the LLM
     prompt = harness.llm.calls[0]["messages"]
     assert prompt[0].role == "system" and "numbered sources" in prompt[0].content
     assert "Question: What was the EBITDA margin in FY24 for Alpha?" in prompt[1].content
@@ -438,7 +444,7 @@ async def test_outputs_are_a_json_file_a_markdown_summary_and_the_chunks(harness
     ):
         assert heading in md, heading
     assert "Recall@5" in md and "hallucination risk" in md.lower() and "a.lost" in md  # the dropped fact is listed
-    assert "q6" in md  # the near miss the gate answers is named in the abstention errors
+    assert "Unanswerable questions by subtype" in md and "near_miss_year" in md
 
 
 async def test_summary_can_be_rendered_again_from_results_json(harness, docs, tmp_path):

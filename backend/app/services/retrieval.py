@@ -6,14 +6,15 @@
       → top rerank_top_n + confidence (top score, gap to the runner-up, dense similarity)
 
 ``search`` and ``rerank`` are public so the voice loop can start retrieval speculatively on the raw utterance and
-rerank once the router's English query arrives (§3.3 d, §9.5). Deciding to answer or abstain is the caller's job:
-``Confidence.above_threshold`` applies the configured ``min_rerank_score`` only; multi-signal thresholds are tuned
-on the eval set in phase 2.
+rerank once the router's English query arrives (§3.3 d, §9.5). Deciding to answer or abstain is the caller's job,
+with ``Confidence.above_threshold`` as the gate: the best reranker score reaches ``min_rerank_score`` and the best
+passage states every fiscal year the question names (tuned on the phase-2 eval set, docs/DESIGN.md §9.2).
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -41,7 +42,10 @@ class Confidence:
     top_score: float  # reranker score of the best passage
     gap: float  # top score minus runner-up's (the top score itself when there is a single candidate)
     dense_similarity: float | None  # cosine(query, best passage)
-    above_threshold: bool  # top_score ≥ retrieval.min_rerank_score
+    # The gate: answer only when this is True. top_score ≥ retrieval.min_rerank_score, and the best passage states
+    # every fiscal period the question names (``missing_periods`` empty).
+    above_threshold: bool
+    missing_periods: tuple[int, ...] = ()  # fiscal years (FY24 → 24) asked about but absent from the best passage
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,17 +92,81 @@ def rank_by_scores(hits: Sequence[SearchHit], scores: Sequence[float]) -> list[R
     return sorted(ranked, key=lambda r: (-r.rerank_score, r.search_rank))
 
 
-def confidence_of(ranked: Sequence[RankedChunk], min_score: float) -> Confidence | None:
+def confidence_of(
+    ranked: Sequence[RankedChunk], min_score: float, *, queries: Sequence[str | None] = ()
+) -> Confidence | None:
+    """The confidence signals of a reranked list and the gate's decision. ``queries``: the question as asked and its
+    English query; the fiscal periods they name must be stated by the best passage (see ``missing_periods``)."""
     if not ranked:
         return None
     top = ranked[0]
     runner_up = ranked[1].rerank_score if len(ranked) > 1 else 0.0
+    missing = missing_periods(queries, top.chunk.embed_text)
     return Confidence(
         top_score=top.rerank_score,
         gap=top.rerank_score - runner_up,
         dense_similarity=top.dense_score,
-        above_threshold=top.rerank_score >= min_score,
+        above_threshold=top.rerank_score >= min_score and not missing,
+        missing_periods=missing,
     )
+
+
+# ------------------------------------------------------------------ fiscal periods (near-miss abstention)
+#
+# The reranker scores relevance, not answerability: "Valmora's EBITDA margin for FY25" scores 0.9+ against the FY24
+# figures (phase-2 eval: every near-miss-year question passed a score gate). A question that names a fiscal year is
+# answered only when the passage it would be answered from states that year.
+
+_DEVANAGARI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+# FY24, FY 24, FY'24, FY2024, FY 2024-25, FY24-25, Q4FY24 (the period is named by the year it ends in)
+_FISCAL_YEAR = re.compile(r"(?<![A-Za-z])FY\s?'?(\d{4}|\d{2})(?:\s?[-\u2013/]\s?(\d{4}|\d{2}))?\b", re.IGNORECASE)
+# 2023-24, 2024-2025, 2023/24 (Indian financial years, also inside Hindi text: वित्त वर्ष 2024-25)
+_YEAR_SPAN = re.compile(r"\b(?:19|20)\d{2}\s?[-\u2013/]\s?((?:19|20)?\d{2})\b")
+_YEAR = re.compile(r"\b(?:19|20)(\d{2})\b")
+# A month before a year places a date in one financial year (April to March): "31 March 2024" is FY24, "June 2024" FY25.
+_JAN_MAR = r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|जनवरी|फ़रवरी|फरवरी|मार्च"
+_APR_DEC = (
+    r"apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+    r"|अप्रैल|मई|जून|जुलाई|अगस्त|सितंबर|सितम्बर|अक्टूबर|अक्तूबर|नवंबर|नवम्बर|दिसंबर|दिसम्बर"
+)
+_DATED_YEAR = re.compile(rf"(?:\b|(?<=\s))(?:({_JAN_MAR})|({_APR_DEC}))\.?,?\s+(?:19|20)(\d{{2}})\b", re.IGNORECASE)
+
+
+def asked_periods(text: str) -> set[int]:
+    """Fiscal years a question names explicitly, as the two-digit year they end in (FY24, FY 2023-24, 2023-24 → 24).
+    A bare calendar year ("in 2024") is not one: it is ambiguous and often part of a date."""
+    text = text.translate(_DEVANAGARI_DIGITS)
+    out = {int((end or start)[-2:]) for start, end in _FISCAL_YEAR.findall(text)}
+    out.update(int(end[-2:]) for end in _YEAR_SPAN.findall(text))
+    return out
+
+
+def stated_periods(text: str) -> set[int]:
+    """Fiscal years a passage covers: the explicit ones, the year of each dated month ("31 March 2024" → FY24,
+    "June 2024" → FY25) and, for any other year, both fiscal years it can fall in: generous, so that only a clear
+    mismatch abstains."""
+    text = text.translate(_DEVANAGARI_DIGITS)
+    out = asked_periods(text)
+    for early, _late, yy in _DATED_YEAR.findall(text):
+        out.add(int(yy) if early else (int(yy) + 1) % 100)
+    undated = _DATED_YEAR.sub(" ", text)
+    for yy in _YEAR.findall(undated):
+        out.update((int(yy), (int(yy) + 1) % 100))
+    return out
+
+
+def missing_periods(queries: Sequence[str | None], passage: str) -> tuple[int, ...]:
+    """The fiscal years the queries name that ``passage`` doesn't state, sorted (empty: nothing missing). A passage
+    that states no year at all can't contradict the question ("EBITDA margin 18.2%" on a slide of an FY24 deck):
+    nothing is missing then."""
+    asked: set[int] = set()
+    for q in queries:
+        if q:
+            asked |= asked_periods(q)
+    if not asked:
+        return ()
+    stated = stated_periods(passage)
+    return tuple(sorted(asked - stated)) if stated else ()
 
 
 # ------------------------------------------------------------------ service
@@ -193,7 +261,7 @@ class RetrievalService:
             rerank_query=rerank_query,
             chunks=ranked[: self.config.rerank_top_n],
             candidate_count=len(hits),
-            confidence=confidence_of(ranked, self.config.min_rerank_score),
+            confidence=confidence_of(ranked, self.config.min_rerank_score, queries=(query, query_en)),
             timings_ms={
                 **(timings or {}),
                 "rerank": _ms(t2 - t1),
