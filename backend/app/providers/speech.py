@@ -166,32 +166,23 @@ class _SileroStream:
 
 @dataclass(frozen=True, slots=True)
 class Transcript:
-    """One transcribed utterance. The confidence fields are Whisper's own (None when the recognizer can't tell, or
-    nothing was decoded): ``avg_logprob`` is the mean log probability of the decoded tokens (clear speech is above
-    about -0.5; Whisper itself retries a decode below -1.0), ``no_speech_prob`` the probability that the audio held no
-    speech at all. ``likely_misheard`` combines them."""
+    """One transcribed utterance. The confidence fields are Whisper's own, None when the recognizer can't tell or
+    nothing was decoded: ``avg_logprob``, the mean log probability of the decoded tokens; ``no_speech_prob``, the
+    probability that the audio held no speech; ``compression_ratio``, the text's gzip ratio (a repetition loop is
+    above 2.4). ``voice/speech_text.transcript_garbled`` reads them to ask the user to say it again. Measured on the
+    synthetic clips (§9.3): clear questions -0.05 to -0.5, Hindi -0.2 to -0.6, garbled or wrong-language transcripts
+    -0.7 to -1.0."""
 
     text: str
     language: Language  # spoken language: detected among the allowed ones, or the only one allowed
     language_probability: float | None = None  # None when the language was given, not detected
     avg_logprob: float | None = None
     no_speech_prob: float | None = None
+    compression_ratio: float | None = None
     prompted: bool = False  # decoded with a vocabulary prompt (the chat's names and terms)
 
-    @property
-    def likely_misheard(self) -> bool:
-        """The transcript is probably garbled (worth asking the user to repeat rather than answering it): words were
-        decoded, but with a low mean log probability, or from audio Whisper thinks held no speech. Thresholds from
-        the synthetic-clip benchmark (DESIGN §9.3): clean questions -0.05 to -0.45, garbled ones below -0.6."""
-        if not self.text.strip():
-            return False
-        if self.avg_logprob is not None and self.avg_logprob < MISHEARD_LOGPROB:
-            return True
-        return self.no_speech_prob is not None and self.no_speech_prob > MISHEARD_NO_SPEECH
 
-
-MISHEARD_LOGPROB = -0.7
-MISHEARD_NO_SPEECH = 0.6  # Whisper's own no-speech threshold
+NO_SPEECH_MAX = 0.6  # Whisper's own no-speech threshold
 
 # Whisper conditions on at most 223 prompt tokens (half its 448-token text context); a vocabulary prompt longer than
 # this is cut by the model from its start. Callers keep prompts well under it (it is also decoding time).
@@ -223,19 +214,22 @@ def pick_language(probabilities: Mapping[str, float], languages: Sequence[Langua
     return best, float(probabilities.get(best, 0.0))
 
 
-def segment_confidence(segments: Sequence[Mapping[str, Any]]) -> tuple[float | None, float | None]:
-    """(mean token log probability, highest no-speech probability) over decoded segments (dicts with ``avg_logprob``,
-    ``no_speech_prob`` and ``tokens``); (None, None) without segments."""
-    weighted, count, no_speech = 0.0, 0, None
+def segment_confidence(segments: Sequence[Mapping[str, Any]]) -> tuple[float | None, float | None, float | None]:
+    """(mean token log probability, highest no-speech probability, highest compression ratio) over decoded segments
+    (dicts with ``avg_logprob``, ``no_speech_prob``, ``compression_ratio`` and ``tokens``); Nones without segments."""
+    weighted, count = 0.0, 0
+    no_speech: float | None = None
+    compression: float | None = None
     for s in segments:
         logprob = s.get("avg_logprob")
         n = max(1, len(s.get("tokens") or ()))
         if logprob is not None:
             weighted, count = weighted + float(logprob) * n, count + n
-        p = s.get("no_speech_prob")
-        if p is not None:
+        if (p := s.get("no_speech_prob")) is not None:
             no_speech = float(p) if no_speech is None else max(no_speech, float(p))
-    return (weighted / count if count else None), no_speech
+        if (r := s.get("compression_ratio")) is not None:
+            compression = float(r) if compression is None else max(compression, float(r))
+    return (weighted / count if count else None), no_speech, compression
 
 
 def _squash(text: str) -> str:
@@ -270,13 +264,12 @@ def prompted_decode_failed(text: str, segments: Sequence[Mapping[str, Any]], pro
     thinks held no speech (with a prompt Whisper turns noise into "Thank you." where it otherwise says nothing)."""
     if echoes_prompt(text, prompt):
         return True
-    for s in segments:
-        if float(s.get("compression_ratio") or 0.0) > COMPRESSION_RATIO_MAX:
-            return True
-    logprob, no_speech = segment_confidence(segments)
+    logprob, no_speech, compression = segment_confidence(segments)
+    if compression is not None and compression > COMPRESSION_RATIO_MAX:
+        return True
     if logprob is not None and logprob < LOGPROB_MIN:
         return True
-    return no_speech is not None and no_speech > MISHEARD_NO_SPEECH
+    return no_speech is not None and no_speech > NO_SPEECH_MAX
 
 
 class _Whisper(SpeechRecognizer, LazyModelProvider):
@@ -308,8 +301,8 @@ class _Whisper(SpeechRecognizer, LazyModelProvider):
                     prompt = None
             if prompt is None:
                 text, segments = self._decode_locked(model, audio, language, None)
-            logprob, no_speech = segment_confidence(segments)
-            return Transcript(text, language, probability, logprob, no_speech, prompted=prompt is not None)
+            logprob, no_speech, compression = segment_confidence(segments)
+            return Transcript(text, language, probability, logprob, no_speech, compression, prompt is not None)
 
     def _language_locked(
         self, model: Any, audio: np.ndarray, languages: list[Language]

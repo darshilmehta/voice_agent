@@ -20,6 +20,7 @@ from app.providers.speech import (
     prompted_token_cap,
     segment_confidence,
 )
+from app.services.voice.speech_text import transcript_garbled
 
 from .conftest import make_model_assets
 
@@ -69,8 +70,8 @@ def test_the_spoken_languages_prompt_is_used(stt):
     t = transcribe(stt)
     assert model.decodes == [PROMPTS["hi"]]
     assert (t.text, t.language, t.prompted) == ("वाल्मोरा का revenue कितना था?", "hi", True)
-    assert (t.avg_logprob, t.no_speech_prob) == (-0.3, 0.05)
-    assert not t.likely_misheard
+    assert (t.avg_logprob, t.no_speech_prob, t.compression_ratio) == (-0.3, 0.05, 1.1)
+    assert not transcript_garbled(t)
 
 
 def test_without_prompts_one_plain_decode(stt):
@@ -104,23 +105,24 @@ def test_an_untrustworthy_prompted_decode_is_redone_without_the_prompt(stt, text
     assert (t.text, t.prompted, t.avg_logprob, t.no_speech_prob) == ("", False, None, None)
 
 
-def test_confidence_is_token_weighted_and_takes_the_highest_no_speech():
-    assert segment_confidence([seg(-0.2, 0.1, tokens=30), seg(-1.0, 0.4, tokens=10)]) == (pytest.approx(-0.4), 0.4)
-    assert segment_confidence([]) == (None, None)
+def test_confidence_is_token_weighted_and_takes_the_highest_no_speech_and_ratio():
+    segments = [seg(-0.2, 0.1, ratio=1.2, tokens=30), seg(-1.0, 0.4, ratio=2.6, tokens=10)]
+    assert segment_confidence(segments) == (pytest.approx(-0.4), 0.4, 2.6)
+    assert segment_confidence([]) == (None, None, None)
 
 
 @pytest.mark.parametrize(
-    ("transcript", "misheard"),
+    ("transcript", "garbled"),
     [
         (Transcript("What was the revenue?", "en", avg_logprob=-0.25, no_speech_prob=0.02), False),
-        (Transcript("Vamar aur jephir mean kiske", "hi", avg_logprob=-0.91, no_speech_prob=0.06), True),
-        (Transcript("Thank you.", "en", avg_logprob=-0.4, no_speech_prob=0.9), True),
-        (Transcript("", "en", avg_logprob=-2.0), False),  # nothing to repeat
+        (Transcript("What was the revenue?", "en", avg_logprob=-1.5), True),
+        (Transcript("What was the revenue?", "en", avg_logprob=-1.1, no_speech_prob=0.8), True),
+        (Transcript("What was the revenue?", "en", avg_logprob=-0.3, compression_ratio=3.0), True),
         (Transcript("Okay.", "en"), False),  # a recognizer without confidence
     ],
 )
-def test_likely_misheard(transcript, misheard):
-    assert transcript.likely_misheard is misheard
+def test_the_confidence_fields_are_the_ones_the_say_again_check_reads(transcript, garbled):
+    assert transcript_garbled(transcript) is garbled
 
 
 def test_echo_needs_two_words_of_the_prompt():

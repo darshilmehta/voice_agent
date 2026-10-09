@@ -469,6 +469,7 @@ class FakeSTT(SpeechRecognizer):
 
     def __init__(self) -> None:
         self.scripts: dict[int, str | Callable[[float], str]] = {}  # a callable gets the audio's length in ms
+        self.confidence: dict[int, dict[str, float]] = {}  # tone → Whisper's confidence fields (avg_logprob, …)
         self.calls: list[dict[str, Any]] = []
         self.cancelled = 0  # transcriptions cancelled while running (stale speculative jobs)
         self.fail_with: Exception | None = None
@@ -491,7 +492,7 @@ class FakeSTT(SpeechRecognizer):
         script = self.scripts.get(tone, "")
         text = script(ms) if callable(script) else script
         language = languages[0] if len(languages) == 1 else (message_language(text) or "en")
-        return Transcript(text, language)  # type: ignore[arg-type]
+        return Transcript(text, language, **self.confidence.get(tone, {}))  # type: ignore[arg-type]
 
 
 class FakeTTS(SpeechSynthesizer):
