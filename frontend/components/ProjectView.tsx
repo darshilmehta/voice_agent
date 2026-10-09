@@ -10,6 +10,7 @@ import { useEffect, useMemo } from "react";
 
 import type { Chat, Project } from "@/lib/api";
 import { useDocumentTitle } from "@/lib/backend-context";
+import { readyDocumentCount } from "@/lib/canvas/overview-refresh";
 import { fullDateTime, plural, relativeTime, shortDate } from "@/lib/format";
 import { chatActivity, chatsOf, keys, slotOf, useWorkspace, useWorkspaceActions } from "@/lib/workspace";
 
@@ -97,7 +98,7 @@ function ProjectPage({ project }: { project: Project }) {
         </div>
       )}
 
-      <ProjectOverview projectId={project.id} docsById={docsById} />
+      <ProjectOverview projectId={project.id} docsById={docsById} readyDocuments={readyDocumentCount(docs)} />
 
       <div className="project-layout">
         <ChatsCard project={project} />
