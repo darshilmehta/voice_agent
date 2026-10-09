@@ -155,6 +155,32 @@ def test_short_partials_of_finished_speech_wait_for_more_evidence(kw, verdict):
     assert barge_in_verdict(evidence(**kw), min_speech_ms=250, is_backchannel=False) == verdict
 
 
+@pytest.mark.parametrize(
+    ("kw", "verdict"),
+    [
+        # B3: still talking at the deadline with the snapshot's transcription still running: wait for it ...
+        ({"speech_ms": 600, "speaking": True, "deadline_passed": True, "transcribing": True}, None),
+        # ... up to the acknowledgement cap, then (nothing heard yet) stop as before
+        (
+            {"speech_ms": 1200, "speaking": True, "deadline_passed": True, "transcribing": True, "cap_passed": True},
+            "stop",
+        ),
+        ({"speech_ms": 600, "speaking": True, "deadline_passed": True, "transcribing": False}, "stop"),
+        # a transcription running doesn't hold back a decision the evidence already makes
+        ({"speech_ms": 100, "speaking": True, "deadline_passed": True, "transcribing": True}, "resume"),
+        # speech that stopped with a fuller transcript coming ("Yeah… but what about FY23?"): wait for it, at most
+        # until the cap
+        ({"speech_ms": 600, "speaking": False, "deadline_passed": True, "transcribing": True}, None),
+        (
+            {"speech_ms": 600, "speaking": False, "deadline_passed": True, "transcribing": True, "cap_passed": True},
+            "resume",
+        ),
+    ],
+)
+def test_a_transcription_still_running_at_the_deadline_is_waited_for_until_the_cap(kw, verdict):
+    assert barge_in_verdict(evidence(**kw), min_speech_ms=250, is_backchannel=None) == verdict
+
+
 # ------------------------------------------------------------------ protocol
 
 

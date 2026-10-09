@@ -6,6 +6,9 @@ Needs only Ollama (127.0.0.1:11434, the configured router model pulled); no embe
 Qdrant. Prints, per intent, how often the router model (after application validation) got the intent right, how
 often the whole router did (keyword fast path first, as in a turn), whether rewritten / English queries carry the
 expected words, and the router call's latency (wall clock, plus Ollama's prompt and output token counts and times).
+
+B1 cases (``documents_match``) also run the planner's check of "general" proposals for questions about facts against
+a cached retrieval with that score, and count how many document questions reach the documents with and without it.
 """
 
 from __future__ import annotations
@@ -26,8 +29,9 @@ from app.domain.conversation import ConversationState
 from app.domain.projects import Message
 from app.providers.base import ProviderContext
 from app.providers.llm import LLMMessage, OllamaLLM
-from app.services.planning import interrupted_answer, live_search
+from app.services.planning import TurnPlanner, interrupted_answer, live_search, policy
 from app.services.prompts import answer_system_prompt
+from app.services.retrieval import Confidence, RetrievalResult
 from app.services.router import (
     RouteRequest,
     RouterProposal,
@@ -92,6 +96,30 @@ def request_for(case: dict[str, Any]) -> RouteRequest:
     )
 
 
+class CachedRetrieval:
+    """A speculative retrieval whose best passage scores ``score`` (B1 cases)."""
+
+    def __init__(self, score: float) -> None:
+        self.score = score
+
+    async def result_for(self, query: str, query_en: str | None):
+        confidence = Confidence(self.score, self.score, 0.5, self.score >= 0.02)  # retrieval.min_rerank_score
+        return RetrievalResult(query, query_en or query, [], 8, confidence), "used"
+
+    def discard(self) -> None:
+        pass
+
+
+async def checked(decision, req: RouteRequest, score: float):
+    """The decision after the planner's B1 check against a retrieval scoring ``score``, and the answer mode."""
+    planner = TurnPlanner(None, None, timeout_s=2.5)  # type: ignore[arg-type]
+    decision, prefetched = await planner._check_facts(decision, req, CachedRetrieval(score))  # type: ignore[arg-type]
+    if prefetched is not None:
+        await prefetched
+    p = policy(decision, req, has_documents=True, retrieval_enabled=True)
+    return p.decision, p.mode
+
+
 def _contains_all(text: str | None, groups: list[list[str]]) -> bool:
     low = (text or "").casefold()
     return all(any(word.casefold() in low for word in group) for group in groups)
@@ -143,6 +171,8 @@ async def test_router_on_the_real_model(tmp_path):
         tools_ok: list[bool] = []
         web_ok: list[bool] = []
         web_queries: list[str] = []
+        b1_router: list[bool] = []
+        b1_checked: list[bool] = []
         fast = 0
         for case in CASES["cases"]:
             req = request_for(case)
@@ -176,6 +206,14 @@ async def test_router_on_the_real_model(tmp_path):
                     web_queries.append(f"{case['id']}: {web_q!r}")
                     if not web_ok[-1]:
                         misses.append(f"{case['id']}: web query {web_q!r}")
+            if "documents_match" in case:  # B1: does the turn reach the documents (or stay general, as expected)?
+                first = quick or decision
+                final, mode = await checked(first, req, case["documents_match"])
+                want_search = case.get("final") != "general"
+                b1_router.append((first.route.intent in ("document_qa", "mixed", "correction")) == want_search)
+                b1_checked.append((mode in ("grounded", "mixed")) == want_search)
+                if not b1_checked[-1]:
+                    misses.append(f"{case['id']}: after the B1 check {final.route.intent} / {mode}")
             walls.append(wall)
             prompt_tokens.append(data.get("prompt_eval_count", 0))
             prefill_ms.append(data.get("prompt_eval_duration", 0) / 1e6)
@@ -194,6 +232,12 @@ async def test_router_on_the_real_model(tmp_path):
     METRICS["router live-data tools (web_search or none)"] = f"{sum(tools_ok)}/{len(tools_ok)}"
     METRICS["router web search queries carrying the expected words"] = f"{sum(web_ok)}/{len(web_ok)}"
     METRICS["router web search queries"] = "\n  " + "\n  ".join(web_queries)
+    METRICS["B1 cases answered as they should (search the documents, or stay general): router alone"] = (
+        f"{sum(b1_router)}/{len(b1_router)}"
+    )
+    METRICS["B1 cases answered as they should: with the planner's check of general proposals"] = (
+        f"{sum(b1_checked)}/{len(b1_checked)}"
+    )
     METRICS["router call latency p50 / p95 / max (wall)"] = (
         f"{statistics.median(walls):.0f} / {_pct(walls, 0.95):.0f} / {max(walls):.0f} ms"
     )
@@ -209,6 +253,7 @@ async def test_router_on_the_real_model(tmp_path):
     assert correct / total >= MIN_INTENT_ACCURACY, misses
     assert sum(query_ok) / len(query_ok) >= MIN_QUERY_ACCURACY, misses
     assert all(tools_ok), misses  # application code decides, from the utterance and the model's English query
+    assert all(b1_checked), misses
     assert sum(web_ok) / len(web_ok) >= MIN_QUERY_ACCURACY, misses
 
 

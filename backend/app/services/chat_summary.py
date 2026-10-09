@@ -45,11 +45,13 @@ from ..settings import Language, Settings
 from .base import InvalidInput, Service, Unavailable
 from .chat_sources import ChatSources, number_markers, ref_label
 from .chats import ChatService
+from .language import script_language
 from .markdown_text import escape_block_markers, escape_inline
 from .messages import MessageService
 from .revisit_prompts import (
     FOLLOW_UP_CHARS,
     HEADINGS,
+    INTERRUPTED_LINE,
     MAX_FOLLOW_UPS,
     MAX_KEY_POINTS,
     MESSAGE_CHARS,
@@ -57,6 +59,7 @@ from .revisit_prompts import (
     OVERVIEW_CHARS,
     POINT_CHARS,
     QUESTION_CHARS,
+    SUMMARY_LANGUAGE_INSISTENCE,
     SUMMARY_PROMPT_VERSION,
     DraftPoint,
     SummaryDraft,
@@ -66,7 +69,7 @@ from .revisit_prompts import (
     summary_system_prompt,
     summary_user_prompt,
 )
-from .sources import estimate_tokens
+from .sources import estimate_tokens, says_not_covered
 from .summaries import SummaryService
 
 log = logging.getLogger(__name__)
@@ -126,8 +129,9 @@ def prepare(messages: Sequence[Message]) -> Prepared:
             last_user = m
             lines.append(_line(m.seq, f"#{m.seq} User: {_flat(m.text, MESSAGE_CHARS)}"))
         elif m.role == "agent":
-            mapping = sources.register(m.seq, m.citations)
             route = m.route or {}
+            # Numbered like the transcript export (every answer's citations), even when the line shows no markers.
+            mapping = sources.register(m.seq, m.citations)
             uncovered = route.get("abstained") is True or route.get("general_note") == "not_covered"
             if uncovered and last_user is not None:
                 question = _flat(last_user.text, QUESTION_CHARS)
@@ -137,9 +141,11 @@ def prepare(messages: Sequence[Message]) -> Prepared:
             if route.get("abstained") is True:
                 lines.append(_line(m.seq, f"#{m.seq} Assistant: {NO_ANSWER_LINE}"))
                 continue
-            heard = m.heard_text is not None
-            body = _flat(number_markers(m.heard_text if heard else m.text, mapping), MESSAGE_CHARS)
-            label = "Assistant (interrupted: the user heard only this)" if heard else "Assistant"
+            if m.heard_text is not None:  # cut off (B7): a fragment is never a source of facts
+                lines.append(_line(m.seq, f"#{m.seq} Assistant: {INTERRUPTED_LINE}"))
+                continue
+            body = _flat(number_markers(m.text, mapping), MESSAGE_CHARS)
+            label = "Assistant"
             if route.get("answer") == "general" or route.get("general_note") == "not_covered":
                 label += " (general knowledge, not from the documents)"
             if route.get("web_sources"):  # live data (§3.7): its web sources are numbered like the documents
@@ -196,23 +202,45 @@ def _clip(text: str, limit: int) -> str:
     return (cut[:space] if space > limit // 2 else cut).rstrip(" ,;:।") + "…"
 
 
+_POINT_WORD = re.compile(r"[\w\u0900-\u097F%.,₹]+")
+
+
+def _point_words(text: str) -> set[str]:
+    return {w.strip(".,").casefold() for w in _POINT_WORD.findall(text) if w.strip(".,")}
+
+
+def _same_point(a: set[str], b: set[str]) -> bool:
+    """Two key points that say the same thing: one's words all in the other, or nearly the same words."""
+    if not a or not b:
+        return False
+    return a <= b or b <= a or len(a & b) / len(a | b) >= 0.75
+
+
 def ground(draft: SummaryDraft, allowed: set[int]) -> SummaryDraft:
     """The draft cleaned up and grounded: texts trimmed and limited in number and length, ``[n]`` markers the model
     wrote inside a point's text moved to its sources, and every source number that is not in ``allowed`` (the numbers
-    in the text the model was shown) dropped."""
+    in the text the model was shown) dropped. Points that repeat an earlier one (same words, or nearly) are merged
+    into it, and points that only say the documents don't cover something are dropped: they are no finding, and the
+    unanswered questions are listed apart (B8: such a point came with a page chip)."""
     points: list[DraftPoint] = []
-    seen: set[str] = set()
+    words: list[set[str]] = []
     dropped = 0
     for p in draft.key_points:
         inline = [int(n) for n in _MARK.findall(p.text)]
         text = _clip(_INLINE_MARK.sub("", p.text), POINT_CHARS)
-        if not text or text.casefold() in seen:
+        if not text or says_not_covered(text) or INTERRUPTED_LINE in text or NO_ANSWER_LINE in text:
             continue
-        seen.add(text.casefold())
         numbers = list(dict.fromkeys([*p.sources, *inline]))
         kept = [n for n in numbers if n in allowed]
         dropped += len(numbers) - len(kept)
+        these = _point_words(text)
+        same = next((i for i, w in enumerate(words) if _same_point(w, these)), None)
+        if same is not None:  # a repeat: its sources join the first one's
+            first = points[same]
+            points[same] = DraftPoint(text=first.text, sources=list(dict.fromkeys([*first.sources, *kept])))
+            continue
         points.append(DraftPoint(text=text, sources=kept))
+        words.append(these)
         if len(points) == MAX_KEY_POINTS:
             break
     follow_ups = list(
@@ -392,9 +420,11 @@ class ChatSummarizer(Service):
             numbers = {n for line in window for n in line.numbers}
             prompt = [
                 LLMMessage("system", summary_system_prompt(language)),
-                LLMMessage("user", summary_user_prompt([line.text for line in window], _legend(sources, numbers))),
+                LLMMessage(
+                    "user", summary_user_prompt([line.text for line in window], _legend(sources, numbers), language)
+                ),
             ]
-            partials.append(await self._ask(prompt, numbers))
+            partials.append(await self._ask(prompt, numbers, language))
         draft = partials[0] if len(partials) == 1 else await self._reduce(partials, sources, language)
         log.info(
             "chat summary: %d messages in %d window(s), %d key points",
@@ -438,13 +468,25 @@ class ChatSummarizer(Service):
             return drafts[0]
         prompt = [
             LLMMessage("system", reduce_system_prompt(language)),
-            LLMMessage("user", reduce_user_prompt(texts, _legend(sources, numbers))),
+            LLMMessage("user", reduce_user_prompt(texts, _legend(sources, numbers), language)),
         ]
-        return await self._ask(prompt, numbers)
+        return await self._ask(prompt, numbers, language)
 
-    async def _ask(self, prompt: list[LLMMessage], allowed: set[int]) -> SummaryDraft:
+    async def _ask(self, prompt: list[LLMMessage], allowed: set[int], language: Language = "en") -> SummaryDraft:
         """One structured call: the model's JSON validated as a ``SummaryDraft`` (one retry when it doesn't validate),
-        cleaned and grounded to ``allowed`` source numbers."""
+        cleaned and grounded to ``allowed`` source numbers. A Hindi summary written in English is asked for once more,
+        insisting on Hindi (B8); if it is still English, it stands."""
+        draft = await self._ask_once(prompt, allowed)
+        if language == "hi" and _mostly_english(draft):
+            *head, last = prompt
+            again = [*head, LLMMessage(last.role, f"{last.content}\n\n{SUMMARY_LANGUAGE_INSISTENCE}")]
+            log.info("summary: asked for Hindi, written in English: asking again")
+            retry = await self._ask_once(again, allowed)
+            if not _mostly_english(retry):
+                return retry
+        return draft
+
+    async def _ask_once(self, prompt: list[LLMMessage], allowed: set[int]) -> SummaryDraft:
         error: Exception | None = None
         for _ in range(LLM_ATTEMPTS):
             try:
@@ -459,6 +501,13 @@ class ChatSummarizer(Service):
                 raise Unavailable(f"summary generation failed: {type(e).__name__}: {e}") from e
             return ground(draft, allowed)
         raise Unavailable(f"summary generation failed: {error}")
+
+
+def _mostly_english(draft: SummaryDraft) -> bool:
+    """The overview, or half the key points, written in English (Latin script)."""
+    texts = [p.text for p in draft.key_points]
+    english = sum(script_language(t) == "en" for t in texts)
+    return script_language(draft.overview) == "en" or (bool(texts) and english * 2 >= len(texts))
 
 
 def _legend(sources: ChatSources, numbers: set[int]) -> list[str]:

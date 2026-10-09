@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import stat
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -206,8 +207,9 @@ def test_7_the_playback_fallback_follows_the_audio_as_it_was_sent(voice, monkeyp
         second_chunk = time.monotonic()  # the client starts playing the 1.6 s second chunk now
         c.until(is_state("listening"), timeout=8)
         waited = time.monotonic() - second_chunk
-    # gapless arithmetic (first audio + 1.7 s + grace) would end the turn ~0.8 s too early, mid-chunk
-    assert waited >= 1.6 + 0.3 - 0.1, waited
+    # gapless arithmetic (first audio + 1.7 s + grace) would end the turn ~0.8 s too early, mid-chunk (waited ≈ 1.1 s).
+    # The client's clock starts when it receives the frame, a little after the server sent it, so allow 0.25 s.
+    assert waited >= 1.6 + 0.3 - 0.25, waited
 
 
 def test_7_playback_reports_push_the_fallback_back(voice, monkeypatch):
@@ -503,7 +505,115 @@ def test_D_an_interruption_confirmed_after_a_resumed_barge_in_uses_the_current_p
         items = c.until("agent_message", timeout=5)
         assert one(items, "barge_in") == {"type": "barge_in", "turn_id": 1, "decision": "stop"}
         stopped = one(items, "agent_message")["message"]
-    # 200 ms reported plus the 1.3 s or so that have passed since: 6+ words of the answer, not the 0 of the old 50 ms
+    # 200 ms reported plus the time since (the answer is now stopped while the user is still talking, B3): 2+ words of
+    # the answer, not the 0 of the old 50 ms
     assert stopped["route"]["interrupted"] == "barge_in"
-    assert len(stopped["heard_text"].split()) >= 6
-    assert stopped["heard_text"].startswith("The EBITDA margin was 18.2%")
+    assert len(stopped["heard_text"].split()) >= 2
+    assert stopped["heard_text"].startswith("The EBITDA")
+
+
+# ------------------------------------------------------------------ quality round: B3
+
+LONG_REPLY = (  # 3.3 s of speech: still playing while the user talks over it
+    "The EBITDA margin was 18.2% in the last fiscal year [S1]. Revenue grew 34% over the same period according to "
+    "the table [S2]. The board approved a dividend of two rupees per share."
+)
+
+
+def decide_while_speaking(c: VoiceClient, pcm: bytes) -> tuple[list, float]:
+    """Send ``pcm`` in real time from another thread; the messages up to the barge-in decision and how long after
+    the audio started it came."""
+    sender = threading.Thread(target=paced, args=(c, pcm))
+    t0 = time.monotonic()
+    sender.start()
+    items = c.until("barge_in", timeout=6)
+    elapsed = time.monotonic() - t0
+    sender.join()
+    return items + c.quiet(0.9), elapsed
+
+
+@pytest.mark.parametrize("stt_s", [0.5, 0.6])  # the 250 ms snapshot's transcript: after the 700 ms deadline
+def test_B3_yeah_right_with_a_snapshot_transcript_after_the_deadline_doesnt_cut_the_answer(voice, stt_s):
+    """Found in the real run: "Yeah, right" cut the answer in 3 of 4 trials: under load no transcript had arrived by
+    the 700 ms deadline, and "still talking, no transcript yet" stopped it. A transcription still running is now waited
+    for, up to the acknowledgement cap (~1.4 s)."""
+    voice.fakes.stt.delay = stt_s
+    items = speaking_over_the_answer(voice, lambda ms: "Yeah." if ms < 1000 else "Yeah, right.")
+    assert one(items, "barge_in") == {"type": "barge_in", "turn_id": 1, "decision": "resume"}
+    assert not of(items, "user_message") and not of(items, "agent_message")
+    assert [r[0] for r in roles(voice)] == ["user", "agent"]
+
+
+def test_B3_real_words_still_stop_when_the_transcripts_are_slow(voice):
+    voice.fakes.stt.delay = 0.5
+    items = speaking_over_the_answer(voice, lambda ms: "Yeah." if ms < 600 else "Yeah, but what about FY23?")
+    assert one(items, "barge_in") == {"type": "barge_in", "turn_id": 1, "decision": "stop"}
+
+
+def test_B3_no_transcript_by_the_cap_still_stops(voice):
+    voice.fakes.llm.reply = LONG_REPLY
+    voice.fakes.stt.scripts[SAID] = "But what about FY23?"
+    with voice.connect() as ws:
+        c = VoiceClient(ws)
+        c.start()
+        c.say(QUESTION)
+        c.until("agent_message")
+        voice.fakes.stt.delay = 3.0  # the transcription never arrives in time
+        c.send("barge_in_start", turn_id=1, played_ms=300)
+        items, elapsed = decide_while_speaking(c, speech_audio(1800, SAID) + silence(800))
+    assert one(items, "barge_in")["decision"] == "stop"
+    assert 1.3 < elapsed < 1.9  # the cap (2 x 700 ms), not later
+
+
+def test_B3_after_a_resume_real_words_stop_the_answer_while_the_user_is_still_talking(voice):
+    """Found in the real run: "No (pause) wait, I meant…" got `resume` at the deadline (the pause) and the agent talked
+    over the user for 4.6 s, until the sentence ended. Speech after a resume is transcribed again as it goes on."""
+    voice.fakes.llm.reply = LONG_REPLY
+    voice.fakes.stt.scripts[SAID] = lambda ms: "Mm." if ms < 700 else "No wait, I meant the EBITDA margin"
+    with voice.connect() as ws:
+        c = VoiceClient(ws)
+        c.start()
+        c.say(QUESTION)
+        c.until("agent_message")
+        c.send("barge_in_start", turn_id=1, played_ms=50)
+        paced(c, speech_audio(300, SAID) + silence(250))  # "No" (pause) at the deadline
+        assert c.until("barge_in")[-1]["decision"] == "resume"
+        c.send("playback", turn_id=1, played_ms=200)
+        items, elapsed = decide_while_speaking(c, speech_audio(1500, SAID) + silence(800))
+        if not of(items, "agent_message"):
+            items += c.until("agent_message")
+    kinds_ = [m["type"] if isinstance(m, dict) else "frame" for m in items]
+    assert one(items, "barge_in") == {"type": "barge_in", "turn_id": 1, "decision": "stop"}
+    assert elapsed < 1.0  # while the user is still talking (1.5 s), not after the sentence ends
+    speech_end = next(i for i, m in enumerate(items) if m == {"type": "user_speech", "phase": "end"})
+    assert kinds_.index("barge_in") < speech_end
+    stopped = of(items, "agent_message")[0]["message"]  # then the correction is answered
+    assert stopped["route"]["interrupted"] == "barge_in" and stopped["heard_text"].startswith("The EBITDA")
+    assert len(stopped["heard_text"].split()) < 12  # cut early: about 1 s of the 3.3 s answer
+
+
+def test_B3_real_words_over_the_answer_stop_it_even_without_barge_in_start(voice):
+    voice.fakes.llm.reply = LONG_REPLY
+    voice.fakes.stt.scripts[SAID] = "But what about the FY23 margin then?"
+    with voice.connect() as ws:
+        c = VoiceClient(ws)
+        c.start()
+        c.say(QUESTION)
+        c.until("agent_message")  # the client's VAD misses the user's speech: no barge_in_start
+        items, elapsed = decide_while_speaking(c, speech_audio(1600, SAID) + silence(800))
+    assert one(items, "barge_in") == {"type": "barge_in", "turn_id": 1, "decision": "stop"}
+    assert elapsed < 1.2  # from 700 ms of speech, not at the end of the sentence (1.6 s + 0.6 s)
+
+
+def test_B3_a_long_acknowledgement_over_the_answer_doesnt_stop_it(voice):
+    voice.fakes.llm.reply = LONG_REPLY
+    voice.fakes.stt.scripts[SAID] = "Yeah, right, okay, sure."
+    with voice.connect() as ws:
+        c = VoiceClient(ws)
+        c.start()
+        c.say(QUESTION)
+        c.until("agent_message")
+        paced(c, speech_audio(1400, SAID) + silence(800))
+        items = c.quiet(0.8)
+    assert not of(items, "barge_in") and not of(items, "user_message")
+    assert [r[0] for r in roles(voice)] == ["user", "agent"]

@@ -183,7 +183,8 @@ class BargeInEvidence:
     ended: bool  # the utterance is over (end of turn, final transcript known)
     deadline_passed: bool  # decision_timeout_ms since barge_in_start
     real_words: int = 0  # words of the transcript that are neither hums ("M M") nor Whisper noise
-    cap_passed: bool = False  # the extended deadline for speech that is still only acknowledgements has passed
+    cap_passed: bool = False  # the extended deadline (acknowledgements, or a transcription still running) has passed
+    transcribing: bool = False  # a transcription of this speech is running (its result may come after the deadline)
 
 
 Verdict = Literal["stop", "resume"]
@@ -202,8 +203,11 @@ def barge_in_verdict(evidence: BargeInEvidence, *, min_speech_ms: float, is_back
                         a short burst that has stopped                 → resume; if its final transcript turns out not
                                                                          to be a backchannel, the session still stops
                                                                          the answer when the utterance ends
-                        still talking, no transcript yet (or not a    → stop
-                        backchannel)
+                        a transcription still running (B3: under      → wait for it, until the extended deadline;
+                        load the snapshot of "Yeah, right" often        at the cap the rules below decide (no
+                        comes after the deadline)                       transcript, still talking → stop)
+                        still talking, no transcript and none coming, → stop
+                        or not a backchannel
                         still talking, but only acknowledgements so    → wait until the extended deadline (the session
                         far ("Yeah…" of "Yeah, right")                   transcribes again meanwhile), then resume:
                                                                          only real words stop the answer
@@ -215,7 +219,11 @@ def barge_in_verdict(evidence: BargeInEvidence, *, min_speech_ms: float, is_back
         return "resume"
     if not evidence.deadline_passed:
         return None
-    if evidence.speech_ms < min_speech_ms or not evidence.speaking:
+    if evidence.speech_ms < min_speech_ms:
+        return "resume"
+    if evidence.transcribing and not evidence.cap_passed:
+        return None  # a (fuller) transcript is coming: decide on it, at the latest at the cap
+    if not evidence.speaking:
         return "resume"
     if evidence.transcript is not None and is_backchannel:
         return "resume" if evidence.cap_passed else None

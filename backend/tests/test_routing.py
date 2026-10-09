@@ -192,6 +192,56 @@ def test_a_language_request_alone_repeats_the_previous_question_or_is_acknowledg
     assert fast_route(request("answer in Hindi: what was the revenue?", language="hi")) is None  # asks more
 
 
+def test_b5_asked_for_english_the_previous_hinglish_question_is_asked_again_in_english():
+    hinglish = [
+        msg("user", "FY24 mein revenue kitna tha?", seq=1),
+        msg("agent", "FY24 में राजस्व ₹ 7,365 करोड़ था।", seq=2, answer="grounded", query_en="What was revenue in FY24?"),
+    ]
+    decision = fast_route(request("answer in English please", hinglish, language="en"))
+    assert decision is not None and decision.language_request
+    assert (decision.route.rewritten_query, decision.route.query_en) == ("What was revenue in FY24?", None)
+    # asked for Hindi, the question keeps its own words and its English search query
+    decision = fast_route(request("हिंदी में बताइए", hinglish, language="hi"))
+    assert decision is not None and decision.language_request
+    assert (decision.route.rewritten_query, decision.route.query_en) == (
+        "FY24 mein revenue kitna tha?",
+        "What was revenue in FY24?",
+    )
+
+
+@pytest.mark.parametrize(
+    ("expected", "pieces", "verdict"),
+    [
+        ("en", ["The EBITDA ", "margin was 18.2%"], True),
+        ("en", ["FY24 में ", "राजस्व"], False),  # asked for English, written in Hindi
+        ("en", ["₹ 7,365 ", "crore [S1]."], None),  # too few letters yet
+        ("hi", ["FY24 में ", "EBITDA"], True),
+        ("hi", ["EBITDA margin FY24 ", "Valmora revenue grew"], False),  # 24+ Latin letters, no Devanagari
+        ("hi", ["EBITDA मार्जिन"], True),
+    ],
+)
+def test_b5_script_check(expected, pieces, verdict):
+    from app.services.language import ScriptCheck
+
+    check = ScriptCheck(expected)
+    for piece in pieces:
+        check.feed(piece)
+    assert check.verdict == verdict
+
+
+def test_b5_script_check_decides_short_answers_at_the_end():
+    from app.services.language import ScriptCheck, script_language
+
+    short = ScriptCheck("hi")
+    short.feed("Yes, 18.2%.")
+    assert short.verdict is None and short.finish() is None  # "Yes" alone: can't tell
+    english = ScriptCheck("hi")
+    english.feed("It was about 18.2% then.")
+    assert english.finish() is False
+    assert script_language("FY24 में EBITDA 21.0% था") == "hi" and script_language("₹ 7,365 [S1]") is None
+    assert script_language("Revenue was 7,365 crore") == "en"
+
+
 @pytest.mark.parametrize(
     ("text", "kind"),
     [

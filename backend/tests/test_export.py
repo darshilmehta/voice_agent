@@ -167,8 +167,7 @@ async def test_markdown_with_a_summary_numbers_its_citations_like_the_transcript
         "\n"
         "### Key points\n"
         "\n"
-        "- The EBITDA margin in FY24 was 18.2%. [1]\n"  # only what was heard, and what that cites
-        "- राजस्व 34% बढ़ा। [3]\n"
+        "- राजस्व 34% बढ़ा। [3]\n"  # the interrupted answer is no source of facts (B7); numbers as in the export
         "\n"
         "### Questions the documents couldn't answer\n"
         "\n"
@@ -345,10 +344,9 @@ async def test_json_includes_the_summary(story):
     assert s["content"] == stored.content and s["unanswered_questions"] == [
         {"question": "# CEO salary?\n```\nx".replace("\n", " "), "message_seq": 5}
     ]
-    assert s["key_points"][0]["sources"] == [  # the interrupted answer was summarised as heard: only [S1]
-        {"ref": 1, "document_id": "doc_report", "filename": "annual_report.pdf", "page_start": 2, "page_end": 2},
-    ]
-    assert s["key_points"][1]["sources"][0]["ref"] == 3
+    # the interrupted answer is no source of facts (B7): the one key point is the Hindi answer's, numbered [3] as in
+    # the transcript's sources list
+    assert [p["sources"][0]["ref"] for p in s["key_points"]] == [3]
 
 
 # ------------------------------------------------------------------ file names and headers

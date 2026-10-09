@@ -76,7 +76,13 @@ from .base import InvalidInput
 from .chats import ChatService
 from .conversation import ConversationStateService, TurnOutcome, state_writes
 from .documents import DocumentService
-from .language import asked_language, decide_language, message_language
+from .language import (
+    ScriptCheck,
+    asked_language,
+    decide_language,
+    message_language,
+    script_language,
+)
 from .live_data import LiveNote
 from .memory import MemoryKeeper, chat_activity
 from .messages import MessageService
@@ -101,6 +107,8 @@ from .prompts import (
     conversation_system_prompt,
     general_system_prompt,
     general_user_prompt,
+    insist_on_language,
+    language_request_note,
     live_notice,
     live_system_prompt,
     live_user_prefix,
@@ -110,7 +118,7 @@ from .prompts import (
 )
 from .retrieval import Confidence, RetrievalResult, RetrievalService, SpeculationOutcome
 from .router import LLMTurnRouter, RouteRequest, TurnRouter, heard
-from .sources import Source, build_sources, finalize_answer, strip_markers, trim_open_marker
+from .sources import Source, build_sources, finalize_answer, says_not_covered, strip_markers, trim_open_marker
 from .web_search import ToolEvent, WebSearchRun, WebSource
 
 log = logging.getLogger(__name__)
@@ -134,7 +142,12 @@ __all__ = [  # the turn API used by the transports, and the router slot (phase 1
 ]
 
 TEXT_MAX = 4000
-HISTORY_MESSAGES = 6  # recent messages sent as conversation context (three exchanges)
+# Recent messages sent as conversation context: at least HISTORY_MIN, and the window's start moves HISTORY_STEP
+# messages at a time, so between moves the prompt's history only grows at its end and Ollama's prompt cache keeps
+# all of it (a window sliding by one message every turn made the model read the whole history again, §9.5).
+HISTORY_MIN = 4  # two exchanges
+HISTORY_STEP = 4
+HISTORY_MESSAGES = HISTORY_MIN + HISTORY_STEP - 1  # the most the window holds (7)
 HISTORY_CHARS = 1000  # per message
 SHORT_REPLY_TOKENS = 96  # conversation replies and clarifying questions: one sentence
 CONTINUATION_TOKENS = 96  # one sentence about results that arrived after the answer started (§3.7)
@@ -326,6 +339,8 @@ class _Progress:
     answered: bool = False  # the answer's text is complete (a live-data continuation may still follow)
     llm_ms: float | None = None  # the answer's generation time, once complete
     notice: LiveNote | None = None  # the live-data notice the answer started with
+    language_retry: bool = False  # the answer came out in the wrong script and was asked again (B5)
+    name_documents: bool = False  # the answer says which document its figures come from (UX5)
 
     @property
     def citable(self) -> list[Source | WebSource]:
@@ -414,7 +429,9 @@ class ChatTurnService:
         self.web_search = web_search  # None: no live-data tool (questions that want live data say so)
         self.router: TurnRouter = router if router is not None else LLMTurnRouter(llm)
         self.planner = TurnPlanner(retrieval, self.router, timeout_s=settings.llm.router_timeout_ms / 1000)
-        self.memory = MemoryKeeper(db, llm, settings, window=HISTORY_MESSAGES)
+        # The memory summary starts once the chat outgrows six messages: by the time the window's start moves past
+        # a message (the 9th message moves it to the 5th), the summary has covered it.
+        self.memory = MemoryKeeper(db, llm, settings, window=6)
 
     @classmethod
     def from_container(cls, container: Container) -> ChatTurnService:
@@ -528,7 +545,7 @@ class ChatTurnService:
                 async for event in events:
                     yield event
         finally:
-            job = functools.partial(self.memory.refresh_if_due, turn.chat.id)
+            job = functools.partial(self._after_turn, turn)
             activity.turn_finished(turn.chat.id, job, spawn=detach)
 
     async def _run(self, turn: Turn, stop: AnswerStop | None, user: Message | None) -> AsyncGenerator[ChatEvent, None]:
@@ -663,10 +680,17 @@ class ChatTurnService:
         covered = plan.needs_retrieval and confidence is not None and confidence.above_threshold
         if covered:
             assert p.result is not None
+            style = ANSWER_LENGTHS[turn.length]
+            budget = self.settings.retrieval.context_token_budget
             p.sources = build_sources(
-                p.result.chunks, ready, budget_tokens=self.settings.retrieval.context_token_budget
+                p.result.chunks,
+                ready,
+                budget_tokens=min(budget, style.context_tokens or budget),
+                max_sources=style.max_sources,
+                best_budget_tokens=budget,
             )
             p.documents_part = "sources"
+            p.name_documents = self._name_documents(p)
         elif plan.needs_retrieval:
             p.documents_part = "not_covered"
 
@@ -722,12 +746,11 @@ class ChatTurnService:
         p.llm_start = time.perf_counter()
         prompt = self._prompt(turn, plan, history, p.sources, p.memory, p)
         short = plan.mode in ("conversation", "clarification")
-        stream = self.llm.stream(
-            prompt, max_tokens=SHORT_REPLY_TOKENS if short else ANSWER_LENGTHS[turn.length].max_tokens
-        )
+        max_tokens = SHORT_REPLY_TOKENS if short else ANSWER_LENGTHS[turn.length].max_tokens
+        stream = self._answer_stream(prompt, plan.language, max_tokens, p)
         model_parts: list[str] = []
         try:
-            async with contextlib.aclosing(stream):  # type: ignore[type-var]  (closing the stream stops generation)
+            async with contextlib.aclosing(stream):  # closing the stream stops generation
                 async for piece in stream:
                     if p.first_delta_ms is None:
                         p.first_delta_ms = clock.ms()
@@ -763,10 +786,53 @@ class ChatTurnService:
             return
         if (p.sources or p.web_sources) and not citations:
             log.info("chat %s: answer cites no source", chat.id)
-        route = self._route(turn, p, abstained=False, reason=None)
+        if plan.mode == "grounded" and not citations and not p.web_sources and says_not_covered(answer):
+            # The documents passed the gate but the answer says they don't cover it (B9): it is an abstention, listed
+            # among the summary's unanswered questions, not an answer.
+            p.abstained, p.reason = True, "not_covered"
+        route = self._route(turn, p, abstained=p.abstained, reason=p.reason)
+        if p.abstained:
+            route["abstained_by"] = "answer"  # the gate let it through; the answer itself said so
         latency = self._latency(clock, p, first_delta_ms=p.first_delta_ms, llm_ms=llm_ms)
         async for event in self._save_answer(turn, answer, citations, route, latency, p):
             yield event
+
+    async def _answer_stream(
+        self, prompt: list[LLMMessage], language: Language, max_tokens: int, p: _Progress
+    ) -> AsyncGenerator[str, None]:
+        """The model's answer, in the answer language (B5). Its first letters are held back until they tell the script
+        (``ScriptCheck``: two words or so of English, the first Devanagari word of Hindi) and then sent as one piece;
+        in the wrong script the stream is closed and the model asked once more, insisting on the language. If it
+        still answers in the other script, that answer stands, and is saved (and spoken) as what it is
+        (``script_language``)."""
+        for attempt in (1, 2):
+            check = ScriptCheck(language)
+            held: list[str] = []
+            wrong = False
+            stream = self.llm.stream(prompt, max_tokens=max_tokens)
+            async with contextlib.aclosing(stream):  # type: ignore[type-var]  (closing the stream stops generation)
+                async for piece in stream:
+                    if check.verdict is not None:
+                        yield piece
+                        continue
+                    held.append(piece)
+                    if check.feed(piece) is None:
+                        continue
+                    if check.verdict is False and attempt == 1:
+                        wrong = True
+                        break
+                    yield "".join(held)
+                    held = []
+            if not wrong and attempt == 1 and check.finish() is False:
+                wrong = True
+            if wrong:
+                log.info("answer in the wrong script for %s (%r): asking again", language, "".join(held)[:80])
+                p.language_retry = True
+                prompt = insist_on_language(prompt, language)
+                continue
+            if held:
+                yield "".join(held)
+            return
 
     # -------------------------------------------------------------- live data (§3.7)
 
@@ -839,13 +905,29 @@ class ChatTurnService:
     # -------------------------------------------------------------- helpers
 
     async def _retrieve(self, plan: TurnPlan, p: _Progress, chat: Chat) -> RetrievalResult:
-        """The plan's retrieval: the speculative one when the route kept its query, else a new one."""
+        """The plan's retrieval: the one already run while routing (B1), the speculative one when the route kept its
+        query, else a new one."""
+        if plan.prefetched is not None:
+            result, p.speculation = await plan.prefetched
+            return result
         if plan.speculation is not None:
             result, p.speculation = await plan.speculation.result_for(plan.query, plan.query_en)
             return result
         return await self.retrieval.retrieve(
             plan.query, project_id=chat.project_id, document_ids=list(p.ready), query_en=plan.query_en
         )
+
+    @staticmethod
+    def _name_documents(p: _Progress) -> bool:
+        """Should the answer say which document its figures come from (UX5)? When its sources come from more than one
+        document, or from one that isn't the obvious one: the chat searches several documents and the conversation
+        wasn't about this one (two reports with the same metrics: "revenue FY24" answered from the other company's
+        report without saying so)."""
+        documents = list(dict.fromkeys(s.chunk.document_id for s in p.sources))
+        if len(documents) > 1:
+            return True
+        active = p.state.active_document_ids if p.state is not None else []
+        return len(p.ready) > 1 and bool(documents) and documents[0] not in active
 
     @staticmethod
     def _fixed_reply(plan: TurnPlan, p: _Progress) -> str:
@@ -856,11 +938,36 @@ class ChatTurnService:
         topic = state.document_topic if state is not None else None
         return resume_text(plan.language, topic, active or list(p.ready.values()))
 
+    async def _after_turn(self, turn: Turn) -> None:
+        """After a turn, while its answer is spoken and nobody is asking yet (``ChatActivity``: cancelled the moment
+        the next turn starts): refresh the memory summary if it is due, then have the model read the next answer's
+        prompt prefix (system prompt, memory, history up to this answer), so the next answer reads only its evidence
+        and question (§9.5)."""
+        await self.memory.refresh_if_due(turn.chat.id)
+        await self._warm_next_prompt(turn)
+
+    async def _warm_next_prompt(self, turn: Turn) -> None:
+        chat = await self.chats.get(turn.chat.id)
+        state = await self.states.get(chat.id)
+        language = state.preferred_language or self._fallback_language(chat, state)
+        history = await self._history(chat.id, before=chat.message_count + 1)
+        if not history:
+            return
+        system = answer_system_prompt(language, turn.length)  # most next turns are document questions
+        messages = [*self._context(system, history, await self.memory.current(chat.id)), LLMMessage("user", "Sources:")]
+        await self.llm.warm_up([messages])
+
     async def _history(self, chat_id: str, *, before: int) -> list[Message]:
-        """Recent user and agent messages, oldest first, without "stop" turns (they got no answer)."""
+        """Recent user and agent messages, oldest first, without "stop" turns (they got no answer): the messages from
+        the window's start (``HISTORY_MIN``/``HISTORY_STEP`` above) up to ``before``."""
         if before <= 1:
             return []
-        items = (await self.messages.list(chat_id, before=before, limit=HISTORY_MESSAGES)).items
+        start = max(1, (before - 1 - HISTORY_MIN) // HISTORY_STEP * HISTORY_STEP + 1)
+        items = [
+            m
+            for m in (await self.messages.list(chat_id, before=before, limit=HISTORY_MESSAGES)).items
+            if m.seq >= start
+        ]
         kept = []
         for i, m in enumerate(items):
             if m.role == "event":
@@ -901,7 +1008,9 @@ class ChatTurnService:
                 live_note=notice,
                 live_hint=plan.live_hint and notice is None,
             )
-            question = answer_user_prompt(plan.query, sources, language)
+            question = answer_user_prompt(
+                plan.query, sources, language, name_documents=p is not None and p.name_documents
+            )
         elif plan.mode == "general":
             notice = p.notice if p is not None else None
             system = general_system_prompt(language, length, plan.general_note, live_note=notice)
@@ -910,6 +1019,8 @@ class ChatTurnService:
             system, question = clarification_system_prompt(language), turn.text
         else:
             system, question = conversation_system_prompt(language), turn.text
+        if plan.language_request:
+            question = f"{question}\n\n{language_request_note(language)}"
         return [*self._context(system, history, memory), LLMMessage("user", question)]
 
     @staticmethod
@@ -985,6 +1096,8 @@ class ChatTurnService:
             "input_language": turn.input_language or message_language(turn.text),
             "route_confidence": route.confidence if route is not None else None,
             "answer": plan.mode,
+            "language_retry": p.language_retry,
+            "named_documents": p.name_documents,
             "general_note": plan.general_note,
             "router": plan.decision.record() if plan.decision is not None else None,
             "speculation": p.speculation,
@@ -1075,7 +1188,7 @@ class ChatTurnService:
                 role=role,
                 text=answer,
                 modality=turn.modality,
-                language=p.plan.language,
+                language=script_language(answer) or p.plan.language,
                 citations=citations,
                 route=route,
                 latency=latency,
@@ -1119,7 +1232,7 @@ class ChatTurnService:
                 text=text,
                 modality=turn.modality,
                 heard_text=stop.heard_text if stop is not None else None,
-                language=p.plan.language,
+                language=script_language(text) or p.plan.language,
                 citations=citations,
                 route=route,
                 latency=latency,
@@ -1149,7 +1262,7 @@ class ChatTurnService:
                 role="agent",
                 text=text,
                 modality=turn.modality,
-                language=p.plan.language,
+                language=script_language(text) or p.plan.language,
                 citations=citations,
                 route=route,
                 latency=latency,

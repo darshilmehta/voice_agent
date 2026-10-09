@@ -161,6 +161,49 @@ async def test_preload_failures_are_llm_errors(load_local):
         await down.preload()
 
 
+# ------------------------------------------------------------------ one model load (B6)
+
+
+async def test_every_request_keeps_the_same_context_size_and_keep_alive(load_local):
+    """Ollama reloads the model when a request asks for another num_ctx: router, answers, titles, summaries, memory,
+    warm-ups and preload all take it from one place."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.path == "/api/generate":
+            return httpx.Response(200, json={"done": True})
+        if body.get("format"):
+            content = '{"intent": "document_qa", "needs_retrieval": true}'
+            return httpx.Response(200, json={"message": {"role": "assistant", "content": content}, "done": True})
+        return httpx.Response(200, content=chunks("ok"))
+
+    llm, rec = make_llm(load_local, respond)
+    await llm.preload()
+    await collect(llm, max_tokens=384)  # an answer
+    await llm.generate(MESSAGES, temperature=0.1, max_tokens=200)  # memory summary, title
+    await llm.generate_json(MESSAGES, Route, max_tokens=96)  # router
+    await llm.generate_json(MESSAGES, Route, model="qwen3:4b-instruct")  # chat summary
+    await llm.warm_up([MESSAGES, MESSAGES])
+    bodies = [rec.body(i) for i in range(len(rec.requests))]
+    assert len(bodies) == 7
+    assert {b["options"]["num_ctx"] for b in bodies} == {8192}
+    assert {b["keep_alive"] for b in bodies} == {"30m"}
+    assert [b["options"].get("num_predict") for b in bodies[-2:]] == [1, 1]  # warm-ups read, they don't write
+
+
+async def test_warm_prompts_reads_the_router_and_answer_prompts_once(load_local):
+    from app.services.preload import warm_prompts
+    from app.services.prompts import answer_system_prompt
+    from app.services.router import ROUTER_SYSTEM_PROMPT
+
+    llm, rec = make_llm(load_local, lambda r: httpx.Response(200, content=chunks("ok")))
+    await warm_prompts(llm, load_local())
+    systems = [rec.body(i)["messages"][0]["content"] for i in range(len(rec.requests))]
+    # the answer's system prompt is the same in English and Hindi (the question asks for the language): read once
+    assert systems == [ROUTER_SYSTEM_PROMPT, answer_system_prompt("en", "short")]
+    assert {rec.body(i)["options"]["num_predict"] for i in range(2)} == {1}  # read, not answered
+
+
 def test_openai_compatible_placeholder_raises(cloud_settings):
     from app.providers.registry import build_container
 

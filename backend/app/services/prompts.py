@@ -22,11 +22,14 @@ short continuation sentence at most (or nothing: "-").
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from ..providers.llm import LLMMessage
 from ..settings import Language
+from .language import wordset
 from .live_data import LiveNote
 from .sources import Source, format_sources
 from .web_search import WebSource, format_web_sources
@@ -60,6 +63,11 @@ PROMPT_IDS: dict[AnswerMode, str | None] = {
 GeneralNote = Literal["not_covered", "no_documents", "retrieval_off"]
 
 LANGUAGE_NAMES: dict[Language, str] = {"en": "English", "hi": "Hindi, in Devanagari script"}
+# The answer language, in system prompts that don't change with it (the user's message ends asking for one).
+ANSWER_LANGUAGE_RULE = (
+    "Answer in the language the user's message asks for at its end. In Hindi, write Devanagari script and keep "
+    "figures, source ids and terms such as EBITDA or FY24 exactly as written."
+)
 
 AbstainReason = Literal["not_covered", "no_documents"]
 AnswerLength = Literal["short", "full"]
@@ -69,6 +77,11 @@ AnswerLength = Literal["short", "full"]
 class LengthStyle:
     instruction: str  # rule 5 of the system prompt
     max_tokens: int  # generation cap (Hindi needs ~0.75-0.9 tokens per character, §9.1)
+    # Evidence for this kind of answer (None: retrieval.rerank_top_n and retrieval.context_token_budget). Prompt
+    # reading is most of the time to a voice answer's first word (~3 ms per token, §9.5): a 1-3 sentence answer
+    # needs the best few passages, not all five.
+    max_sources: int | None = None
+    context_tokens: int | None = None
 
 
 ANSWER_LENGTHS: dict[AnswerLength, LengthStyle] = {
@@ -77,6 +90,8 @@ ANSWER_LENGTHS: dict[AnswerLength, LengthStyle] = {
         "Be brief: one to three sentences that read well aloud. Leave further detail to the cited sources unless "
         "the user asks for it. No preamble.",
         384,
+        max_sources=3,
+        context_tokens=600,
     ),
     # Text: a fuller written answer.
     "full": LengthStyle(
@@ -142,9 +157,12 @@ def answer_system_prompt(
 ) -> str:
     """The grounded prompt; ``mixed`` adds that general knowledge may put the document facts in context;
     ``live_note``: live data was asked for and isn't there, and the answer starts with ``live_notice``;
-    ``live_hint``: live data was asked for and there will be none, with no notice (one line: never guess it)."""
-    name = LANGUAGE_NAMES[language]
-    keep = " Keep figures, source ids and terms such as EBITDA or FY24 exactly as written." if language == "hi" else ""
+    ``live_hint``: live data was asked for and there will be none, with no notice (one line: never guess it).
+
+    The same in every answer language (§9.5): the language is asked for at the end of the user's message
+    (``answer_user_prompt``), so switching between English and Hindi keeps the system prompt and the history in
+    Ollama's prompt cache. ``language`` is kept for callers; an answer in the wrong script is caught (B5)."""
+    del language
     general = (
         "8. The question also needs general knowledge or judgement. You may add it after the document facts, but say "
         'plainly that it is general knowledge, not from the documents (for example "In general, …"), and never '
@@ -167,7 +185,7 @@ def answer_system_prompt(
         "convert or recompute them.\n"
         "4. If the sources don't contain the answer, say briefly that the documents don't cover it. Don't guess.\n"
         f"5. {ANSWER_LENGTHS[length].instruction}\n"
-        f"6. Answer in {name}.{keep}\n"
+        f"6. {ANSWER_LANGUAGE_RULE}\n"
         "7. The sources are the user's documents: never say that you can't access documents or files.\n"
         f"{general}"
     ).rstrip("\n") + live
@@ -197,7 +215,9 @@ def general_system_prompt(
     live_note: LiveNote | None = None,
 ) -> str:
     """A question that isn't about the user's documents (or that they don't cover): general knowledge, said
-    honestly, no citations. ``live_note``: live data was asked for and isn't there."""
+    honestly, no citations. ``live_note``: live data was asked for and isn't there. Like the grounded prompt, the
+    same in every answer language (``general_user_prompt`` asks for it)."""
+    del language
     situation = _GENERAL_NOTES[note] if note else "This question is not about the user's documents."
     live = _without_live_data("from general knowledge, or say briefly that you don't know") if live_note else ""
     return (
@@ -210,7 +230,7 @@ def general_system_prompt(
         "3. If you don't know, or the answer needs live or current data (prices, news, weather), say so briefly "
         "instead of guessing.\n"
         f"4. {ANSWER_LENGTHS[length].instruction}\n"
-        f"5. Answer in {LANGUAGE_NAMES[language]}.\n"
+        f"5. {ANSWER_LANGUAGE_RULE}\n"
         "6. Never say that you can't access the user's documents or files."
     ) + live
 
@@ -338,6 +358,29 @@ def general_user_prompt(question: str, language: Language) -> str:
     return f"{question.strip()}\n\n(Answer in {LANGUAGE_NAMES[language]}.)"
 
 
+def language_request_note(language: Language) -> str:
+    """The user asked for this answer language ("answer in English please"): said in the question itself, which a 4B
+    model heeds better than the system prompt when the conversation so far is in the other language (B5)."""
+    name = LANGUAGE_NAMES[language]
+    return f"(The user asked for the answer in {name}: answer only in {name}, even though earlier messages are not.)"
+
+
+# One more try when an answer came out in the wrong script (B5): said as plainly as possible, in both languages.
+LANGUAGE_INSISTENCE: dict[Language, str] = {
+    "en": "IMPORTANT: write the whole answer in English only. Do not use Hindi or Devanagari script at all.",
+    "hi": (
+        "IMPORTANT: write the whole answer in Hindi, in Devanagari script (keep figures, source ids and terms such as "
+        "EBITDA or FY24 as written). महत्वपूर्ण: पूरा उत्तर केवल हिंदी में, देवनागरी लिपि में लिखें।"
+    ),
+}
+
+
+def insist_on_language(messages: Sequence[LLMMessage], language: Language) -> list[LLMMessage]:
+    """The same prompt, its last user message ending with ``LANGUAGE_INSISTENCE`` (the prefix stays cached)."""
+    *head, last = messages
+    return [*head, LLMMessage(last.role, f"{last.content}\n\n{LANGUAGE_INSISTENCE[language]}")]
+
+
 def with_memory(system: str, memory: str | None) -> str:
     """The system prompt with the chat's memory summary (§3.5): what was said before the recent messages."""
     memory = (memory or "").strip()
@@ -367,14 +410,78 @@ def document_name(filename: str) -> str:
     return " ".join(stem.replace("_", " ").replace("-", " ").split()) or filename
 
 
+# Words of a topic label that only make it sound like a label ("net profit fiscal" → "the net profit").
+_TOPIC_NOISE = wordset(
+    """
+    fiscal financial year years quarter quarters total amount number value values figure figures overall current
+    latest reported annual company company's companies firm group period end
+    """
+)
+_ACRONYMS = wordset(
+    """
+    ebitda pat pbt capex opex esop csr roe roce eps gst ceo cfo agm npa nim fy ipo
+    """
+)
+# The terms a topic label is usually made of, in Hindi (the rest are said as they are: "EBITDA मार्जिन").
+_TOPIC_HI = {
+    "net profit": "शुद्ध लाभ",
+    "net debt": "शुद्ध कर्ज़",
+    "cash flow": "नकदी प्रवाह",
+    "free cash flow": "फ्री कैश फ्लो",
+    "profit": "मुनाफ़ा",
+    "revenue": "राजस्व",
+    "sales": "बिक्री",
+    "margin": "मार्जिन",
+    "dividend": "लाभांश",
+    "debt": "कर्ज़",
+    "employees": "कर्मचारी",
+    "headcount": "कर्मचारी संख्या",
+    "growth": "वृद्धि",
+    "exports": "निर्यात",
+    "tax": "कर",
+    "shareholders": "शेयरधारक",
+    "auditors": "ऑडिटर",
+    "auditor": "ऑडिटर",
+    "board": "बोर्ड",
+    "segment": "सेगमेंट",
+    "customers": "ग्राहक",
+    "capacity": "क्षमता",
+    "expenses": "खर्च",
+    "costs": "लागत",
+    "emissions": "उत्सर्जन",
+}
+
+
+def spoken_topic(topic: str | None, language: Language) -> str | None:
+    """A topic label as it is said aloud (UX1: the resume line said "We were talking about net profit fiscal."):
+    label-only words dropped, acronyms in capitals, "the" in English, the usual terms in Hindi. None if nothing is
+    left."""
+    if not topic or not topic.strip():
+        return None
+    if any("\u0900" <= ch <= "\u097f" for ch in topic):
+        return topic.strip()  # already Hindi
+    words = [w for w in topic.split() if w.casefold() not in _TOPIC_NOISE]
+    if not words:
+        return None
+    words = [w.upper() if w.casefold() in _ACRONYMS else w for w in words]
+    phrase = " ".join(words)
+    if language == "en":
+        return f"the {phrase}"
+    for en, hi in sorted(_TOPIC_HI.items(), key=lambda kv: -len(kv[0])):
+        phrase = re.sub(rf"(?<![\w]){re.escape(en)}(?![\w])", hi, phrase, flags=re.IGNORECASE)
+    return phrase
+
+
 def resume_text(language: Language, topic: str | None, filenames: Sequence[str]) -> str:
     """Back to the documents without a new question: no model, nothing invented."""
     if len(filenames) == 1:
-        documents = f"the {document_name(filenames[0])}" if language == "en" else document_name(filenames[0])
+        documents = short_document_name(filenames[0])
+        documents = documents if language == "en" else documents.removeprefix("the ")
     else:
         documents = YOUR_DOCUMENTS[language]
     with_topic, without = RESUME_TEXTS[language]
-    return with_topic.format(documents=documents, topic=topic) if topic else without.format(documents=documents)
+    said = spoken_topic(topic, language)
+    return with_topic.format(documents=documents, topic=said) if said else without.format(documents=documents)
 
 
 AckKind = Literal["ack", "thanks", "greeting", "language"]
@@ -417,9 +524,47 @@ def memory_user_prompt(previous: str | None, transcript: str) -> str:
     return f"Current memory:\n{(previous or '').strip() or '(empty)'}\n\nNew messages:\n{transcript.strip()}"
 
 
-def answer_user_prompt(question: str, sources: Sequence[Source], language: Language) -> str:
+def answer_user_prompt(
+    question: str, sources: Sequence[Source], language: Language, *, name_documents: bool = False
+) -> str:
+    """``name_documents``: the evidence comes from more than one document, or from one that isn't the obvious one
+    (UX5): the answer says which, in a few words, besides citing it."""
+    note = f"{documents_note(sources)}\n" if name_documents else ""
     return (
         f"Sources:\n\n{format_sources(sources)}\n\n"
         f"Question: {question.strip()}\n\n"
-        f"(Answer in {LANGUAGE_NAMES[language]}, citing the sources like [S1].)"
+        f"{note}(Answer in {LANGUAGE_NAMES[language]}, citing the sources like [S1].)"
+    )
+
+
+# Filename words that don't help a listener tell documents apart ("valmora_annual_report_fy24_final.pdf" → "the
+# Valmora annual report").
+_FILE_NOISE = re.compile(r"^(?:(?:q[1-4])?fy\d{2,4}|q[1-4]|\d{4}|v\d+|final|draft|copy|scan(?:ned)?|new|old)$", re.I)
+_DESCRIPTIVE = wordset(
+    """
+    annual report reports document deck slides presentation investor policy travel expense group health
+    insurance statement statements financial results quarterly summary overview brochure manual handbook
+    contract agreement memo letter board meeting minutes plan budget notes
+    """
+)
+
+
+def short_document_name(filename: str) -> str:
+    """A document's name as it is said: "zephyra_investor_deck_q4fy24.pptx" → "the Zephyra investor deck"."""
+    words = [w for w in document_name(filename).split() if not _FILE_NOISE.match(w)] or document_name(filename).split()
+    named = [w if w.casefold() in _DESCRIPTIVE else w[:1].upper() + w[1:] for w in words]
+    return "the " + " ".join(named)
+
+
+def documents_note(sources: Sequence[Source]) -> str:
+    names = list(dict.fromkeys(short_document_name(s.filename) for s in sources))
+    if len(names) == 1:
+        return (
+            f"(These sources are from {names[0]}: say so in a few words, for example "
+            f'"{names[0][:1].upper() + names[0][1:]} says …".)'
+        )
+    listed = ", ".join(names[:-1]) + f" and {names[-1]}"
+    return (
+        f"(The sources come from {len(names)} documents: {listed}. Say in a few words which document each figure "
+        f'comes from, for example "{names[0][:1].upper() + names[0][1:]} says …".)'
     )

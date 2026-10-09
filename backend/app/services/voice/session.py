@@ -16,6 +16,11 @@
   last frame is out.
 - Barge-in, duck-then-decide: the client ducks and sends ``barge_in_start``; the server decides within
   ``voice.barge_in.decision_timeout_ms`` from its own VAD and transcripts of the new speech (``barge_in_verdict``).
+  A transcription still running at that deadline is waited for, up to the acknowledgement cap (~1.4 s, B3).
+- Speech that goes on while the agent answers with no decision pending (after a ``resume``: "No… wait, I meant…";
+  or the client's VAD missed it) is transcribed every ``WATCH_STEP_MS`` of new speech; real words that aren't an
+  acknowledgement stop the answer at once (``barge_in: stop`` without ``barge_in_start``), not when the sentence
+  ends (B3).
   On "stop" the turn is muted and its task cancelled at once, then the turn is *settled* by its own task: the
   decision is sent, the stopped answer saved with ``heard_text`` (an empty one if nothing had been generated) and sent
   as ``agent_message``. The next turn waits for pending settles, so the cut answer always precedes the next
@@ -68,6 +73,7 @@ from ..chat_turns import (
     detach,
 )
 from ..chats import ChatService
+from ..language import script_language
 from ..messages import MessageService
 from .fillers import filler_audio
 from .protocol import (
@@ -124,6 +130,10 @@ BARGE_IN_MATCH_S = 0.5  # a barge_in_start belongs to an utterance that started 
 # Speech still going on at decision_timeout_ms but only acknowledgements so far ("Yeah…" of "Yeah, right"): the decision
 # waits up to this many times decision_timeout_ms (700 → 1400 ms) for more words; only real words stop the answer.
 ACKNOWLEDGEMENT_GRACE = 2
+# Speech going on while the agent answers, with no barge-in decision pending: transcribed again after this much more
+# speech (the first time at decision_timeout_ms of speech, or this long after a "resume"), to stop the answer as soon
+# as it has real words instead of when the sentence ends (B3).
+WATCH_STEP_MS = 400
 
 
 class Transport(Protocol):
@@ -174,6 +184,7 @@ class AgentTurn:
     tts_failed: bool = False
     first_audio_at: float | None = None  # the answer's first audio (not the filler's)
     queue: asyncio.Queue[SpeakItem] | None = None  # text waiting for TTS
+    voice_language: Language | None = None  # the voice speaking this answer: its text's script, once it tells (B5)
     tts_busy: bool = False  # the speaker is synthesizing or sending a chunk
     answer_queued: bool = False  # the answer's text is complete and all of it is queued for speech
     message_sent: bool = False  # agent_message was sent
@@ -196,6 +207,17 @@ class PendingBargeIn:
     real_words: int = 0
     deadline_passed: bool = False
     cap_passed: bool = False
+    transcribing: int = 0  # transcriptions of the interrupting speech still running
+
+
+@dataclass(eq=False)
+class SpeechWatch:
+    """Speech over an answer that nobody is deciding about (after a "resume", or without ``barge_in_start``)."""
+
+    agent: AgentTurn
+    utterance: int  # the endpointer's utterance number
+    checked_ms: float  # speech_ms at the last transcription
+    stt: asyncio.Task[None] | None = None
 
 
 @dataclass(eq=False)
@@ -247,6 +269,8 @@ class VoiceSession:
         self._turn_lock = asyncio.Lock()  # one settle at a time
         self._settling: set[asyncio.Task[None]] = set()  # interrupted turns being saved; the next turn waits for them
         self._pending: PendingBargeIn | None = None
+        self._watch: SpeechWatch | None = None
+        self._utterance_no = 0  # counts the endpointer's utterances
         self._speculative: asyncio.Task[Transcript | None] | None = None
         self._utterances: asyncio.Queue[_EndedUtterance] = asyncio.Queue()
         self._processing = False  # the worker is transcribing or starting a turn for an utterance
@@ -505,6 +529,7 @@ class VoiceSession:
     async def _on_vad_event(self, event: VADEvent) -> None:
         match event:
             case SpeechStarted():
+                self._utterance_no += 1
                 await self._send({"type": "user_speech", "phase": "start"})
             case SpeechPaused(audio=audio):
                 self._drop_speculative()
@@ -794,7 +819,7 @@ class VoiceSession:
             agent.tts_busy = True
             try:
                 try:
-                    pcm = await self.tts.synthesize(text, agent.turn.language)
+                    pcm = await self.tts.synthesize(text, self._voice_for(agent, text))
                 except Exception as e:
                     agent.tts_failed = True
                     log.warning("voice session %s: speech synthesis failed: %s", self.id, _describe(e))
@@ -805,6 +830,15 @@ class VoiceSession:
                 await self._send_chunk(agent, text, pcm)
             finally:
                 agent.tts_busy = False
+
+    @staticmethod
+    def _voice_for(agent: AgentTurn, text: str) -> Language:
+        """The voice for a chunk of the answer: the script of the answer's first chunk that has letters (B5: an
+        answer asked for in English but written in Hindi is spoken by the Hindi voice), kept for the whole answer, so
+        "EBITDA 21.0%" in a Hindi answer doesn't switch voices."""
+        if agent.voice_language is None:
+            agent.voice_language = script_language(text)
+        return agent.voice_language or agent.turn.language
 
     async def _speak_filler(self, agent: AgentTurn) -> None:
         """The filler of a web search (§3.7), pre-synthesized: sent at once, before the turn's next message. If its
@@ -1038,8 +1072,10 @@ class VoiceSession:
         await self._evaluate(pending)
         if self._pending is not pending:
             return
-        # Still talking, but only acknowledgements so far: listen longer, with a transcript of everything said.
-        self._transcribe_for(pending)
+        # Still talking, but only acknowledgements so far, or the transcription isn't in yet: listen longer, with a
+        # transcript of everything said (when one is running, its result asks for the next).
+        if not pending.transcribing:
+            self._transcribe_for(pending)
         await asyncio.sleep(timeout * (ACKNOWLEDGEMENT_GRACE - 1))
         pending.cap_passed = True
         await self._evaluate(pending)
@@ -1050,26 +1086,37 @@ class VoiceSession:
         """After new audio: transcribe the interrupting speech once it is long enough, and re-evaluate."""
         pending = self._pending
         if pending is None:
+            await self._watch_speech()
             return
         ep = self._endpointer
         if pending.stt is None and ep.in_utterance and ep.speech_ms >= self.vad_settings.min_speech_ms:
-            pending.stt = self._spawn(self._barge_in_transcript(pending, ep.snapshot()), f"{self.id}-barge-in-stt")
+            pending.stt = self._transcribe_for(pending)
         await self._evaluate(pending)
 
-    def _transcribe_for(self, pending: PendingBargeIn) -> None:
-        """Transcribe the interrupting speech so far again, while it is still going on past the deadline."""
-        if self._endpointer.in_utterance:
-            audio = self._endpointer.snapshot()
-            self._spawn(self._barge_in_transcript(pending, audio), f"{self.id}-barge-in-stt")
+    def _transcribe_for(self, pending: PendingBargeIn) -> asyncio.Task[None] | None:
+        """Transcribe the interrupting speech so far (again, while it goes on past the deadline). Counted as running
+        until its result is in, so the deadline waits for it (B3)."""
+        if not self._endpointer.in_utterance:
+            return None
+        pending.transcribing += 1
+        audio = self._endpointer.snapshot()
+        return self._spawn(self._barge_in_transcript(pending, audio), f"{self.id}-barge-in-stt")
 
     async def _barge_in_transcript(self, pending: PendingBargeIn, audio: np.ndarray) -> None:
-        transcript = await self._transcribe(audio, report=False)
-        if transcript is None or self._pending is not pending:
+        try:
+            transcript = await self._transcribe(audio, report=False)
+        finally:
+            pending.transcribing -= 1
+        if self._pending is not pending:
             return
-        if transcript.text:
-            await self._send({"type": "transcript_partial", "text": transcript.text})
-        self._note_transcript(pending, transcript.text)
+        if transcript is not None:
+            if transcript.text:
+                await self._send({"type": "transcript_partial", "text": transcript.text})
+            self._note_transcript(pending, transcript.text)
         await self._evaluate(pending)
+        ep = self._endpointer
+        if self._pending is pending and pending.deadline_passed and ep.speaking and not pending.transcribing:
+            self._transcribe_for(pending)  # still talking past the deadline: a fuller transcript
 
     def _note_transcript(self, pending: PendingBargeIn, text: str) -> None:
         pending.transcript = text
@@ -1088,6 +1135,7 @@ class VoiceSession:
             deadline_passed=pending.deadline_passed,
             real_words=pending.real_words,
             cap_passed=pending.cap_passed,
+            transcribing=pending.transcribing > 0,
         )
         verdict = barge_in_verdict(
             evidence, min_speech_ms=self.vad_settings.min_speech_ms, is_backchannel=pending.backchannel
@@ -1106,9 +1154,52 @@ class VoiceSession:
         else:
             # The answer goes on at full volume: if this speech turns out to be an interruption after all (its final
             # transcript has real words), what was heard is whatever has been played by then (the playback reports),
-            # not what had been played when the speech began.
+            # not what had been played when the speech began. Speech that goes on is watched from here (B3).
             pending.agent.barge_in_ms = pending.agent.barge_in_at = None
+            ep = self._endpointer
+            if ep.in_utterance:
+                self._watch = SpeechWatch(pending.agent, self._utterance_no, ep.speech_ms)
             await self._send({"type": "barge_in", "turn_id": pending.agent.id, "decision": "resume"})
+
+    # -------------------------------------------------------------- speech nobody is deciding about (B3)
+
+    async def _watch_speech(self) -> None:
+        """Speech while the agent answers and no barge-in decision is pending: transcribe it every WATCH_STEP_MS of
+        new speech (from decision_timeout_ms of speech, or right after a "resume"), so real words stop the answer
+        while the user is still talking."""
+        agent, ep = self._turn, self._endpointer
+        if agent is None or agent.interrupted or agent.cut or not ep.in_utterance or not ep.speaking:
+            return
+        watch = self._watch
+        if watch is None or watch.agent is not agent or watch.utterance != self._utterance_no:
+            first = max(self.vad_settings.min_speech_ms, self.barge_in.decision_timeout_ms) - WATCH_STEP_MS
+            watch = self._watch = SpeechWatch(agent, self._utterance_no, first)
+        if watch.stt is not None and not watch.stt.done():
+            return
+        if ep.speech_ms < watch.checked_ms + WATCH_STEP_MS:
+            return
+        watch.checked_ms = ep.speech_ms
+        watch.stt = self._spawn(self._watch_transcript(watch, ep.snapshot()), f"{self.id}-watch-stt")
+
+    async def _watch_transcript(self, watch: SpeechWatch, audio: np.ndarray) -> None:
+        transcript = await self._transcribe(audio, report=False)
+        agent = watch.agent
+        if transcript is None or not transcript.text or self._turn is not agent or agent.interrupted:
+            return
+        await self._send({"type": "transcript_partial", "text": transcript.text})
+        pending = self._pending
+        if pending is not None:  # the client asked meanwhile: this is evidence for its decision
+            if pending.agent is agent:
+                self._note_transcript(pending, transcript.text)
+                await self._evaluate(pending)
+            return
+        text = transcript.text
+        if is_backchannel(text, self.barge_in.backchannel_max_words) or real_words(text) < 2:
+            return
+        if self._answer_heard(agent, None):  # complete and heard: the end of the utterance ends the turn (§3.7)
+            return
+        log.info("voice session %s: speech over turn %d has real words (%r): stopping it", self.id, agent.id, text)
+        await self._interrupt(agent, "barge_in", None, decision=True)
 
     # -------------------------------------------------------------- observability
 

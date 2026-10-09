@@ -130,6 +130,48 @@ def test_finalize_normalizes_lists_and_case_and_drops_unknown_ids():
     assert [c.source_id for c in cites] == ["S1", "S3", "S2"]
 
 
+def test_short_answers_get_the_best_few_sources():
+    """§9.5: a voice-length answer gets at most ``max_sources`` passages (best first, then grouped as usual)."""
+    chunks = [make_chunk(i, text=f"passage {i}", heading_path=[f"H{i}"]) for i in range(5)]
+    assert [s.chunk.text for s in build_sources(ranked(*chunks), FILES, budget_tokens=3000)] == [
+        f"passage {i}" for i in range(5)
+    ]
+    short = build_sources(ranked(*chunks), FILES, budget_tokens=3000, max_sources=3)
+    assert [(s.source_id, s.chunk.text) for s in short] == [
+        ("S1", "passage 0"),
+        ("S2", "passage 1"),
+        ("S3", "passage 2"),
+    ]
+
+
+def test_a_short_answers_budget_never_cuts_its_best_passage():
+    table = make_chunk(0, text="| row | value |\n" * 120)  # ~550 estimated tokens: over the voice budget
+    small = [make_chunk(i, text=f"short passage {i}") for i in (1, 2)]
+    cut = build_sources(ranked(table, *small), FILES, budget_tokens=300)
+    assert len(cut) == 1 and cut[0].chunk.text.endswith(" …")  # without a separate allowance: cut to fit
+    whole = build_sources(ranked(table, *small), FILES, budget_tokens=300, max_sources=3, best_budget_tokens=3000)
+    assert whole[0].chunk.text == table.text  # kept whole; the voice budget (now spent) is for the others
+    assert len(whole) == 1
+
+
+def test_tables_are_compacted_in_the_prompt():
+    from app.services.sources import Source, compact_tables, format_sources
+
+    table = (
+        "| Metric                            | FY24   | FY23   |\n"
+        "|-----------------------------------|--------|--------|\n"
+        "| Revenue from operations (₹ crore) | 7,365  | 6,482  |\n"
+        "Note: figures are consolidated.   "
+    )
+    assert compact_tables(table) == (
+        "| Metric | FY24 | FY23 |\n|---|---|---|\n| Revenue from operations (₹ crore) | 7,365 | 6,482 |\n"
+        "Note: figures are consolidated.   "  # not a table row: left alone
+    )
+    assert compact_tables("a | b, not a table") == "a | b, not a table"
+    source = Source("S1", make_chunk(0, text=table), "annual_report.pdf", 0.9)
+    assert "| 7,365 | 6,482 |" in format_sources([source]) and "-----" not in format_sources([source])
+
+
 def test_finalize_with_no_sources_removes_every_marker():
     assert finalize_answer("Nothing [S1].", []) == ("Nothing.", [])
 

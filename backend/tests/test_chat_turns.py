@@ -65,10 +65,12 @@ async def test_disconnect_mid_answer_stops_generation_and_saves_the_partial_answ
         tg.start_soon(client, tg.cancel_scope)
     await wait_for_background()
 
-    assert fakes.llm.closed and fakes.llm.sent == 3  # generation cancelled right away
+    # generation cancelled right away: 6 pieces for 3 deltas, the first 4 sent together once they showed the answer
+    # is in English (B5)
+    assert fakes.llm.closed and fakes.llm.sent == 6
     user, agent = await transcript(db, chat_id)
     assert user.role == "user" and agent.role == "agent"
-    assert agent.text == "Margin 18.2% [S1]"  # the three pieces that were streamed: "Margin", " 18.2%", " [S1] "
+    assert agent.text == "Margin 18.2% [S1] while revenue grew"  # what was streamed
     assert [c.source_id for c in agent.citations] == ["S1"]  # [S2] was never generated
     assert agent.route["stopped"] is True and agent.route["abstained"] is False
     assert agent.latency["llm_ms"] is not None
@@ -87,7 +89,8 @@ async def test_closing_the_event_stream_saves_the_partial_answer(setup, db, fake
     await wait_for_background()
     assert fakes.llm.closed
     agent = (await transcript(db, chat_id))[-1]
-    assert agent.text == "Margin 18.2%" and agent.citations == []
+    # two deltas: the first words, held until they showed the answer is in English (B5), then "revenu"
+    assert agent.text == "Margin 18.2% [S1] while revenu" and [c.source_id for c in agent.citations] == ["S1"]
     assert agent.route["stopped"] is True
 
 
@@ -191,7 +194,7 @@ async def test_a_stopped_voice_answer_is_saved_with_what_was_heard(setup, db, fa
     assert stop.saved is not None and stop.user is not None and stop.completed is None
     user, agent = await transcript(db, chat_id)
     assert stop.user == user and stop.saved == agent
-    assert agent.text == "Margin 18.2% [S1]" and agent.heard_text == "Margin" and agent.interrupted
+    assert agent.text == "Margin 18.2% [S1] while revenue grew" and agent.heard_text == "Margin" and agent.interrupted
     assert agent.route["stopped"] is True and agent.route["interrupted"] == "barge_in"
 
 
@@ -216,7 +219,9 @@ async def test_voice_spoken_language_and_stt_timings_are_saved_on_the_user_messa
     )
     [e async for e in pipeline.run(turn)]
     user, agent = await transcript(db, chat_id)
-    assert (user.language, user.latency, agent.language) == ("hi", stt, "hi")  # Hinglish, spoken as Hindi
+    assert (user.language, user.latency) == ("hi", stt)  # Hinglish, spoken as Hindi
+    assert agent.route["language"] == "hi" and "Answer in Hindi" in fakes.llm.calls[0]["messages"][-1].content
+    assert agent.language == "en"  # the fake answered in English (twice: B5): saved as what it is
 
 
 async def test_an_answer_nobody_heard_is_left_out_of_the_next_prompt(setup, db, fakes):

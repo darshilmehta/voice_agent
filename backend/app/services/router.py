@@ -218,6 +218,112 @@ def mentions_documents(text: str, filenames: Sequence[str] = ()) -> bool:
     return False
 
 
+# ------------------------------------------------------------------ facts or general knowledge (B1)
+
+# "What is EBITDA?", "What does EBITDA stand for?", "define working capital", "how is EBITDA calculated?", "how do I
+# make chai?", "EBITDA क्या होता है?", "EBITDA ka matlab kya hai?": general knowledge, whatever the documents say.
+_DEFINITIONAL = re.compile(
+    r"^(?:(?:so|and|ok|okay|by the way|btw)[, ]+)?(?:"
+    r"(?:what|who)\s*(?:'s|\s+is|\s+are)\s+(?:an?\s+|the\s+(?:term|concept|meaning|definition|full\s+form)\s+(?:of\s+)?)?"
+    r"[\w&/ -]{1,40}\??$"
+    r"|what\s+(?:does|do)\s+.{1,40}\s+(?:mean|stand\s+for)\b"
+    r"|what(?:'s|\s+is)\s+the\s+(?:meaning|definition|full\s+form)\s+of\b"
+    r"|(?:define|definition\s+of)\b"
+    r"|explain\s+(?:what\s+)?.{1,40}\s+(?:is|are|means)\b"
+    r"|how\s+(?:do|can|should|would|could)\s+(?:i|you|we|one|people)\b"
+    r"|how\s+to\b"
+    r"|how\s+(?:is|are)\s+.{1,40}\s+(?:calculated|computed|measured|defined|pronounced)\b"
+    r"|why\s+do\s+(?:companies|people|firms|businesses)\b"
+    r")"
+    r"|^\S+(?:\s+\S+){0,2}\s+(?:क्या|kya)\s+(?:है|hai)\s*[?।]?$"
+    r"|(?:मतलब|अर्थ|परिभाषा|matlab|arth)\s*(?:क्या|kya)"
+    r"|(?:क्या|kya)\s+(?:होता|होती|होते|hota|hoti|hote)\s+(?:है|हैं|hai|hain)"
+    r"|(?:कैसे|kaise)\s+\S+\s*(?:ते|te)\s+(?:हैं|hain)",
+    re.IGNORECASE,
+)
+# Questions about the assistant itself ("who are you?", "can you speak Hindi?"): conversation, not facts. ("Can you
+# tell me the revenue?" is a fact question.)
+_TO_THE_ASSISTANT = re.compile(
+    r"\b(?:who|what|how)\s+are\s+you\b|^are\s+you\b|\byour\s+(?:name|job|purpose)\b|\bwhat\s+can\s+you\s+do\b|"
+    r"\bcan\s+you\s+(?:hear|speak|understand|see)\b|\b(?:aap|tum)\s+(?:kaun|kaise)\b|(?:आप|तुम)\s+(?:कौन|कैसे)",
+    re.IGNORECASE,
+)
+# What the user's documents are about: the company, its board, its figures for a period ("the company", "our revenue",
+# "FY24", "at the end of the year", "कंपनी", "वित्त वर्ष").
+_DOCUMENT_SUBJECT = re.compile(
+    r"\b(?:the|this|our|its|their)\s+(?:[a-z'-]+\s+)?(?:company|company's|firm|group|business|businesses|"
+    r"organi[sz]ation|bank|board|management|auditors?|segments?|plants?|subsidiar(?:y|ies)|promoters?|"
+    r"shareholders?|directors?|ceo|cfo|chair(?:person|man)?|employees|workforce|staff|headcount|products?|"
+    r"suppliers?|customers?|revenue|profits?|margins?|debt|dividends?|results|accounts)\b"
+    r"|\b(?:company's|firm's|group's)\b"
+    r"|\b(?:q[1-4]\s*)?fy\s?'?\d{2,4}\b"
+    r"|\b(?:year[- ]end|end\s+of\s+the\s+(?:fiscal\s+|financial\s+)?(?:year|quarter)|fiscal\s+year|financial\s+year|"
+    r"last\s+(?:fiscal\s+)?year|this\s+year|previous\s+year|the\s+year|last\s+quarter|the\s+quarter)\b"
+    r"|\b(?:31|30)\s+(?:march|june|september|december)\b"
+    r"|कंपनी|कम्पनी|वित्त\s*वर्ष|वित्तीय\s*वर्ष|रिपोर्ट|दस्तावेज़|दस्तावेज|पिछले\s+साल|इस\s+साल|बोर्ड|"
+    r"\b(?:kampani|kampni|pichhle\s+saal|pichle\s+saal|is\s+saal)\b",
+    re.IGNORECASE,
+)
+# Filename words that name no one ("annual_report_fy24.pdf" names no company; "valmora_annual_report.pdf" does).
+_GENERIC_FILE_WORDS = wordset(
+    """
+    annual report reports document documents doc docs file files final draft copy scan scanned notes minutes deck
+    slides presentation investor investors policy policies travel expense expenses group health insurance statement
+    statements financial financials results quarterly quarter summary overview brochure manual handbook contract
+    agreement memo letter board meeting plan budget data sheet table tables appendix version updated new old english
+    hindi soochna yojana
+    """
+)
+_NAME_WORD = re.compile(r"[a-z]{4,}")
+
+
+# Asks for a judgement ("is an 18% margin good?", "should we…"): document facts plus general knowledge at most.
+_OPINION = re.compile(
+    r"^(?:is|are|was|were)\b.*\b(?:good|bad|high|low|healthy|strong|weak|reasonable|normal|typical|enough|"
+    r"better|worse|risky|safe)\b|\bshould\b|\bin\s+your\s+(?:opinion|view)\b|\bdo\s+you\s+think\b|"
+    r"\b(?:compare|compared|comparison)\b|अच्छा\s+है|achha\s+hai",
+    re.IGNORECASE,
+)
+
+
+def asks_for_judgement(text: str) -> bool:
+    return bool(_OPINION.search(text))
+
+
+def is_definitional(text: str) -> bool:
+    """Asks what a term means or how something is done in general ("What is EBITDA?", "how do I…?", "X क्या होता
+    है?"), not about the documents' subject ("What is the company's EBITDA?" is a fact question)."""
+    t = " ".join(text.strip().split())
+    return bool(_DEFINITIONAL.search(t)) and not about_the_documents(t)
+
+
+def about_the_documents(text: str, filenames: Sequence[str] = ()) -> bool:
+    """Points at what the documents are about: names them ("the report"), their subject ("the company", "our
+    revenue", "its board") or a reporting period ("FY24", "at the end of the year", "वित्त वर्ष"), or a name from a
+    document's filename ("Valmora" for valmora_annual_report_fy24.pdf)."""
+    if mentions_documents(text, filenames) or _DOCUMENT_SUBJECT.search(text):
+        return True
+    names = {
+        w
+        for name in filenames
+        for w in _NAME_WORD.findall(name.rsplit(".", 1)[0].casefold())
+        if w not in _GENERIC_FILE_WORDS
+    }
+    return bool(names & {w.removesuffix("'s") for w in words(text)})
+
+
+def asks_about_facts(text: str) -> bool:
+    """A question about facts (a figure, a name, a date, which one…), not a definition or how-to, and not a question
+    to the assistant itself: in a project with documents, such a question may well be about them even when the router
+    model says "general" (B1)."""
+    return (
+        is_question(text)
+        and len(words(text)) >= 3
+        and not is_definitional(text)
+        and not (_TO_THE_ASSISTANT.search(text))
+    )
+
+
 def heuristic_topic(text: str) -> str:
     """A short, stable topic label: the question's content words without years or figures ("What was the EBITDA
     margin in FY24?" → "ebitda margin"), so a follow-up about another year stays on the same topic."""
@@ -315,7 +421,9 @@ class RouteDecision:
     error: str | None = None
     llm_ms: float | None = None
     reply: ReplyKind | None = None  # a fixed reply (heuristic thanks / greeting)
+    language_request: bool = False  # "answer in English please": the previous question again, in the asked language
     live: str | None = None  # the live-data cue of a question that wants current data (§3.7), tool or not
+    retrieval_wait_ms: float | None = None  # waited for retrieval to check a "general" proposal (B1)
 
     def record(self) -> dict[str, object]:
         """How the route was decided, for the message's ``route.router`` (transcript and evals)."""
@@ -326,6 +434,7 @@ class RouteDecision:
             "error": self.error,
             "prompt": ROUTER_PROMPT_VERSION if self.source in ("llm", "fallback") else None,
             "live_cue": self.live,
+            "retrieval_wait_ms": self.retrieval_wait_ms,
         }
 
 
@@ -403,18 +512,24 @@ def fast_route(req: RouteRequest) -> RouteDecision | None:
     if only_asks_for_a_language(req.utterance):
         # "हिंदी में बताइए" after an answer: that question again, in the asked language (the turn's language);
         # before any answer: a short acknowledgement. The language itself is decided (and kept) by services/language.
+        # Asked for English, the question is asked again in English (its English query): a 4B model answers a
+        # Hinglish question in Hindi whatever the prompt says (B5).
         last, previous = req.last_answer, req.previous_question
         if last is not None and previous and (last.route or {}).get("answer") in _ANSWERED:
             r = last.route or {}
+            query, query_en = r.get("rewritten_query") or previous, r.get("query_en")
+            if req.language == "en" and query_en:
+                query, query_en = query_en, None
             route = _route(
                 req,
                 "correction",
                 confidence=CONFIDENCE["heuristic"],
-                query=r.get("rewritten_query") or previous,
-                query_en=r.get("query_en"),
+                query=query,
+                query_en=query_en,
                 topic=r.get("topic") or None,
             )
-            return RouteDecision(route, "heuristic", overrides=("language request: the previous question again",))
+            overrides = ("language request: the previous question again",)
+            return RouteDecision(route, "heuristic", overrides=overrides, language_request=True)
         route = _route(req, "conversation", confidence=CONFIDENCE["heuristic"])
         return RouteDecision(route, "heuristic", reply="language")
     ack = acknowledgement(req.utterance)

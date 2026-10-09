@@ -170,7 +170,8 @@ def test_a_page_cited_by_several_answers_is_one_source(env):
     assert user.count("[1] annual_report.pdf, p. 2") == 1 and "[2]" not in user
 
 
-def test_an_interrupted_answer_is_summarised_as_heard(env):
+def test_b7_an_interrupted_answer_is_no_source_of_facts(env):
+    """Found in the real run: a heard "Product…" fragment became "no product depends on a single supplier"."""
     api, llm, seed, project = env
     chat = seed.chat(project).id
     seed.ask(
@@ -179,8 +180,8 @@ def test_an_interrupted_answer_is_summarised_as_heard(env):
     )  # fmt: skip
     api.post(url(chat))
     user = llm.json_calls[0][1].content
-    assert "#2 Assistant (interrupted: the user heard only this): The margin was 18.2% [1]." in user
-    assert "16.9%" not in user
+    assert "#2 Assistant: (cut off by the user before it finished: incomplete, not an answer)" in user
+    assert "18.2%" not in user and "16.9%" not in user and "[1]" not in user
 
 
 def test_events_are_not_part_of_the_summary(env):
@@ -648,3 +649,58 @@ def test_prepare_lists_questions_the_documents_did_not_cover():
     assert [(q.question, q.message_seq) for q in prepared.unanswered] == [
         ("How does our margin compare with the industry?", 1)
     ]
+
+
+# ------------------------------------------------------------------ quality round: B8, B9
+
+
+def test_b8_repeated_points_merge_and_non_answers_lose_their_points_and_chips():
+    raw = SummaryDraft(
+        overview="About the report.",
+        key_points=[
+            DraftPoint(text="The EBITDA margin in FY24 was 18.2%.", sources=[1]),
+            DraftPoint(text="In FY24 the EBITDA margin was 18.2%", sources=[2]),  # the same, in other words
+            DraftPoint(text="The report does not provide the CEO's salary.", sources=[3]),  # a non-answer, with a chip
+            DraftPoint(text="रिपोर्ट में CEO के वेतन की जानकारी नहीं दी गई है।", sources=[3]),
+            DraftPoint(text="Revenue grew 34% in FY24.", sources=[2]),
+        ],
+        follow_ups=[],
+    )
+    grounded = ground(raw, {1, 2, 3})
+    assert [(p.text, p.sources) for p in grounded.key_points] == [
+        ("The EBITDA margin in FY24 was 18.2%.", [1, 2]),
+        ("Revenue grew 34% in FY24.", [2]),
+    ]
+
+
+def test_b8_a_hindi_summary_written_in_english_is_asked_for_once_more(env):
+    api, llm, seed, project = env
+    chat = seed.chat(project, language="hi").id
+    seed.ask(chat, HI, "वित्त वर्ष 2024 में EBITDA मार्जिन 18.2% था [S1]।", citations=[P2], route=ANSWERED, language="hi")
+    replies = [
+        draft("A conversation about the margin.", [("The EBITDA margin was 18.2%", [1])]),
+        draft("मार्जिन के बारे में बातचीत।", [("EBITDA मार्जिन 18.2% था", [1])]),
+    ]
+    llm.json_reply = lambda m, s: replies.pop(0)
+    s = api.post(url(chat), params={"language": "hi"}).json()
+    assert s["overview"] == "मार्जिन के बारे में बातचीत।" and s["key_points"][0]["text"] == "EBITDA मार्जिन 18.2% था"
+    first, second = llm.json_calls
+    assert "(Write everything in Hindi" in first[-1].content  # asked last, in the conversation's message too
+    assert second[-1].content.endswith("हिंदी (देवनागरी) में लिखें।")  # then insisting
+    llm.json_reply = lambda m, sc: draft("Still English.", [("Margin 18.2%", [1])])
+    seed.ask(chat, "और?", "बस इतना ही [S1]।", citations=[P2], route=ANSWERED, language="hi")
+    s = api.post(url(chat), params={"language": "hi"}).json()  # still English after the second try: it stands
+    assert s["overview"] == "Still English." and len(llm.json_calls) == 4
+
+
+def test_b9_an_answer_that_says_the_documents_dont_cover_it_is_unanswered(env):
+    """A grounded answer that passed the gate but says the documents don't cover the question is an abstention: it
+    is listed among the unanswered questions, and makes no key point."""
+    api, _, seed, project = env
+    chat = seed.chat(project).id
+    seed.ask(chat, EN, EBITDA, citations=[P2, P3], route=ANSWERED)
+    soft = {**ABSTAINED, "abstained_by": "answer"}
+    seed.ask(chat, "What is the FY25 margin?", "The documents do not specify the FY25 margin.", route=soft)
+    s = api.post(url(chat)).json()
+    assert [q["question"] for q in s["unanswered_questions"]] == ["What is the FY25 margin?"]
+    assert [p["text"] for p in s["key_points"]] == ["The EBITDA margin in FY24 was 18.2%."]

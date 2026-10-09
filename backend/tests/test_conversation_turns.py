@@ -53,7 +53,7 @@ RERANKED: list[str] = []  # the reranker's last query (the English one for Hindi
 def scripted_reply(messages: list[LLMMessage]) -> str:
     """Answers by prompt kind: grounded answers quote and cite the source that best matches what was searched."""
     system = messages[0].content
-    hindi = "in Hindi" in system
+    hindi = "in Hindi" in messages[-1].content
     if system.startswith("You keep the memory"):
         return MEMORY
     if system.startswith("You answer questions about the user's documents"):
@@ -170,6 +170,67 @@ async def test_an_unrelated_question_skips_retrieval_and_says_so(world):
     assert "not about the user's documents" in system and "Never claim" in system and "[S1]" in system
 
 
+async def test_b1_b9_document_questions_routed_general_are_searched_and_unanswered_ones_abstain(world):
+    """B1: the 4B router labels document questions "general"; they are checked against the documents. B9: one the
+    documents can't answer abstains, and the summary lists it among the unanswered questions."""
+    from app.services.chat_summary import prepare
+
+    world.fakes.llm.route = routes(
+        {
+            "Which segment drove the revenue growth?": {"intent": "general_qa", "query": None},
+            "How many employees did the company have at year end?": {"intent": "general_qa", "query": None},
+            "What's the capital of France?": {"intent": "general_qa", "query": None},
+        }
+    )
+    events, agent = await say(world, "Which segment drove the revenue growth?")
+    r = agent.route
+    assert (r["intent"], r["answer"], r["abstained"]) == ("document_qa", "grounded", False)
+    assert agent.citations and agent.text.startswith("Revenue grew 34%")
+    assert r["router"]["overrides"][-1].startswith("general_qa→document_qa: the documents match")
+    assert r["router"]["retrieval_wait_ms"] is not None and r["speculation"] == "used"
+    events, agent = await say(world, "How many employees did the company have at year end?")
+    r = agent.route
+    assert (r["intent"], r["answer"], r["abstained"], r["abstain_reason"]) == (
+        "document_qa",
+        "grounded",
+        True,
+        "not_covered",
+    )
+    assert sources_of(events).abstained
+    _, agent = await say(world, "What's the capital of France?")  # truly general: not searched, not unanswered
+    assert (agent.route["answer"], agent.route["abstained"]) == ("general", False)
+    messages = (await MessageService(world.db).list(world.chat_id)).items
+    assert [q.question for q in prepare(messages).unanswered] == [
+        "How many employees did the company have at year end?"
+    ]
+
+
+async def test_b9_an_answer_saying_the_documents_dont_cover_it_is_an_abstention(world):
+    """The gate let the question through (a passage scored above the threshold) but the answer itself says the
+    documents don't cover it: saved as abstained (``abstained_by: "answer"``), so the summary lists it as unanswered."""
+    question = "What is the EBITDA margin target?"
+    world.fakes.llm.route = routes({question: {"intent": "document_qa", "query": None}})
+    world.fakes.llm.reply = replies("The documents do not specify an EBITDA margin target.")
+    _, agent = await say(world, question)
+    r = agent.route
+    assert (r["abstained"], r["abstain_reason"], r["abstained_by"], r["basis"]) == (True, "not_covered", "answer", [])
+    world.fakes.llm.reply = replies("The EBITDA margin was 18.2% in FY24 [S1]. The documents give no target.")
+    _, agent = await say(world, question)
+    assert agent.route["abstained"] is False  # it answers something from the documents (it cites a source)
+
+
+def test_b7_the_memory_summary_keeps_no_fragment_of_a_cut_off_answer():
+    from app.services.memory import transcript
+    from app.services.revisit_prompts import INTERRUPTED_LINE
+
+    from .test_routing import msg
+
+    cut = msg("agent", "Product X depends on a single supplier [S1].", heard="Product", seq=2)
+    unheard = msg("agent", "Revenue grew 34% [S1].", heard="", seq=4)
+    lines = transcript([msg("user", "Which product?", seq=1), cut, msg("user", "And revenue?", seq=3), unheard])
+    assert lines == f"User: Which product?\nAssistant: {INTERRUPTED_LINE}\nUser: And revenue?"
+
+
 async def test_acknowledgements_and_thanks_get_short_fixed_replies_never_an_abstention(world):
     _, first = await say(world, "okay")
     assert (first.role, first.text, first.route["intent"], first.route["answer"]) == (
@@ -242,7 +303,7 @@ async def test_resume_returns_to_the_document_topic_without_the_model(world):
     _, agent = await say(world, "Let's go back to the annual report")
     assert (
         agent.text
-        == "Sure, back to the annual report. We were talking about ebitda margin. What would you like to know?"
+        == "Sure, back to the annual report. We were talking about the EBITDA margin. What would you like to know?"
     )
     assert len(answer_calls(world)) == calls  # a fixed text, never "I can't access documents"
     r = agent.route
@@ -331,24 +392,91 @@ async def test_hinglish_hindi_and_switching_languages(world):
     assert agent.language == "hi" and agent.route["input_language"] == "hi"
     assert agent.route["query_en"] == "How much was revenue in FY24?" and agent.route["speculation"] == "reused_search"
     assert world.fakes.reranker.calls[-1][0] == "How much was revenue in FY24?"  # the English query is scored
-    assert agent.text.startswith("दस्तावेज़ के अनुसार") and [c.source_id for c in agent.citations] == ["S3"]
-    assert "Answer in Hindi" in answer_calls(world)[-1]["messages"][0].content
+    # a short answer gets the best 3 passages (§9.5): the revenue passage is S2 of them
+    assert agent.text.startswith("दस्तावेज़ के अनुसार") and [c.source_id for c in agent.citations] == ["S2"]
+    assert "Answer in Hindi" in answer_calls(world)[-1]["messages"][-1].content
     json_calls = len(world.fakes.llm.json_calls)
     _, english = await say(world, "Now answer in English please")  # asked: English from now on
     assert english.language == "en" and len(world.fakes.llm.json_calls) == json_calls  # no router call
-    r = english.route  # the previous question again, in English, from the documents
+    r = english.route  # the previous question again, asked in English (B5), from the documents
     assert (r["intent"], r["answer"], r["rewritten_query"], r["query_en"]) == (
         "correction",
         "grounded",
-        "FY24 mein revenue kitna tha?",
         "How much was revenue in FY24?",
+        None,
     )
     assert r["router"]["overrides"] == ["language request: the previous question again"]
-    assert r["speculation"] == "reused_search" and english.text.startswith("Revenue grew 34%")
+    assert r["speculation"] == "used" and english.text.startswith("Revenue grew 34%")
+    question = answer_calls(world)[-1]["messages"][-1].content
+    assert "Question: How much was revenue in FY24?" in question and "answer only in English" in question
     _, agent = await say(world, "वित्त वर्ष 2024 में कर्ज कितना था?")
     assert agent.language == "en" and agent.citations  # the user's request beats the utterance's language
     _, agent = await say(world, "हिंदी में बताइए")  # asked again
     assert agent.language == "hi"
+
+
+def replies(*texts: str) -> Callable[[list[LLMMessage]], str]:
+    """Answers in this order (memory summaries keep their scripted reply)."""
+    queue = list(texts)
+
+    def reply(messages: list[LLMMessage]) -> str:
+        if messages[0].content.startswith("You keep the memory"):
+            return MEMORY
+        return queue.pop(0)
+
+    return reply
+
+
+async def test_b5_answer_in_english_reasks_in_english_and_retries_an_answer_in_hindi(world):
+    """Found in the real run: "answer in English please" re-asked the Hinglish question verbatim, the 4B model answered
+    in Hindi anyway, and the answer was saved `language: en` and spoken with the English voice."""
+    from app.services.prompts import LANGUAGE_INSISTENCE
+
+    world.fakes.llm.route = routes(
+        {"FY24 mein revenue kitna tha?": {"intent": "document_qa", "query": "How much was revenue in FY24?"}}
+    )
+    await say(world, "FY24 mein revenue kitna tha?")
+    world.fakes.llm.reply = replies("FY24 में राजस्व 34% बढ़ा [S1]।", "Revenue grew 34% in FY24 [S1].")
+    events, english = await say(world, "answer in English please")
+    first, second = answer_calls(world)[-2:]
+    asked = first["messages"][-1].content
+    assert "Question: How much was revenue in FY24?" in asked and "answer only in English" in asked
+    assert second["messages"][-1].content.endswith(LANGUAGE_INSISTENCE["en"])  # asked once more, insisting
+    assert second["messages"][:-1] == first["messages"][:-1]  # the same prompt otherwise (its prefix stays cached)
+    assert english.text == "Revenue grew 34% in FY24 [S1]." and english.language == "en"
+    assert "".join(e.text for e in events if isinstance(e, DeltaEvent)) == english.text  # no Hindi leaked out
+    assert english.route["language_retry"] is True and english.route["language"] == "en"
+
+
+async def test_b5_an_answer_still_in_the_other_script_is_saved_as_what_it_is(world):
+    world.fakes.llm.route = routes({"What was the EBITDA margin in FY24?": {"intent": "document_qa", "query": None}})
+    world.fakes.llm.reply = replies("FY24 में EBITDA 18.2% था [S1]।", "FY24 में EBITDA मार्जिन 18.2% था [S1]।")
+    _, agent = await say(world, "What was the EBITDA margin in FY24?")
+    assert agent.text == "FY24 में EBITDA मार्जिन 18.2% था [S1]।"
+    assert agent.language == "hi" and agent.route["language"] == "en" and agent.route["language_retry"] is True
+    world.fakes.llm.reply = replies("The EBITDA margin was 18.2% [S1].")  # the right script: one call, no retry
+    calls = len(answer_calls(world))
+    _, agent = await say(world, "What was the EBITDA margin in FY24?")
+    assert len(answer_calls(world)) == calls + 1 and agent.route["language_retry"] is False
+    assert agent.language == "en"
+
+
+async def test_latency_the_next_answers_prompt_prefix_is_read_while_this_one_is_spoken(world):
+    """§9.5: after a turn, the model reads the next answer's prompt up to its evidence (system prompt, memory,
+    history), and the history window only grows at its end between moves: the next answer reads its sources and
+    question only."""
+    world.fakes.llm.route = routes({"What was the EBITDA margin in FY24?": {"intent": "document_qa", "query": None}})
+    prompts = []
+    for _ in range(6):
+        await say(world, "What was the EBITDA margin in FY24?")
+        prompts.append(answer_calls(world)[-1]["messages"])
+    warmed = world.fakes.llm.warmed
+    assert len(warmed) == 6 and all(w[-1].content == "Sources:" for w in warmed)
+    for before, after in zip(warmed[:-1], prompts[1:], strict=True):
+        assert after[: len(before) - 1] == before[:-1]  # everything but the evidence and question was read already
+    # The window's start moved once (at the 9th message): turns 2-4 extend the same history, turn 5 starts anew.
+    histories = [len(p) - 2 for p in prompts]
+    assert histories == [0, 2, 4, 6, 4, 6]
 
 
 async def test_the_memory_summary_is_refreshed_in_the_background_and_used(world):
@@ -367,7 +495,8 @@ async def test_the_memory_summary_is_refreshed_in_the_background_and_used(world)
     system = answer_calls(world)[-1]["messages"][0].content
     assert f"Earlier in this conversation (summary; the recent messages follow):\n{MEMORY}" in system
     assert agent.route["memory"] is True
-    assert len(answer_calls(world)[-1]["messages"]) == 1 + 6 + 1  # system, the recent window, the question
+    # system, the recent window (the 9th message moved its start to the 5th: messages 5-8), the question
+    assert len(answer_calls(world)[-1]["messages"]) == 1 + 4 + 1
 
 
 async def test_memory_summaries_never_run_while_a_turn_is_answering():
@@ -525,7 +654,7 @@ async def test_drift_document_general_hindi_and_back(world):
     script = [
         ("What was the EBITDA margin in FY24?", "document_qa", "en", ["S1"]),
         ("By the way, what's the capital of France?", "general_qa", "en", []),
-        ("वित्त वर्ष 2024 में राजस्व कितना बढ़ा?", "document_qa", "hi", ["S3"]),
+        ("वित्त वर्ष 2024 में राजस्व कितना बढ़ा?", "document_qa", "hi", ["S2"]),
         ("भारत की राजधानी क्या है?", "general_qa", "hi", []),
         ("Okay, let's go back to the annual report.", "resume_document", "en", []),
         ("And what about the margin in FY23?", "document_qa", "en", ["S2"]),
@@ -541,7 +670,9 @@ async def test_drift_document_general_hindi_and_back(world):
 
     messages = (await MessageService(world.db).list(world.chat_id)).items
     resume = messages[9]
-    assert resume.text == "Sure, back to the annual report. We were talking about revenue. What would you like to know?"
+    assert resume.text == (
+        "Sure, back to the annual report. We were talking about the revenue. What would you like to know?"
+    )
     hindi = messages[5]
     assert hindi.route["query_en"] == "How much did revenue grow in FY24?" and hindi.text.startswith("दस्तावेज़")
     assert [m.route["is_topic_shift"] for m in messages if m.role == "agent"] == [False, True, True, True, True, True]

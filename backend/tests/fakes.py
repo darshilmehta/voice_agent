@@ -339,6 +339,7 @@ class FakeLLM(LLMClient):
         self.json_calls: list[dict[str, Any]] = []
         self.json_delay = 0.0
         self.json_cancelled = 0  # router calls cancelled before they answered
+        self.warmed: list[list[LLMMessage]] = []  # prompts read with warm_up (startup, the next turn's prefix)
 
     async def generate_json[M: BaseModel](
         self,
@@ -366,6 +367,9 @@ class FakeLLM(LLMClient):
             return schema.model_validate_json(content)
         except ValidationError as e:
             raise LLMError(f"model output doesn't match {schema.__name__}: {e.errors()[:1]}") from e
+
+    async def warm_up(self, prompts: Sequence[Sequence[LLMMessage]], *, model: str | None = None) -> None:
+        self.warmed.extend(list(m) for m in prompts)
 
     async def stream(  # type: ignore[override]
         self,
