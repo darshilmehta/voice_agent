@@ -159,6 +159,27 @@ class TurnRoute(BaseModel):
 
 Router input: the new utterance, the last few turns, the session state, and — if the agent was interrupted — the partial answer that was played. Application code owns state; the model only proposes changes. Default language rule: answer in the language of the latest utterance unless asked otherwise.
 
+**As built (phase 3).** The schema above is the persisted `route`; the model itself proposes only `{intent, query}` (`query` = the standalone English question) and application code validates it and derives the rest (topic, topic shift, languages, confidence):
+
+- **Keyword fast path, no model:** stop phrases ("stop", "bas", "ruko", "रुको"); acknowledgements while the agent is idle ("okay", "yeah right", "haan theek hai"); thanks and greetings; a request that only changes the language; English standalone questions that name the documents. Fixed replies need no LLM at all.
+- **Speculative retrieval** runs in parallel with the router call: reused when the route keeps the query (for Hindi the reranker scores the English query), discarded otherwise. An English standalone question whose retrieval scores ≥ 0.6 before the router answers skips the router.
+- **Bounds:** `num_predict` 96 and `llm.router_timeout_ms` (2.5 s); on timeout or invalid output the turn falls back to a document question (`router.source: "fallback"`).
+- **Validation overrides:** resume phrases always resume; a "stop"/"backchannel" that asks something is a question; a correction with nothing before it is a document question; "yes please" to the agent's offer searches for what was offered.
+
+| Intent | Search | Answer (`route.answer`) | `abstained` |
+|---|---|---|---|
+| document_qa | yes (rewritten / English query) | grounded, `[S#]` | only if not covered |
+| mixed | yes | grounded + marked general knowledge; not covered → general with `general_note: "not_covered"` | false |
+| general_qa | no | general (says it isn't from the documents, no citations) | false |
+| conversation | no | short LLM reply, or a fixed ack for thanks / greetings / language requests | false |
+| clarification | no | one question back | false |
+| resume_document | no (yes if it also asks something) | fixed text naming the document and topic, or grounded | false unless grounded and not covered |
+| correction | inherits the last answered question's mode | as that mode | as that mode |
+| backchannel | no | "Anything else?" / "और कुछ जानना है?"; nothing if that was just said | false |
+| stop | no | silent: an `event` message "Stopped", nothing spoken | false |
+
+**Language rule** (first that applies): a language the user asks for (it then sticks) → the request's forced `language` → the pinned preference → the utterance's language (romanized Hindi counts as Hindi and is answered in Devanagari) → the previous answer's language. Hindi answers keep citations.
+
 ### 3.5 Conversation state and memory
 
 ```json
@@ -177,6 +198,8 @@ Router input: the new utterance, the last few turns, the session state, and — 
 ```
 
 Agent states: `IDLE → LISTENING → THINKING → SPEAKING → (INTERRUPTED → LISTENING)`. Prompt context = recent messages + the chat's compact memory summary + retrieved evidence + current utterance; never the full transcript. Live state lives in the session store for the duration of a voice session; everything said is persisted as messages (§3.9).
+
+**As built (phase 3).** State persists per chat in `chat_states` (migration 0003): active / previous / document topic, the last document query, active document ids, input / response / preferred language, last intent, `last_interrupted_message_id`, `retrieval_enabled`. Only application code changes it, through a pure `advance(old state, what the turn did)`; writes are chained per chat and readers wait for pending ones, and a completed answer's state is written before its message is saved. The memory summary (`SummaryKind` "memory") is refreshed in the background every `llm.memory_summary_every_turns` (3) exchanges or `llm.memory_summary_token_budget` (1,500) tokens once the chat outgrows the prompt's 6-message window; it starts only when no turn is answering and is cancelled the moment one starts.
 
 ### 3.6 Failure handling
 
@@ -496,7 +519,7 @@ Goal: the same backend and frontend run locally or on a server; switching is a c
 | [`config/cloud.config.json`](../config/cloud.config.json) | **no** — template only | Mock server deployment: `*.example.com` hosts, `${VAR}` secrets, CUDA devices |
 | [`config/README.md`](../config/README.md) | — | Loading rules, deploy steps, provider status |
 
-Both files have **identical keys** (142) and are validated by one Pydantic schema; a test loads both so the template can't drift.
+Both files have **identical keys** (145) and are validated by one Pydantic schema; a test loads both so the template can't drift.
 
 Top-level sections: `profile`, `strict_offline`, `app`, `server`, `auth`, `client`, `llm`, `embeddings`, `reranker`, `vector_store`, `metadata_db`, `object_store`, `ingestion`, `retrieval`, `stt`, `vad`, `tts`, `voice`, `audio_transport`, `job_queue`, `session_store`, `event_bus`, `model_cache`, `observability`.
 
@@ -682,6 +705,7 @@ Findings:
 
 - **`qwen3:4b` is the always-thinking 2507 release** (same weights as `qwen3:4b-thinking`); it leaks reasoning into answers even with `think: false`. Use **`qwen3:4b-instruct`**. `qwen3:8b` is the original hybrid release and turns thinking off cleanly.
 - **Router latency is output-length bound** (prompt processing ~0.1–0.3 s; the rest is generating JSON). The slim schema (`intent, retrieve, lang, query`) halves it.
+- **As built (phase 3):** with only `{intent, query}` in the output, a routed turn takes p50 ≈ 0.65–0.7 s, p95 ≈ 0.9–1.0 s (~395 prompt tokens prefill in ~110 ms because the static prefix stays cached; ~18 output tokens at ~30 ms each). Cold prompt prefill runs at ~370 tokens/s (a 1.6k-token prompt ≈ 4.3 s) vs ~170 ms with a cached prefix, and a router call between two answers doesn't evict the answer's cached prefix. 43/43 intents on `backend/tests/integration/router_cases.json` (EN/HI/Hinglish; the prompt was tuned on that set, so this is optimistic).
 - **Hindi costs ~0.75–0.9 tokens per character**, so Hindi answers start much later on 8b (5 s) — too slow for voice.
 - **Both models together don't fit the GPU budget** alongside embeddings, reranker, Whisper and Kokoro (~13.5 GB > 12.7 GB cap). Pick one model for the voice loop.
 - 4b-instruct router misses: `mixed` → `document_qa` (harmless — still retrieves) and, on the slim schema, a correction without `retrieve=true`. The second is fixed deterministically: a `correction` inherits the retrieval decision of the turn it corrects (app logic, not the model).
@@ -862,7 +886,7 @@ Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first
 | 0 Skeleton | ✅ done | PRs #1–#3 (hygiene, backend skeleton, frontend shell), #5 (CI), #8 (Docker images + `full` profile, `docker.config.json`, `strict_offline_local_hosts`) |
 | 1 Projects + text document chat | ✅ done | #10 persistence (SQLite + Alembic, projects/chats/messages/pins API), #11 ingestion + hybrid retrieval, #12 sidebar, project and chat pages, transcript view, #16 upload + background ingestion + streamed cited chat (transport-agnostic `ChatTurnService`), #14 upload UI + streaming composer + citation popovers. Verified end to end on the real models: FY24 EBITDA 18.2% cited p.2 in EN and HI, out-of-document question abstains, transcript survives reload |
 | 4–6 Voice loop | ✅ done | #17 + #19 protocol (§3.10), #21 voice session backend (VAD, speculative STT, Kokoro streaming, barge-in, preload), #20 voice-first chat page (presence field, captions, browser VAD barge-in, transcript panel, "Start a conversation"), #18 citation tables. Independently reviewed (both sides) and verified end to end on the real models in the browser: spoken question → cited spoken answer, barge-in with `heard_text`, backchannels ignored, stop, Hindi, reload, second tab, backend restart; first audio median ~3.2 s in the browser, 2.7–4.9 s across runs (§9.5) |
-| 3 + 7 Router, state, revisit features | in progress | router + conversation state + drift/languages; titles, summaries, export |
+| 3 + 7 Router, state, revisit features | ✅ backend done | #23 automatic titles, user summaries, transcript export; router + conversation state + memory summary + drift and EN/HI/Hinglish switching (this PR): 43/43 intents on the labelled set with `qwen3:4b-instruct` (prompt tuned on that set), router p50 ≈ 0.65 s / p95 ≈ 1 s on routed turns, 0 on fast-path turns. UI for summaries/export next |
 
 Design-only PRs so far: #4 and #6 (voice presence UI, §3.8), #7 (projects, chats, transcripts, §3.9).
 
