@@ -182,20 +182,22 @@ def test_a_document_is_named_by_its_file(filename, label):
 # ------------------------------------------------------------------ through the service
 
 
-def test_the_overview_of_a_project_with_two_documents_names_each_panels_document(app):
-    p = project(app)
-    upload(app, p, "valmora_report.txt", REPORT)
-    upload(app, p, "zephyra_deck.txt", ZEPHYRA)
-    drain(app)
-    chat(app, p)
-    body = app.get(f"/api/projects/{p}/overview").json()
-    assert body["status"] == "ready"
-    # grouped by document, the one with the most tables first; each title says which document it is from
-    assert [v["title"].split(": ", 1)[0] for v in body["panels"]] == [
-        "Valmora report",
-        "Valmora report",
-        "Zephyra deck",
-    ]
-    assert [v["kind"] for v in body["panels"]] == ["kpi", "line", "line"]
-    assert {v["language"] for v in body["panels"]} == {"en"}
-    assert body["panels"][2]["title"] == "Zephyra deck: Revenue, Q1 FY24–Q4 FY24"  # noqa: RUF001
+def test_the_overview_of_a_project_with_two_documents_names_each_panels_document(make_app):
+    # the grouping and order with three panels (the shipped value is 4)
+    with make_app(CANVAS__OVERVIEW_PANELS="3") as app:
+        p = project(app)
+        upload(app, p, "valmora_report.txt", REPORT)
+        upload(app, p, "zephyra_deck.txt", ZEPHYRA)
+        drain(app)
+        chat(app, p)
+        body = app.get(f"/api/projects/{p}/overview").json()
+        assert body["status"] == "ready"
+        # grouped by document, the one with the most tables first; each title says which document it is from
+        assert [v["title"].split(": ", 1)[0] for v in body["panels"]] == [
+            "Valmora report",
+            "Valmora report",
+            "Zephyra deck",
+        ]
+        assert [v["kind"] for v in body["panels"]] == ["kpi", "line", "line"]
+        assert {v["language"] for v in body["panels"]} == {"en"}
+        assert body["panels"][2]["title"] == "Zephyra deck: Revenue, Q1 FY24–Q4 FY24"  # noqa: RUF001

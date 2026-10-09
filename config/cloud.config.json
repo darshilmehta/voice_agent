@@ -183,7 +183,7 @@
     "planner_max_tokens": 200,
     "planner_candidates": 4,
     "max_panels": 12,
-    "overview_panels": 3
+    "overview_panels": 4
   },
 
   "job_queue": { "provider": "redis", "url": "rediss://:${REDIS_PASSWORD}@redis.example.com:6380/0", "concurrency": 4 },
