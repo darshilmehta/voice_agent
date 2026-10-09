@@ -105,11 +105,15 @@ Chunks keep provenance: `document_id`, `version`, `chunk_id`, `page_start/end`, 
 ### 3.2 Retrieval (per document question)
 
 ```text
-query (rewritten if it's a follow-up) → BGE-M3 dense + sparse
-→ Qdrant prefetch (top `retrieval.prefetch_k` = 8 each, filtered to the project and the chat's documents) → RRF fusion
-→ bge-reranker-v2-m3 → top 5 → context builder (dedupe, group by section, budget, [S#] ids)
+query (rewritten if it's a follow-up; + the router's query_en for Hindi/Hinglish) → BGE-M3 dense + sparse
+→ Qdrant prefetch (top `retrieval.prefetch_k` = 8 per leg, both queries, filtered to the project and the chat's
+  documents) → RRF fusion
+→ bge-reranker-v2-m3 (English passages vs query_en, Hindi passages vs the user's own words; batches of 2 on MPS)
+→ top 5 → context builder (dedupe, group by section, budget, [S#] ids)
 → confidence gate → answer or abstain
 ```
+
+**As tuned in phase 2** (194-question eval, `evals/`): every chunk is embedded and reranked as *document label + heading path + text*, where the label is the file name plus the document's title — tables and slides rarely name their company, so without it "Valmora's EBITDA" matched the other company's table. The gate answers when the best reranker score is at least `retrieval.min_rerank_score` (**0.02**) **and** the best passage states every fiscal year the question names (FY24, FY 2023-24, Q4FY24, Hindi digits); declining relevant passages that don't hold the answer is the answer model's job (on the eval it declines 20 of the 23 unanswerable questions the gate lets through). Changing what is embedded bumps `ingestion.chunking.version`; READY documents indexed with an older version are re-ingested in the background at startup (they stay searchable on the old index, show PROCESSING while re-ingesting, and keep their table ids when the tables are unchanged).
 
 ### 3.3 The conversation loop — what makes it feel like a conversation
 
@@ -736,7 +740,7 @@ Findings → design changes:
 
 - **Libraries phone home unless given local paths.** FlagEmbedding calls `snapshot_download` on the repo id and, offline, rejects our deliberately partial snapshot. Providers must resolve models to a local snapshot directory (`local_snapshot(repo_id)`) and never pass bare repo ids. `strict_offline` caught this.
 - **Equal-weight RRF demotes cross-lingual answers to #2**: sparse matching is noise when query and document languages differ. Hybrid is judged on recall (top-3 = 8/8); the **reranker owns final order**. Optional later: down-weight sparse when query language ≠ document language.
-- **Reranker scores are not calibrated across languages.** A fixed 0.3 abstention cutoff would reject real Hindi questions (and, measured in phase 4 on the smoke documents, even Whisper's exact transcript of an English revenue question scored 0.282: answerable questions scored 0.074–0.983, unanswerable ones ≤ 0.013, so `retrieval.min_rerank_score` is **0.05** until phase 2 re-tunes it on the eval set). Changes: (1) the router also emits an **English search query** for non-English turns and the reranker scores that; (2) abstention uses **top score + gap to the next candidate + dense similarity**, thresholds tuned on the eval set.
+- **Reranker scores are not calibrated across languages.** A fixed 0.3 abstention cutoff would reject real Hindi questions (and, measured in phase 4 on the smoke documents, even Whisper's exact transcript of an English revenue question scored 0.282: answerable questions scored 0.074–0.983, unanswerable ones ≤ 0.013, so `retrieval.min_rerank_score` became 0.05 until phase 2). **Phase 2 re-tuned the gate on the 194-question eval:** unanswerable near misses score as high as answers (median 0.45; 12/12 "FY25" questions above 0.9), so no score threshold separates them — a fiscal-year check does (near-miss-year questions let through 12 → 5); Hindi calibration was mostly a cross-lingual-pair problem, and scoring Hindi passages with the Hindi question puts Hindi answerables at ≥ 0.11; top score + gap + dense similarity was tried, but dense similarity separates poorly (AUC 0.65) and was not adopted. `min_rerank_score` is **0.02**: 3/156 false abstains, 23/38 unanswerable questions through the gate, 3/38 answered end to end.
 
 ### 9.3 Smoke tests 06–07, 09 results (speech)
 
@@ -891,6 +895,7 @@ Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first
 | 0 Skeleton | ✅ done | PRs #1–#3 (hygiene, backend skeleton, frontend shell), #5 (CI), #8 (Docker images + `full` profile, `docker.config.json`, `strict_offline_local_hosts`) |
 | 1 Projects + text document chat | ✅ done | #10 persistence (SQLite + Alembic, projects/chats/messages/pins API), #11 ingestion + hybrid retrieval, #12 sidebar, project and chat pages, transcript view, #16 upload + background ingestion + streamed cited chat (transport-agnostic `ChatTurnService`), #14 upload UI + streaming composer + citation popovers. Verified end to end on the real models: FY24 EBITDA 18.2% cited p.2 in EN and HI, out-of-document question abstains, transcript survives reload |
 | 4–6 Voice loop | ✅ done | #17 + #19 protocol (§3.10), #21 voice session backend (VAD, speculative STT, Kokoro streaming, barge-in, preload), #20 voice-first chat page (presence field, captions, browser VAD barge-in, transcript panel, "Start a conversation"), #18 citation tables. Independently reviewed (both sides) and verified end to end on the real models in the browser: spoken question → cited spoken answer, barge-in with `heard_text`, backchannels ignored, stop, Hindi, reload, second tab, backend restart; first audio median ~3.2 s in the browser, 2.7–4.9 s across runs (§9.5) |
+| 2 Retrieval quality | ✅ done | eval set #22; tuning: R@1 71.8 → 85.6 %, R@5 87.8 → 96.8 %, MRR 0.797 → 0.920, page citations 74.4 → 88.5 %, end-to-end correct answers 79.5 → 92.9 %, unanswerable answered 4/38 → 3/38, retrieve p50 707 → 445 ms (document labels, fiscal-year veto, Hindi-aware reranking, small rerank batches, re-index on a chunking-version change) |
 | 3 + 7 Router, state, revisit features | ✅ done | #23 automatic titles, user summaries, transcript export; #24 router + conversation state + memory summary + drift and EN/HI/Hinglish switching: 43/43 intents on the labelled set with `qwen3:4b-instruct` (prompt tuned on that set), router p50 ≈ 0.65 s / p95 ≈ 1 s on routed turns, 0 on fast-path turns; #25 summary/export/title UI and routed-answer labels; #29 title job lane |
 | 10 Live visual canvas | in progress | **part of the MVP** (user decision 2026-10-09); §12.1, contract v1 |
 
