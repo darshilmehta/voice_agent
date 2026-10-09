@@ -51,8 +51,10 @@ Docker Desktop, Python 3.12, Node 24 and ffmpeg are also expected.
 Backend on `127.0.0.1:8000` ([`backend/README.md`](backend/README.md)):
 
 ```bash
-cd backend && uv sync && uv run python -m app
+cd backend && uv sync --group ml && uv run python -m app
 ```
+
+`--group ml` installs the local models' libraries (Docling, BGE-M3, the reranker, Whisper, Kokoro, Silero); without it the app starts but documents, retrieval and voice are unavailable (`/health` marks them `degraded`). The model weights come from `scripts/setup/download_models.sh all`, and Qdrant (`docker compose -f infra/docker-compose.yml up -d qdrant`) and Ollama with `qwen3:4b-instruct` must be running. The models preload for ~20–35 s after startup (`/health` → `preload: ready`).
 
 Frontend on `127.0.0.1:3000` ([`frontend/README.md`](frontend/README.md)):
 
