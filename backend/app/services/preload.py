@@ -24,13 +24,13 @@ from typing import Literal
 from pydantic import BaseModel
 
 from ..providers.base import PlaceholderProvider
-from ..providers.llm import LLMClient, LLMError, LLMMessage
+from ..providers.llm import LLMClient, LLMMessage
 from ..providers.models import ModelUnavailableError
 from ..providers.registry import Container
 from ..providers.speech import SpeechSynthesizer
 from ..settings import Settings
 from .prompts import answer_system_prompt
-from .router import LLMTurnRouter, RouteRequest
+from .router import RouteRequest, router_messages
 from .voice.fillers import filler_audio
 
 log = logging.getLogger(__name__)
@@ -149,13 +149,10 @@ class ModelPreloader:
 
 
 async def warm_prompts(llm: LLMClient, settings: Settings) -> None:
-    """The router's prompt (a real router call, JSON schema and all) and the voice answer's system prompt in each
-    configured language, read once by the model."""
+    """The router's prompt and the voice answer's system prompt in each configured language, read once by the model
+    (one token each: Ollama's prompt cache keeps them; the JSON schema only constrains sampling)."""
     request = RouteRequest("Hello, can you hear me?", settings.client.default_language)
-    try:
-        await LLMTurnRouter(llm, settings.llm.router_model).propose(request)
-    except LLMError as e:  # the model's reply doesn't matter, only that it read the prompt
-        log.info("preload: the router warm-up call returned no valid route (%s)", e)
+    await llm.warm_up([router_messages(request)], model=settings.llm.router_model)
     answers = [
         [LLMMessage("system", answer_system_prompt(language, "short")), LLMMessage("user", "Hello")]
         for language in settings.client.languages

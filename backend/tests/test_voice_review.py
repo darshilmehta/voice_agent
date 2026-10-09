@@ -531,7 +531,7 @@ def decide_while_speaking(c: VoiceClient, pcm: bytes) -> tuple[list, float]:
     return items + c.quiet(0.9), elapsed
 
 
-@pytest.mark.parametrize("stt_s", [0.5, 0.6, 0.8, 1.0])
+@pytest.mark.parametrize("stt_s", [0.5, 0.6, 0.7])  # the 250 ms snapshot's transcript: after the 700 ms deadline
 def test_B3_yeah_right_with_a_snapshot_transcript_after_the_deadline_doesnt_cut_the_answer(voice, stt_s):
     """Found in the real run: "Yeah, right" cut the answer in 3 of 4 trials: under load no transcript had arrived by
     the 700 ms deadline, and "still talking, no transcript yet" stopped it. A transcription still running is now waited

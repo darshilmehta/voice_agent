@@ -494,14 +494,14 @@ def test_short_queries_that_ask_for_something_are_sent(question):
 
 
 def test_a_cue_that_leaves_nothing_to_search_drops_the_tool_and_keeps_the_hint():
-    """N1 end to end: "how is it doing today?" has a cue but no subject. The tool is dropped (nothing leaves), the
-    plan notes that live data was asked for and isn't there, and ``live`` stays set for the prompt's hint."""
+    """N1 end to end: "how is it doing today?" has a cue but no subject. The tool is dropped (nothing leaves), no
+    notice is planned (as with the tool off), and ``live`` stays set for the prompt's hint."""
     req = request("how is it doing today?")
     d = with_live_tools(decision_for(req, "general_qa"), req)
     assert d.route.tools == ["web_search"] and d.live == "today"
     dropped, query, note = live_search(d, req)
-    assert (query, note, dropped.route.tools) == (None, "failed", [])
-    assert "no English search query" in dropped.overrides[-1] and dropped.live == "today"
+    assert (query, note, dropped.route.tools) == (None, None, [])
+    assert "no usable search query" in dropped.overrides[-1] and dropped.live == "today"
 
 
 # ------------------------------------------------------------------ the route

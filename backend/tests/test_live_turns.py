@@ -431,14 +431,14 @@ async def test_a_document_question_with_a_live_cue_but_no_usable_search_query_ge
     one-line "never guess current figures" hint, the same as when the tool is off."""
     from app.services import planning
 
-    monkeypatch.setattr(planning, "web_query", lambda *a, **k: None)
+    monkeypatch.setattr(planning, "web_query", lambda *a, **k: None)  # nothing worth searching for in it
     world.fakes.llm.route = lambda messages: {"intent": "document_qa", "query": None}
-    events, agent = await ask(world, "Explain the real-time monitoring section of the report")
+    events, agent = await ask(world, "How is the revenue doing right now?")
     assert world.web.queries == [] and "tool:start" not in kinds(events)
     assert not any(agent.text.startswith(n["en"]) for n in LIVE_NOTICES.values())
     r = agent.route
     assert (r["tools"], r["live_note"], r["web_search"]) == ([], None, None)
-    assert r["router"]["live_cue"] == "real-time" and "no usable search query" in r["router"]["overrides"][-1]
+    assert r["router"]["live_cue"] == "right now" and "no usable search query" in r["router"]["overrides"][-1]
     assert LIVE_HINT in answer_prompts(world)[0][0].content
 
 
