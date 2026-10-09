@@ -49,6 +49,35 @@ def live(make_app, fakes) -> Iterator[Voice]:
         yield Voice(api, fakes, new_chat(api, project))
 
 
+CONTINUED = "A second source adds heavy volume [W2]."
+CONTINUED_SPOKEN = "A second source adds heavy volume."
+
+
+def continuing_reply(messages: list[LLMMessage]) -> str:
+    """As ``live_reply``; the prompt for results that arrived after the answer gets a sentence citing the new one."""
+    if "More web results arrived" in messages[-1].content:
+        return CONTINUED
+    return live_reply(messages)
+
+
+@pytest.fixture
+def continuing(make_app, fakes) -> Iterator[Voice]:
+    """Two results, the second 0.3 s after the answer started; two continuations are allowed and the search then
+    stays open for the rest of its 4 s, so the turn is still waiting for it after the first continuation."""
+    fakes.web = FakeWebSearch([(0.0, web_result(1)), (0.3, web_result(2))])
+    fakes.web.hang = True
+    fakes.llm.reply = continuing_reply
+    fakes.stt.scripts.update({LIVE: LIVE_Q, CORRECTION: "No wait, what was the EBITDA margin in FY24?"})
+    env = {
+        "TOOLS__WEB_SEARCH__TIMEOUT_S": "4",
+        "TOOLS__WEB_SEARCH__PARTIAL_WAIT_MS": "50",
+        "TOOLS__WEB_SEARCH__MAX_CONTINUATIONS": "2",
+    }
+    with make_app(**env) as api:
+        project, _ = project_with_report(api)
+        yield Voice(api, fakes, new_chat(api, project))
+
+
 class TimedClient(VoiceClient):
     """Also records when each message arrived."""
 
@@ -202,6 +231,36 @@ def test_speech_after_a_heard_answer_while_the_web_still_runs_is_not_a_barge_in(
     assert after.index(one(after, "agent_message")) < after.index(one(after, "user_message"))
     assert one(after, "turn")["turn_id"] == 2
     assert live.fakes.web.cancelled == 1
+
+
+def test_a_kept_continuation_is_spoken_at_once_not_when_the_turn_ends(continuing):
+    """N2: a continuation sentence goes to the speech chunker's flush as soon as it is kept, not with the turn's final
+    flush. The turn here keeps waiting for the search (a further continuation) for seconds after it, so an unspoken
+    sentence would sit in the chunker all that time, and speech after the answer's played audio would count as
+    "answer fully heard" with the continuation neither spoken nor part of what was heard."""
+    with continuing.connect() as ws:
+        c = VoiceClient(ws)
+        c.start()
+        c.say(LIVE)
+        items = c.until(lambda m: isinstance(m, dict) and m.get("text") == CONTINUED_SPOKEN, timeout=2.5)
+        # (unfixed, that chunk comes with the search's end at 4 s)
+        assert not [t for t in of(items, "tool") if t["phase"] in ("done", "timeout")]  # the search is still open
+        assert not of(items, "agent_message")
+        deltas = of(items, "delta")
+        assert deltas[-1]["text"] == " " + CONTINUED
+        assert items.index(deltas[-1]) < items.index(of(items, "audio_chunk")[-1])  # shown before it is spoken
+        assert [ch["text"] for ch in of(items, "audio_chunk")][-3:] == [
+            "Up 2% today.", "The report says revenue grew 34%.", CONTINUED_SPOKEN,
+        ]  # fmt: skip
+        # all of it played: the next speech is no barge-in, and the saved answer has the continuation
+        items += c.until(lambda m: isinstance(m, bytes) and parse_frame(m)[1:3] == (3, 2))  # its last frame
+        c.send("playback", turn_id=1, played_ms=60_000)
+        c.say(CORRECTION, ms=400)
+        after = c.until("turn")
+    assert not of(after, "barge_in") and {"type": "state", "state": "interrupted"} not in after
+    agent = one(after, "agent_message")["message"]
+    assert agent["text"] == "Up 2% today [W1]. The report says revenue grew 34% [S1]. " + CONTINUED
+    assert agent["heard_text"] is None and agent["route"]["stopped"] is False and "interrupted" not in agent["route"]
 
 
 def test_a_tts_failure_on_the_filler_doesnt_silence_the_answer(live, monkeypatch):
