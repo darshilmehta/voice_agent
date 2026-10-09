@@ -45,8 +45,13 @@ def upload(api: TestClient, project_id: str, name: str, content: bytes, ctype: s
 
 
 def drain(api: TestClient) -> None:
-    """Wait for the background ingestion jobs (and the idle hook after them)."""
-    _run(api, api.app.state.container["job_queue"].join)  # type: ignore[attr-defined]
+    """Wait for the background jobs (and the idle hooks after them), including jobs that jobs of another lane queued
+    meanwhile (the startup re-index check, a short job, queues re-ingestions in the long lane)."""
+    queue = api.app.state.container["job_queue"]  # type: ignore[attr-defined]
+    while True:
+        _run(api, queue.join)
+        if not queue.queued and not queue.running:
+            return
 
 
 def wait_for_status(api: TestClient, doc_id: str, status: str, timeout: float = 3.0) -> dict:

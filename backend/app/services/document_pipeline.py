@@ -35,7 +35,7 @@ from ..providers.ingestion import Chunk, IngestionError, ParsedDocument
 from ..providers.models import ModelUnavailableError
 from ..providers.registry import Container
 from ..providers.retrieval import VectorStore
-from ..providers.runtime import LANE_LONG, JobQueue
+from ..providers.runtime import LANE_LONG, LANE_SHORT, JobQueue
 from ..providers.storage import MetadataDB, ObjectNotFound, ObjectStore
 from ..settings import Settings
 from .base import InvalidInput, Unavailable
@@ -221,9 +221,10 @@ class DocumentPipeline:
             self.queue.on_idle(self._release_parser, lane=LANE_LONG)
             jobs = await self.documents.recover_interrupted()
             if await self.documents.indexed_documents():
-                # A job like the ingestions (in the background, never failing startup); it needs no model, so it
-                # doesn't wait for the preload, but the re-ingestions it queues do.
-                await self.queue.submit("re-index check", self.reindex_outdated)
+                # In the background, never failing startup. A quick job (database and vector-store counts, no model):
+                # the short lane, so nothing waits for it and the long lane stays idle when nothing is outdated. The
+                # re-ingestions it queues go to the long lane and wait for the preload like any ingestion.
+                await self.queue.submit("re-index check", self.reindex_outdated, lane=LANE_SHORT)
         except NotImplementedError as e:  # placeholder providers (cloud template in tests): nothing to run
             log.warning("document pipeline not started: %s", e)
             return
