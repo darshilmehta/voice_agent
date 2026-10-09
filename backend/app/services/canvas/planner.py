@@ -110,7 +110,9 @@ _SUGGESTED = _gate(
 _PERIOD_TOKEN = re.compile(
     r"\b(?:(?:Q[1-4]|H[12])\s*FY\s?'?\d{2,4}|FY\s?'?\d{2,4}|Q[1-4]|H[12]|(?:19|20)\d{2})\b", re.I
 )
-_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
+# A figure, not digits inside an identifier: "L24119GJ1994PLC023871" (a CIN), "GHI/2024/00418377" (a policy number) or
+# the grade "L5" are not three numbers worth a chart.
+_NUMBER = re.compile(r"(?<![A-Za-z0-9/_])\d[\d,]*(?:\.\d+)?(?![A-Za-z0-9/_])")
 
 
 def visual_intent(question: str, answer: str | None = None) -> Intent:
