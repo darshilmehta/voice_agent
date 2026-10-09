@@ -294,7 +294,7 @@ So "session" now only means a live connection; anything persisted is a project, 
 **Behaviour.**
 
 - A chat answers from **its project's documents** (Qdrant filter on `project_id`), optionally narrowed to selected documents per chat. Documents never leak across projects.
-- New chats get an **automatic title** from the first question (editable).
+- New chats get an **automatic title** after the first answer (≤ 6 words, in the chat's language; a background job, off the answer's path; falls back to the first question; never replaces a title the user set).
 - **Pinning:** projects and chats can be pinned; pinned items appear at the top of the sidebar.
 - **Deleting** a chat removes its messages and summaries; deleting a project removes its documents, vectors, uploads, chats and summaries. Everything is local, so delete really deletes.
 
@@ -370,8 +370,9 @@ DELETE            /api/documents/{id}
 GET/POST          /api/projects/{id}/chats            list / create
 PATCH/DELETE      /api/chats/{id}                     rename, pin, document scope / delete
 GET               /api/chats/{id}/messages            transcript, paginated
-GET               /api/chats/{id}/transcript?format=md|json   export
-GET/POST          /api/chats/{id}/summary             read / generate or refresh
+GET               /api/chats/{id}/export?format=md|json   export (attachment; Content-Disposition exposed to the frontend)
+GET/POST          /api/chats/{id}/summary             read / generate or refresh (?language=en|hi; unchanged chat → stored copy)
+POST              /api/chats/{id}/title:regenerate    new automatic title (?force=true replaces a user title)
 WS                /ws/chats/{id}                      live voice or text session for that chat
 ```
 
