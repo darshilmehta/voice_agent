@@ -16,6 +16,12 @@
  * "Searching your documents…" until sources arrive, the answer streaming in with a caret, then the saved answer.
  * Failures show inline on their turn with Retry. While you're at the bottom the view follows new text; scroll up
  * and it stays where you are, with a button to jump back to the latest.
+ *
+ * Live web search (docs/DESIGN.md §3.7): a turn that searches the web shows a "Searching the web…" badge until the
+ * answer starts, then a quiet "Searched the web for “…”" (exactly what left the machine); web results are `[W#]`
+ * chips and a globe chip in the source list (documents first, then web); the label says when the answer includes live
+ * web results; and `route.live_note` explains missing live data. With `features.web_search` off the badge, the note
+ * and the hint are hidden; web citations still render, as on any old message.
  */
 
 import { Fragment, memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -25,6 +31,7 @@ import {
   errorMessage,
   isAbort,
   type Chat,
+  type Citation,
   type Message,
   type ProjectDocument,
   type SourcesPayload,
@@ -34,17 +41,33 @@ import type { Turn } from "@/lib/chat-turns";
 import { citedIds, toSourceRefs, type SourceRef } from "@/lib/citations";
 import { clockTime, dayKey, dayLabel, fullDateTime, plural } from "@/lib/format";
 import { cutNote, cutReasonOf, stoppedNote } from "@/lib/interruption";
-import { BASIS_LABEL, answerKindOf, basisOf, isBrief, showsSources, understoodAsByUser, type Basis } from "@/lib/route";
+import {
+  BASIS_LABEL,
+  LIVE_NOTE_TEXT,
+  WEB_NOTE,
+  answerKindOf,
+  basisOf,
+  isBrief,
+  isWebBasis,
+  liveNoteOf,
+  showsSources,
+  sourcesToShow,
+  understoodAsByUser,
+  type Basis,
+} from "@/lib/route";
+import { searchOfRoute, type WebSearchState } from "@/lib/web-search";
 
 import { AnswerText, CitationPopoverProvider, SourceList } from "./Citations";
 import { Icon } from "./Icon";
 import { BackendDown, EmptyState } from "./States";
+import { WebSearchNote } from "./WebSearchNote";
 
 const PAGE = 50;
 /** Within this many pixels of the end counts as "at the bottom": new text keeps the view pinned there. */
 const PIN_SLACK = 48;
 const JUMP_AFTER = 200;
 const NO_CITATIONS: never[] = [];
+const NO_SEARCHES: Record<string, WebSearchState> = {};
 
 const LANGUAGE_LABEL: Record<string, string> = { en: "English", hi: "Hindi" };
 
@@ -83,7 +106,16 @@ interface TranscriptProps {
   /** Messages the voice session saved while this page was open (the session's `user_message` / `agent_message`). */
   voiceMessages?: Message[];
   /** The voice turn in progress, before it is saved: what the user is saying, what the agent has written so far. */
-  voice?: { userText: string | null; agentText: string | null; sources: SourcesPayload | null } | null;
+  voice?: {
+    userText: string | null;
+    agentText: string | null;
+    sources: SourcesPayload | null;
+    /** The turn's web search, and the web results that arrived (a `[W3]` only a late `tool results` carries). */
+    search: WebSearchState | null;
+    webSources: Citation[];
+  } | null;
+  /** What the web search of each message the voice session saved was (by message id): the note of what was searched. */
+  voiceSearches?: Record<string, WebSearchState>;
   /**
    * Scroll to the message with this `seq` and highlight it (loading earlier pages until it is there). `n` tells one
    * request from the next; `onFocusDone` is called with it once the message was shown, or can't be found.
@@ -104,6 +136,7 @@ export function Transcript({
   busy = false,
   voiceMessages = NO_MESSAGES,
   voice = null,
+  voiceSearches = NO_SEARCHES,
   focus = null,
   onFocusDone,
 }: TranscriptProps) {
@@ -126,6 +159,7 @@ export function Transcript({
 
   const chatId = chat.id;
   const showDebug = config?.features.debug_panel ?? false;
+  const webOn = config?.features.web_search === true;
 
   // Open at the latest messages: before = message_count + 1. If messages arrived since the chat was loaded, the
   // page's `total` says so and we ask again from the true end.
@@ -438,6 +472,7 @@ export function Transcript({
                     message={m}
                     docsById={docsById}
                     showDebug={showDebug}
+                    webOn={webOn}
                     understood={understood.get(m.id)}
                     flash={m.seq === flashSeq}
                   />
@@ -459,6 +494,8 @@ export function Transcript({
                         message={m}
                         docsById={docsById}
                         showDebug={showDebug}
+                        webOn={webOn}
+                        search={voiceSearches[m.id]}
                         understood={understood.get(m.id)}
                         flash={m.seq === flashSeq}
                       />
@@ -481,6 +518,7 @@ export function Transcript({
                         message={t.user}
                         docsById={docsById}
                         showDebug={showDebug}
+                        webOn={webOn}
                         understood={understood.get(t.user.id)}
                         flash={t.user.seq === flashSeq}
                       />
@@ -491,6 +529,7 @@ export function Transcript({
                       turn={t}
                       docsById={docsById}
                       showDebug={showDebug}
+                      webOn={webOn}
                       busy={busy}
                       onRetry={onRetry}
                     />
@@ -511,7 +550,13 @@ export function Transcript({
                 </li>
               )}
               {liveVoice?.agentText != null && (
-                <LiveVoiceAnswer text={liveVoice.agentText} sources={liveVoice.sources} docsById={docsById} />
+                <LiveVoiceAnswer
+                  text={liveVoice.agentText}
+                  sources={liveVoice.sources}
+                  extra={liveVoice.webSources}
+                  search={webOn ? liveVoice.search : null}
+                  docsById={docsById}
+                />
               )}
             </ol>
           )}
@@ -570,18 +615,32 @@ function bySourceId(refs: SourceRef[]): Record<string, SourceRef> {
   return out;
 }
 
-/** Sources for chips: the message's own citations first, then (live turns) what retrieval returned. */
-function useSources(text: string, citations: unknown, live: SourcesPayload | null | undefined, docsById: Record<string, ProjectDocument>) {
+/**
+ * Sources for chips: the message's own citations first (the saved ones are authoritative), then (live turns) what
+ * retrieval returned, then the web results that arrived with the search (`extra`: a `[W3]` that only a continuation's
+ * `tool results` carries).
+ */
+function useSources(
+  text: string,
+  citations: unknown,
+  live: SourcesPayload | null | undefined,
+  docsById: Record<string, ProjectDocument>,
+  extra?: Citation[],
+) {
   return useMemo(() => {
     const own = toSourceRefs(citations, docsById);
-    const map = { ...bySourceId(live ? toSourceRefs(live.sources, docsById) : []), ...bySourceId(own) };
+    const map = {
+      ...bySourceId(extra ? toSourceRefs(extra, docsById) : []),
+      ...bySourceId(live ? toSourceRefs(live.sources, docsById) : []),
+      ...bySourceId(own),
+    };
     // The list under the bubble shows what the text cites; older citations without markers are listed as they are.
     const cited = citedIds(text)
       .map((id) => map[id])
       .filter((r): r is SourceRef => !!r);
     const listed = own.length ? [...own, ...cited.filter((c) => !own.some((o) => o.key === c.key))] : cited;
     return { map, listed };
-  }, [text, citations, live, docsById]);
+  }, [text, citations, live, docsById, extra]);
 }
 
 function MessageMeta({ m, isUser, extra }: { m: Message; isUser: boolean; extra?: ReactNode }) {
@@ -609,15 +668,24 @@ const MessageItem = memo(function MessageItem({
   message: m,
   docsById,
   showDebug,
+  webOn = false,
   live,
+  extra,
+  search,
   understood,
   flash = false,
 }: {
   message: Message;
   docsById: Record<string, ProjectDocument>;
   showDebug: boolean;
+  /** `features.web_search`: the note of what was searched and the hint about missing live data show only when on. */
+  webOn?: boolean;
   /** For an answer given on this page: what retrieval returned (fills in chips, says whether it abstained). */
   live?: SourcesPayload | null;
+  /** For an answer given on this page: the web results the search brought (the saved citations win over them). */
+  extra?: Citation[];
+  /** The live web search of this answer, when this page saw it (the saved route may carry only the query). */
+  search?: WebSearchState | null;
   /**
    * A user message the router understood differently (a correction, a follow-up, a word Whisper mis-heard): the
    * question it worked from. Quiet by default: "Understood as: …" shows when the message is hovered or focused, and
@@ -627,7 +695,7 @@ const MessageItem = memo(function MessageItem({
   /** Highlight it for a moment (it was jumped to from the summary). */
   flash?: boolean;
 }) {
-  const { map, listed } = useSources(m.text, m.citations, live, docsById);
+  const { map, listed } = useSources(m.text, m.citations, live, docsById, extra);
   // "Understood as: …" is hidden until the message is hovered or focused; the toggle in the meta row keeps it open.
   const [understoodOpen, setUnderstoodOpen] = useState(false);
   const understoodId = useId();
@@ -647,8 +715,12 @@ const MessageItem = memo(function MessageItem({
   // What the router decided shapes the labels: general-knowledge and mixed answers say where they come from, a short
   // acknowledgement is a light bubble with no sources, a clarifying question says it asked one.
   const kind = isUser ? null : answerKindOf(m);
-  const basis = isUser ? null : basisOf(m, listed.length > 0);
+  const hasWeb = listed.some((r) => r.kind === "web");
+  const basis = isUser ? null : basisOf(m, { documents: listed.some((r) => r.kind === "document"), web: hasWeb });
   const brief = isBrief(kind);
+  // What was searched (exactly what left the machine) and why live data is missing: only while web search is on.
+  const searched = webOn && !isUser ? (search && search.status !== "ended" ? search : (searchOfRoute(m.route) ?? search ?? null)) : null;
+  const liveNote = webOn && !isUser ? liveNoteOf(m) : null;
   // The documents didn't cover it: "Not in your documents", unless it was answered from general knowledge on purpose.
   const abstained = !isUser && !basis && (live?.abstained ?? abstainedFlag(m));
   const heard = m.heard_text;
@@ -735,7 +807,15 @@ const MessageItem = memo(function MessageItem({
         </p>
       )}
 
-      {!isUser && showsSources(kind) && <SourceList sources={listed} />}
+      {searched && <WebSearchNote search={searched} />}
+      {liveNote && (
+        <p className="msg-note msg-note-quiet">
+          <Icon name="info" size={12} />
+          {LIVE_NOTE_TEXT[liveNote]}
+        </p>
+      )}
+
+      {!isUser && showsSources(kind) &&<SourceList sources={sourcesToShow(kind, listed)} />}
 
       {/* A cut voice answer already says how it was cut (and is usually complete, so "wasn't written" would be wrong). */}
       {!isUser && (stopped || droppedUnheard) && !cutOff && (
@@ -776,9 +856,10 @@ function AbstainLabel() {
 
 /** Where an answer's content comes from, when it isn't (only) the documents. Same quiet treatment as the abstention. */
 function BasisLabel({ basis }: { basis: Basis }) {
+  const web = isWebBasis(basis);
   return (
-    <span className="abstain-label basis-label" data-basis={basis}>
-      <Icon name={basis === "mixed" ? "doc" : "info"} size={14} />
+    <span className="abstain-label basis-label" data-basis={basis} title={web ? WEB_NOTE : undefined}>
+      <Icon name={web ? "globe" : basis === "mixed" ? "doc" : "info"} size={14} />
       {BASIS_LABEL[basis]}
     </span>
   );
@@ -790,13 +871,17 @@ function BasisLabel({ basis }: { basis: Basis }) {
 function LiveVoiceAnswer({
   text,
   sources,
+  extra,
+  search,
   docsById,
 }: {
   text: string;
   sources: SourcesPayload | null;
+  extra: Citation[];
+  search: WebSearchState | null;
   docsById: Record<string, ProjectDocument>;
 }) {
-  const { map, listed } = useSources(text, NO_CITATIONS, sources, docsById);
+  const { map, listed } = useSources(text, NO_CITATIONS, sources, docsById, extra);
   if (!text) return null;
   return (
     <li className="msg msg-agent" aria-busy="true">
@@ -811,6 +896,7 @@ function LiveVoiceAnswer({
       <div className="bubble">
         <AnswerText text={text} sources={map} streaming />
       </div>
+      {search && <WebSearchNote search={search} />}
       <SourceList sources={listed} />
     </li>
   );
@@ -857,23 +943,37 @@ function LiveAnswer({
   turn,
   docsById,
   showDebug,
+  webOn,
   busy,
   onRetry,
 }: {
   turn: Turn;
   docsById: Record<string, ProjectDocument>;
   showDebug: boolean;
+  webOn: boolean;
   busy: boolean;
   onRetry?: (key: string) => void;
 }) {
-  const { map, listed } = useSources(turn.answer, NO_CITATIONS, turn.sources, docsById);
+  const { map, listed } = useSources(turn.answer, NO_CITATIONS, turn.sources, docsById, turn.web.sources);
 
   if (turn.phase === "done" && turn.agent) {
-    return <MessageItem message={turn.agent} docsById={docsById} showDebug={showDebug} live={turn.sources} />;
+    return (
+      <MessageItem
+        message={turn.agent}
+        docsById={docsById}
+        showDebug={showDebug}
+        webOn={webOn}
+        live={turn.sources}
+        extra={turn.web.sources}
+        search={turn.web.search}
+      />
+    );
   }
   if (turn.phase === "sending") return null;
 
-  const abstained = turn.sources?.abstained ?? false;
+  // Not in the documents, but the web had it: that is an answer, not an abstention.
+  const webResults = turn.web.sources.length > 0 || (turn.sources?.sources ?? []).some((c) => c.kind === "web");
+  const abstained = !webResults && (turn.sources?.abstained ?? false);
   const hasText = turn.answer.length > 0;
   const streaming = turn.phase === "answering" && hasText;
   const waiting = (turn.phase === "searching" || turn.phase === "answering") && !hasText;
@@ -915,6 +1015,8 @@ function LiveAnswer({
           <AnswerText text={turn.answer} sources={map} streaming={streaming} />
         </div>
       )}
+
+      {webOn && turn.web.search && <WebSearchNote search={turn.web.search} />}
 
       {hasText && <SourceList sources={listed} />}
 

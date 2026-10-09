@@ -14,7 +14,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 
-import { MESSAGE_MAX_CHARS, errorMessage, type Chat, type Language, type ProjectDocument } from "@/lib/api";
+import { MESSAGE_MAX_CHARS, errorMessage, type Chat, type Citation, type Language, type ProjectDocument } from "@/lib/api";
 import { useAutoTitleRefresh } from "@/lib/auto-title";
 import { useBackend, useDocumentTitle } from "@/lib/backend-context";
 import { useChatTurns } from "@/lib/chat-turns";
@@ -69,6 +69,7 @@ export function ChatView({ chatId }: { chatId: string }) {
 }
 
 const LANGUAGES: readonly Language[] = ["en", "hi"];
+const NO_WEB_SOURCES: Citation[] = [];
 
 interface Blocked {
   reason: string;
@@ -125,13 +126,14 @@ function ChatPage({ chat }: { chat: Chat }) {
     void ws.loadChats(projectId, true);
     void ws.loadProjects(true);
   }, [ws, chatId, projectId]);
-  const conversation = useChatTurns(api, chatId, onSettled);
+  const { config } = useBackend();
+  // `features.web_search`: with it off the web search's badge and note stay off (web citations still render).
+  const conversation = useChatTurns(api, chatId, onSettled, { webSearch: config?.features.web_search === true });
   const { canAsk, blocked } = readiness(chat, docs);
   const language = LANGUAGES.includes(chat.language as Language) ? (chat.language as Language) : null;
 
   // Voice first (docs §1, §3.9): the page opens in voice mode, the transcript is a panel (open when reopening a chat
   // that has messages), and typing is a collapsed fallback. A new chat starts listening at once.
-  const { config } = useBackend();
   const voiceEnabled = config?.features.voice !== false;
   const { session, snapshot } = useVoiceSession(chat.id, language);
   const [autoStart] = useState(() => wantsAutoStart(chat.id));
@@ -217,6 +219,8 @@ function ChatPage({ chat }: { chat: Chat }) {
       userText: speaking ? snapshot.userText : null,
       agentText: answering ? voiceTurn.deltaText : null,
       sources: voiceTurn?.sources ?? null,
+      search: voiceTurn?.web.search ?? null,
+      webSources: voiceTurn?.web.sources ?? NO_WEB_SOURCES,
     };
   }, [snapshot.caption, snapshot.userFinal, snapshot.userSpeaking, snapshot.userText, snapshot.audible, snapshot.serverState, voiceTurn]);
 
@@ -228,6 +232,7 @@ function ChatPage({ chat }: { chat: Chat }) {
       busy={conversation.busy}
       onRetry={canAsk ? conversation.retry : undefined}
       voiceMessages={snapshot.messages}
+      voiceSearches={snapshot.searches}
       voice={voiceLive}
       focus={focus}
       onFocusDone={onFocusDone}

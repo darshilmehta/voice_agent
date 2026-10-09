@@ -79,6 +79,13 @@ const PATHS = {
       <path d="M12 11v5.5M12 7.8v.1" />
     </>
   ),
+  globe: (
+    <>
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M3.5 12h17M12 3.5c2.3 2.3 3.5 5.1 3.5 8.5s-1.2 6.2-3.5 8.5c-2.3-2.3-3.5-5.1-3.5-8.5S9.7 5.8 12 3.5z" />
+    </>
+  ),
+  external: <path d="M13.5 4.5h6v6M19 5 11 13M17.5 14v3.5a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2H10" />,
 } as const;
 
 export type IconName = keyof typeof PATHS;

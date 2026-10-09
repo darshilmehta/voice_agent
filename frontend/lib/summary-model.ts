@@ -23,11 +23,17 @@ export function normalizeSummary(raw: unknown): ChatSummary {
         const o = obj(k);
         const sources: SummarySource[] = list(o.sources).map((s) => {
           const so = obj(s);
+          const pageStart = int(so.page_start);
+          const pageEnd = int(so.page_end);
+          // A web result a key point drew on: the backend sends an explicitly empty `document_id` (not a missing
+          // or null one) with the site as `filename`, no pages and no link (docs/DESIGN.md §3.7).
+          const web = so.document_id === "" && pageStart === null && pageEnd === null;
           return {
             document_id: str(so.document_id) || null,
-            filename: str(so.filename, "Document") || "Document",
-            page_start: int(so.page_start),
-            page_end: int(so.page_end),
+            filename: str(so.filename, web ? "Web" : "Document") || (web ? "Web" : "Document"),
+            page_start: pageStart,
+            page_end: pageEnd,
+            ...(web ? { web: true } : {}),
           };
         });
         return { text: str(o.text).trim(), sources };

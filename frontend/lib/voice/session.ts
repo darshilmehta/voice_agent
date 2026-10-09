@@ -11,12 +11,17 @@
  * (the voice's levels, how far into a sentence playback is) are not in the snapshot: the presence field and the
  * captions read them from `player` and the analysers on each animation frame.
  *
+ * A turn that searches the web (docs/DESIGN.md §3.7) also gets `tool` messages and a filler `audio_chunk`
+ * (`filler: true`): `turn.web` holds the search (`searchingNow` says whether it is running: the label and the presence
+ * follow it, since the server stays in `speaking` through the silent search) and every web result that arrived.
+ *
  * Failure handling: an unexpected socket close reconnects with backoff (the microphone and VAD keep running); close
  * 4404 (no such chat) and 4409 (replaced by another session on this chat) end the session with an explanation;
  * `error` messages are shown and the session keeps listening.
  */
 
 import type { Language, Message, SourcesPayload } from "../api";
+import { applyTool, endSearch, NO_WEB, parseTool, type WebSearchState, type WebTurn } from "../web-search";
 import { MIC_ERROR_TEXT, MicError, openMic, voiceSupport, type MicCapture, type MicErrorKind } from "./capture";
 import { AgentPlayer } from "./playback";
 import {
@@ -40,6 +45,8 @@ export interface ChunkInfo {
   index: number;
   text: string;
   durationMs: number;
+  /** The short "Let me look that up." spoken while the web is searched: not part of the answer's text (§3.7). */
+  filler: boolean;
 }
 
 /** The agent's current answer: what it said, how, and from which sources. */
@@ -58,6 +65,8 @@ export interface TurnState {
   message: Message | null;
   /** Cut off by the user (barge-in stop or the stop button). */
   cut: boolean;
+  /** The turn's live web search (`tool` messages) and the web results that arrived for it. */
+  web: WebTurn;
 }
 
 export interface Notice {
@@ -92,6 +101,8 @@ export interface VoiceSnapshot {
   turn: TurnState | null;
   /** Messages the server saved during this page view, in order. */
   messages: Message[];
+  /** What the web search of each saved answer was (by message id), for the transcript's note of what was searched. */
+  searches: Record<string, WebSearchState>;
   vad: "off" | "loading" | "on" | "unavailable";
   attempt: number;
   /**
@@ -117,6 +128,7 @@ const INITIAL: VoiceSnapshot = {
   audible: false,
   turn: null,
   messages: [],
+  searches: {},
   vad: "off",
   attempt: 0,
   resyncs: 0,
@@ -127,6 +139,18 @@ export interface VoiceOptions {
   backendUrl: string;
   /** null: the server detects the language of each utterance. */
   language: Language | null;
+  /** `features.web_search`: false keeps the search's badge, label and note off (web results still resolve their markers). */
+  webSearch?: boolean;
+}
+
+/**
+ * The agent is searching the web right now: a search started and nothing has ended it. Nothing is, once the answer
+ * has sources or is saved, the turn is cut, or the session isn't live. The server stays in `speaking` through the
+ * silent search after the filler, so the label and the presence follow this instead.
+ */
+export function searchingNow(s: Pick<VoiceSnapshot, "phase" | "turn">): boolean {
+  const t = s.turn;
+  return s.phase === "live" && !!t && !t.cut && !t.message && t.web.search?.status === "searching";
 }
 
 // 0.4 s doubling up to 8 s: ten attempts keep trying for about a minute, which covers a backend restart with its
@@ -147,6 +171,7 @@ const freshTurn = (id: number | null, userSeq: number | null = null): TurnState 
   sources: null,
   message: null,
   cut: false,
+  web: NO_WEB,
 });
 
 export class VoiceSession {
@@ -216,6 +241,11 @@ export class VoiceSession {
   private patchTurn(change: (t: TurnState) => TurnState, id?: number | null): void {
     const base = this.snap.turn ?? freshTurn(id ?? null);
     this.set({ turn: change(base) });
+  }
+
+  /** The turn with its web search ended, when one was running (the session ended, the connection dropped, an error). */
+  private searchEnded(turn: TurnState | null): TurnState | null {
+    return turn && turn.web.search?.status === "searching" ? { ...turn, web: endSearch(turn.web) } : turn;
   }
 
   setOptions(opts: Partial<VoiceOptions>): void {
@@ -352,6 +382,7 @@ export class VoiceSession {
       vad: "off",
       attempt: 0,
       notice: null,
+      turn: this.searchEnded(this.snap.turn),
     });
   }
 
@@ -370,6 +401,7 @@ export class VoiceSession {
       audible: false,
       vad: "off",
       attempt: 0,
+      turn: this.searchEnded(this.snap.turn),
     });
   }
 
@@ -482,7 +514,14 @@ export class VoiceSession {
     // Whatever the agent was saying belongs to a session that no longer exists.
     this.cancelPlayback();
     this.reconnected = true;
-    this.set({ phase: "reconnecting", attempt, serverState: null, userSpeaking: false, ducked: false });
+    this.set({
+      phase: "reconnecting",
+      attempt,
+      serverState: null,
+      userSpeaking: false,
+      ducked: false,
+      turn: this.searchEnded(this.snap.turn),
+    });
     const delay = Math.min(8000, 400 * 2 ** (attempt - 1)) + Math.random() * 200;
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
@@ -620,7 +659,8 @@ export class VoiceSession {
         break;
       }
       case "state": {
-        this.set({ serverState: msg.state });
+        // `listening` means the agent isn't doing anything: a search still marked running was ended without a word.
+        this.set(msg.state === "listening" ? { serverState: msg.state, turn: this.searchEnded(this.snap.turn) } : { serverState: msg.state });
         // Words the user said that never became a message: a Stop that nothing answered is over, and the words go.
         // The server closes every `user_speech: start` with `end` and re-sends the state: `listening` when nothing was
         // going on, the agent's own state when it was answering (the speech was ignored). Anything but that agent
@@ -673,12 +713,24 @@ export class VoiceSession {
       case "turn":
         this.adopt(msg.turn_id);
         break;
+      case "tool": {
+        // The turn's web search (§3.7). Its results are merged into the turn's sources (a continuation can cite `[W3]`,
+        // which only a later `tool results` carries); the search state is what the badge, the label and the presence show.
+        const tool = parseTool(msg);
+        if (!tool || typeof msg.turn_id !== "number") break;
+        const turn = this.adopt(msg.turn_id);
+        if (!turn || turn.cut) break; // a turn that was cut off, or a late message of an old one
+        this.set({ turn: { ...turn, web: applyTool(turn.web, tool, this.opts.webSearch === true) } });
+        break;
+      }
       case "sources":
-        // `sources` has no turn id: it belongs to the turn in progress, unless that one was cut off.
+        // `sources` has no turn id: it belongs to the turn in progress, unless that one was cut off. The answer is
+        // starting, so the search is no longer what is being waited for (it may still bring more results).
         if (this.snap.turn?.cut) break;
         this.patchTurn((t) => ({
           ...t,
           sources: { sources: msg.sources ?? [], confidence: msg.confidence ?? null, abstained: msg.abstained === true },
+          web: endSearch(t.web),
         }));
         break;
       case "delta": {
@@ -691,7 +743,12 @@ export class VoiceSession {
         const turn = this.adopt(msg.turn_id);
         if (!turn || turn.cut) break;
         this._player?.announce(msg.turn_id, msg.chunk_index, msg.duration_ms);
-        const chunk: ChunkInfo = { index: msg.chunk_index, text: msg.text, durationMs: msg.duration_ms };
+        const chunk: ChunkInfo = {
+          index: msg.chunk_index,
+          text: msg.text,
+          durationMs: msg.duration_ms,
+          filler: msg.filler === true,
+        };
         const chunks = [...turn.chunks.filter((c) => c.index !== chunk.index), chunk].sort((a, b) => a.index - b.index);
         this.set({ turn: { ...turn, chunks }, ...this.agentCaption() });
         break;
@@ -714,7 +771,14 @@ export class VoiceSession {
           this.cutTurns.add(turn.id);
           this._player?.stopTurn(turn.id);
         }
-        this.set({ messages: this.withMessage(m), turn: { ...turn, message: m, cut }, caption: "agent" });
+        // The answer is saved: the search is over, and what it was stays with the message (the transcript's note).
+        const web = endSearch(turn.web);
+        this.set({
+          messages: this.withMessage(m),
+          searches: web.search ? { ...this.snap.searches, [m.id]: web.search } : this.snap.searches,
+          turn: { ...turn, message: m, cut, web },
+          caption: "agent",
+        });
         if (!cut && !resent && turn.id !== null) this._player?.completeTurn(turn.id);
         break;
       }
@@ -729,7 +793,8 @@ export class VoiceSession {
         }
         break;
       case "error":
-        this.set({ notice: { detail: msg.detail, stage: msg.stage, key: ++this.noticeKey } });
+        // The error path may send no terminal `tool` event: whatever search was running is over.
+        this.set({ notice: { detail: msg.detail, stage: msg.stage, key: ++this.noticeKey }, turn: this.searchEnded(this.snap.turn) });
         // A failed transcription (or any failure before the question was saved) leaves no message: clear the words.
         if (!this.snap.userFinal && this.snap.caption === "user" && !this.snap.userSpeaking) this.dropUserCaption();
         break;
@@ -822,7 +887,7 @@ export class VoiceSession {
     // Only the turn it names is cut: with the next question already placed, this is an older turn's stop.
     this.set({
       ducked: ofNewerTurn ? this.snap.ducked : false,
-      turn: cur && cur.id === turnId ? { ...cur, cut: true } : cur,
+      turn: cur && cur.id === turnId ? { ...cur, cut: true, web: endSearch(cur.web) } : cur,
     });
   }
 
@@ -842,11 +907,11 @@ export class VoiceSession {
       // The answer in progress (still being written, or written and still being spoken) has an id: cut it off.
       this.cutTurns.add(cur.id);
       this._player?.stopTurn(cur.id);
-      this.set({ ducked: false, turn: { ...cur, cut: true } });
+      this.set({ ducked: false, turn: { ...cur, cut: true, web: endSearch(cur.web) } });
     } else if (cur && cur.id === null && !cur.cut) {
       // The question is saved but its answer has no id yet: mark it, so the turn is cancelled when it gets one.
       this.stopPending = true;
-      this.set({ ducked: false, turn: { ...cur, cut: true } });
+      this.set({ ducked: false, turn: { ...cur, cut: true, web: endSearch(cur.web) } });
     } else {
       // Nothing in flight we know of (the question is still being transcribed): cancel the turn that arrives.
       this.stopPending = true;

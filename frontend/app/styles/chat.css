@@ -375,6 +375,21 @@
   background: var(--selected);
 }
 
+/* A live web result in the source list: a globe and the site, in the web teal. */
+.cite.cite-web {
+  background: var(--web-soft);
+  color: var(--web-text);
+}
+
+.cite.cite-web:hover,
+.cite.cite-web[aria-describedby] {
+  background: color-mix(in srgb, var(--web) 24%, transparent);
+}
+
+.cite-web > .icon {
+  flex: none;
+}
+
 .cite-num {
   display: inline-grid;
   place-items: center;
@@ -422,6 +437,18 @@
 
 .cite-chip:focus-visible {
   outline-offset: 1px;
+}
+
+/* [W1]: a live web result, in its own teal, with the "W" that tells it from the document passage [S1] */
+.cite-chip.web:not(.missing) {
+  background: var(--web-soft);
+  color: var(--web-text);
+}
+
+.cite-chip.web:not(.missing):hover,
+.cite-chip.web:not(.missing)[aria-describedby] {
+  background: var(--web);
+  color: var(--on-web);
 }
 
 .cite-chip.missing {
@@ -497,6 +524,70 @@
 @keyframes caret-blink {
   50% {
     opacity: 0;
+  }
+}
+
+/* What was searched on the web: "Searching the web…" while it runs, then "Searched the web for “…”". Quiet and small. */
+.web-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 0 4px;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.web-note > .icon {
+  flex: none;
+  color: var(--web-text);
+}
+
+.web-lead,
+.web-tail {
+  flex: none;
+}
+
+.web-query {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  opacity: 0.8;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.web-badge {
+  width: fit-content;
+  padding: 3px 12px 3px 9px;
+  border-radius: 999px;
+  background: var(--web-soft);
+  color: var(--web-text);
+  font-weight: 550;
+}
+
+.web-badge .web-query {
+  color: inherit;
+  font-weight: 450;
+}
+
+.web-badge > .icon {
+  animation: web-pulse 1.3s ease-in-out infinite;
+}
+
+@keyframes web-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .web-badge > .icon {
+    animation: none;
   }
 }
 

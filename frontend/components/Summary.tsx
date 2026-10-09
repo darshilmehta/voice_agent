@@ -153,18 +153,25 @@ const LANGUAGES: { id: Language; label: string; name: string }[] = [
 const LANGUAGE_NAME: Record<Language, string> = { en: "English", hi: "Hindi" };
 
 const SOURCE_NOTE = "Cited by this summary. The passage isn't stored with it; the transcript has the full answer.";
+const WEB_SOURCE_NOTE = "A web result this summary drew on. The summary doesn't keep the page's address; the transcript has the link.";
 
+/**
+ * The chips under a key point. A source from the web (live search, docs/DESIGN.md §3.7) carries only its site: it is a
+ * web chip (globe and site), not a document, and has no link to follow.
+ */
 function sourceRefs(sources: SummarySource[], docsById: Record<string, ProjectDocument>): SourceRef[] {
   const seen = new Set<string>();
   const out: SourceRef[] = [];
   for (const s of sources) {
-    const ref = toSourceRef(
-      { document_id: s.document_id ?? undefined, filename: s.filename, page_start: s.page_start, page_end: s.page_end },
-      docsById,
-    );
+    const ref = s.web
+      ? toSourceRef({ kind: "web", filename: s.filename, site: s.filename }, docsById)
+      : toSourceRef(
+          { document_id: s.document_id ?? undefined, filename: s.filename, page_start: s.page_start, page_end: s.page_end },
+          docsById,
+        );
     if (seen.has(ref.key)) continue;
     seen.add(ref.key);
-    out.push({ ...ref, note: SOURCE_NOTE });
+    out.push({ ...ref, note: s.web ? WEB_SOURCE_NOTE : SOURCE_NOTE });
   }
   return out;
 }
