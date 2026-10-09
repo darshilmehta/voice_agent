@@ -38,6 +38,17 @@ def test_ingest_file_indexes_every_chunk():
     assert parser.parsed._native is None  # Docling tree released after chunking
 
 
+def test_chunks_are_named_after_the_users_file_not_the_temporary_copy():
+    """The pipeline parses a copy named by document id; chunk labels (Chunk.document_label) need the real name."""
+    svc, parser, *_ = make_service([make_chunk(0)], source_name="doc_01abc.pdf")
+    res = asyncio.run(svc.ingest_file("/tmp/doc_01abc.pdf", "proj1", "doc1", 1, filename="Valmora FY24 report.pdf"))
+    assert parser.chunked[0].source_name == "Valmora FY24 report.pdf"
+    assert res.document.source_name == "Valmora FY24 report.pdf" and res.document._native is None  # released
+    svc, parser, *_ = make_service([make_chunk(0)], source_name="report.pdf")
+    asyncio.run(svc.ingest_file("/tmp/report.pdf", "proj1", "doc1", 1))
+    assert parser.chunked[0] is parser.parsed  # no name given: the parsed document as is
+
+
 def test_reingest_replaces_the_previous_version():
     store = FakeStore()
     old = [make_chunk(i, chunk_id=f"doc1:v1:{i:04d}", version=1) for i in range(3)]

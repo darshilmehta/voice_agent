@@ -195,6 +195,7 @@ class FakeParser(DocumentParser):
         self.chunks = chunks
         self.parsed_paths: list[Any] = []
         self.chunk_calls: list[dict[str, Any]] = []
+        self.chunked: list[ParsedDocument] = []  # the documents chunk() was given
 
     async def parse(self, path: Any) -> ParsedDocument:
         self.parsed_paths.append(path)
@@ -203,6 +204,7 @@ class FakeParser(DocumentParser):
 
     async def chunk(self, document: ParsedDocument, *, project_id: str, document_id: str, version: int) -> list[Chunk]:
         self.chunk_calls.append({"project_id": project_id, "document_id": document_id, "version": version})
+        self.chunked.append(document)
         return list(self.chunks)
 
 

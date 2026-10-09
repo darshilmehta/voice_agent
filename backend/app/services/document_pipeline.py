@@ -315,7 +315,9 @@ class DocumentPipeline:
             async with self.store.open_temp_copy(target.storage_key, filename=temp_name) as path:
                 stage = "ingest"
                 await self.documents.set_stage(job_id, stage)
-                result = await self.ingestion.ingest_file(path, target.project_id, doc_id, target.version)
+                result = await self.ingestion.ingest_file(
+                    path, target.project_id, doc_id, target.version, filename=target.filename
+                )
             stage = "persist"
             saved = await self.documents.finish_job(
                 job_id, page_count=result.page_count, chunk_count=result.chunk_count, tables=result.tables

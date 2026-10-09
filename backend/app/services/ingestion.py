@@ -62,12 +62,19 @@ class IngestionService:
             _expect(container["vector_store"], VectorStore),
         )
 
-    async def ingest_file(self, path: Path | str, project_id: str, document_id: str, version: int) -> IngestionResult:
+    async def ingest_file(
+        self, path: Path | str, project_id: str, document_id: str, version: int, *, filename: str | None = None
+    ) -> IngestionResult:
         """Index one document version. Afterwards the index holds exactly this version's chunks for
         ``document_id``: older versions and stale chunks are removed only once the new ones are stored, so the
-        document stays searchable throughout. Raises IngestionError (or ModelUnavailableError) on failure."""
+        document stays searchable throughout. Raises IngestionError (or ModelUnavailableError) on failure.
+
+        ``filename``: the name the user knows the document by, when ``path`` is a temporary copy with another name;
+        chunks are labelled with it (``Chunk.document_label``)."""
         t0 = time.perf_counter()
         parsed = await self.parser.parse(Path(path))
+        if filename and filename != parsed.source_name:
+            parsed = parsed.model_copy(update={"source_name": filename})
         t1 = time.perf_counter()
         try:
             chunks = await self.parser.chunk(parsed, project_id=project_id, document_id=document_id, version=version)
