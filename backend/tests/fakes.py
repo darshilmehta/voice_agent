@@ -6,7 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -474,10 +474,12 @@ class FakeSTT(SpeechRecognizer):
         self.fail_with: Exception | None = None
         self.delay = 0.0
 
-    async def transcribe(self, pcm16k: np.ndarray, languages: Sequence[str]) -> Transcript:  # type: ignore[override]
+    async def transcribe(  # type: ignore[override]
+        self, pcm16k: np.ndarray, languages: Sequence[str], *, prompts: Mapping[str, str] | None = None
+    ) -> Transcript:
         tone = round(float(np.abs(pcm16k).max()) * 100) if pcm16k.size else 0
         ms = len(pcm16k) * 1000 / IN_RATE
-        self.calls.append({"tone": tone, "ms": ms, "languages": list(languages)})
+        self.calls.append({"tone": tone, "ms": ms, "languages": list(languages), "prompts": prompts})
         if self.delay:
             try:
                 await asyncio.sleep(self.delay)
