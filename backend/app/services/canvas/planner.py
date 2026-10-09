@@ -42,21 +42,66 @@ log = logging.getLogger(__name__)
 
 Intent = Literal["requested", "suggested", "none"]
 
-_REQUESTED = re.compile(
-    r"\b(show|chart|graph|plot|visuali[sz]e|draw|display|dashboard|diagram|pie|bar\s+chart|line\s+chart|"
-    r"put\s+(it|that|this)\s+on\s+(the\s+)?screen|on\s+screen|"
-    r"dikhao|dikhaao|dikhaiye|dikhaye|dikha\s+do|dikhana|chart\s+banao|graph\s+banao)\b"
-    r"|दिखाओ|दिखाइए|दिखाएं|दिखाएँ|दिखा\s+दो|दिखाना|चार्ट|ग्राफ़|ग्राफ|आरेख",
-    re.I,
+_GATE_LETTER = "A-Za-z0-9ऀ-ॣ०-ॿ"
+
+
+def _gate(alternatives: str) -> re.Pattern[str]:
+    """Whole words or phrases, in English, Hinglish or Hindi (\\b fails after Hindi vowel signs)."""
+    return re.compile(f"(?<![{_GATE_LETTER}])(?:{alternatives})(?![{_GATE_LETTER}])", re.I)
+
+
+# The user asks to see something.
+_REQUESTED = _gate(
+    r"show|chart|charts|graph|graphs|plot|visuali[sz]e|draw|display|dashboard|diagram|pie|bar\s+chart|line\s+chart|"
+    r"put\s+(?:it|that|this|them)\s+on\s+(?:the\s+)?screen|on\s+(?:the\s+)?screen|"
+    r"put\s+(?:\S+\s+){1,6}?up\s+(?:against|next\s+to|beside|alongside|side\s+by\s+side)|"
+    r"let\s+me\s+see|can\s+i\s+see|i(?:\s+want|\s+would\s+like|['\u2019]d\s+like)\s+to\s+see|"
+    r"dikhao|dikhaao|dikhaiye|dikhayiye|dikhaye|dikha\s+do|dikhana|chart\s+banao|graph\s+banao|"
+    r"दिखाओ|दिखाइए|दिखाइये|दिखाएं|दिखाएँ|दिखा\s+दो|दिखाना|चार्ट|ग्राफ़|ग्राफ|आरेख"
 )
-_SUGGESTED = re.compile(
-    r"\b(compare|comparison|versus|vs\.?|trend|trends|over\s+(the\s+)?(years|quarters|time|period)|"
-    r"year\s+on\s+year|yoy|quarter\s+(by|on)\s+quarter|quarterly|breakdown|break\s+down|split|share|mix|"
-    r"composition|growth|grew|grown|increase|decrease|declined?|rise|rose|fell|fall|moved?|changed?|"
-    r"how\s+has|how\s+did|bridge|segment(s|-wise)?|by\s+segment|by\s+district|each|all\s+the|"
-    r"tulna|badhat|badha|ghata|hissa|rujhan)\b"
-    r"|तुलना|रुझान|बढ़त|वृद्धि|बढ़ा|घटा|हिस्सा|बंटवारा|हर\s+तिमाही|तिमाही|सालाना|खंड",
-    re.I,
+# ... unless "show" is what a document does ("What does the report show about debt?").
+_SHOWS = re.compile(r"\b(?:does|did|do|will|would)\s+(?:[^\s?.!।]+\s+){0,5}?show\b|\bshows\b", re.I)
+_VERBS_OF_CHANGE = (
+    r"move[ds]?|moving|change[ds]?|changing|grow|grows|grew|grown|growing|evolve[ds]?|trend\w*|perform\w*|fare[ds]?|"
+    r"stack\s+up|compare[ds]?|do|did|go|went|look"
+)
+_CATEGORY_NOUNS = (
+    r"segments?|business(?:es)?|divisions?|districts?|regions?|grades?|courses?|categor(?:y|ies)|plants?|"
+    r"facilit(?:y|ies)|units?"
+)
+_SUPERLATIVE = r"most|highest|lowest|largest|biggest|smallest|least|fastest|slowest|best|worst|top|sabse|सबसे"
+# The words suggest a visual helps: a trend, a comparison, a breakdown, a ranking of categories, a bridge, headline
+# numbers, dates. Plain facts ("What share of revenue came from exports?", "dividend per share", "each day") don't.
+_SUGGESTED = _gate(
+    # trends
+    r"trends?|trending|over\s+(?:the\s+)?(?:years|quarters|months|time|period)|year\s+(?:on|over)\s+year|yoy|"
+    r"quarter\s+(?:by|on|after|to|over)\s+quarter|quarterly|(?:each|every)\s+quarter|"
+    r"across\s+(?:the\s+|all\s+(?:the\s+)?)?(?:quarters|years|segments|businesses)|"
+    rf"how\s+(?:has|have|did|does|do|is|are)\s+(?:\S+\s+){{0,6}}?(?:{_VERBS_OF_CHANGE})|"
+    # comparisons
+    r"compare[ds]?|comparing|comparison|versus|vs\.?|stack\s+up|stacks\s+up|relative\s+to|"
+    r"against\s+(?:the\s+)?(?:previous|last|prior|same|a\s+year)|"
+    r"(?:better|worse|higher|lower|bigger|smaller|stronger|weaker)\s+than|"
+    r"(?:which|who)\s+(?:\S+\s+){0,5}?(?:better|worse|stronger|weaker)|"
+    r"(?:from|since|over|against|versus|than|with)\s+(?:the\s+)?(?:last|previous|prior)\s+year|"
+    r"(?:a|one)\s+year\s+(?:ago|earlier|before)|"
+    r"tulna|mukable|mukabale|muqable|pichle\s+saal|तुलना|मुक़ाबले|मुकाबले|पिछले\s+साल|"
+    # breakdowns
+    r"break\s*down|breakdown|break\s+(?:\S+\s+){1,4}?down|split\s+(?:by|across|between|of|into)|composition|"
+    r"distribution|(?:revenue|sales|business|product|segment|portfolio)\s+mix|made\s+up\s+of|consists?\s+of|"
+    rf"comprises?|by\s+(?:{_CATEGORY_NOUNS})|segment-?wise|district-?wise|each\s+(?:{_CATEGORY_NOUNS})|"
+    r"who\s+owns|ownership|shareholding|contribut\w*\s+(?:the\s+)?most|kis\s+kis|"
+    r"बंटवारा|बँटवारा|किस[\s-]+किस|जिलेवार|ज़िलेवार|खंडवार|"
+    # rankings of categories
+    rf"(?:which|what|kaun\s*s[aei]|kaunsa|kaunsi|कौन\s*स[ाीे]|किस)\s+(?:\S+\s+){{0,6}}?(?:{_SUPERLATIVE})|"
+    rf"(?:{_SUPERLATIVE})\s+(?:\S+\s+){{0,6}}?(?:which|kaun|किस|कौन)|rank\w*|top\s+(?:\d+|three|five|ten)|"
+    # bridges and headline numbers
+    r"walk\s+(?:me\s+|us\s+)?through|bridge|waterfall|turns?\s+into|from\s+(?:revenue|sales|ebitda)\s+(?:\S+\s+){0,3}?to|"
+    r"headline\s+(?:numbers|figures|metrics)|key\s+(?:numbers|figures|metrics|financials|highlights|indicators)|"
+    r"highlights|at\s+a\s+glance|snapshot|scorecard|ek\s+nazar|एक\s+नज़र|एक\s+नजर|मुख्य\s+(?:आंकड़े|आँकड़े|वित्तीय)|"
+    # dates
+    r"timeline|milestones|(?:key|important)\s+dates|schedule|"
+    r"rujhan|रुझान|हर\s+तिमाही|तिमाही\s+दर\s+तिमाही|har\s+(?:quarter|timahi|saal)"
 )
 # "Q3 FY24" is one period (a single quarter's figure is a fact, not a comparison); "Q3 and Q4", "FY23 vs FY24" are two.
 _PERIOD_TOKEN = re.compile(
@@ -66,16 +111,19 @@ _NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
 
 def visual_intent(question: str, answer: str | None = None) -> Intent:
-    """Is a visual worth it? "requested": the user asked to see something; "suggested": a trend, comparison,
-    breakdown, several periods, or an answer with three or more numbers; "none": a plain fact or a chat turn."""
-    if _REQUESTED.search(question):
+    """Is a visual worth it? "requested": the user asked to see something ("show", "chart", "put … up against",
+    "dikhao", "दिखाओ"); "suggested": a trend, a comparison, a breakdown, a ranking of categories ("which segment grew
+    the fastest"), a bridge, headline numbers, dates, two or more periods, or an answer with three or more numbers;
+    "none": a plain fact or a chat turn (EN, HI, Hinglish)."""
+    text = question.casefold()
+    if _REQUESTED.search(text) and not (_SHOWS.search(text) and not _REQUESTED.search(_SHOWS.sub(" ", text))):
         return "requested"
     if (
-        _SUGGESTED.search(question)
+        _SUGGESTED.search(text)
         or len({m.group(0).upper().replace(" ", "") for m in _PERIOD_TOKEN.finditer(question)}) >= 2
     ):
         return "suggested"
-    if answer is not None and len(_NUMBER.findall(answer)) >= 3:
+    if answer is not None and len(_NUMBER.findall(_PERIOD_TOKEN.sub(" ", answer))) >= 3:  # figures, not "FY24"
         return "suggested"
     return "none"
 
