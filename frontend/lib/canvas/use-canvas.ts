@@ -18,13 +18,16 @@ import { useToast } from "@/components/Toast";
 import { createCanvasApi, type Overview, type OverviewStatus } from "./client";
 import { subscribeCanvasEvents } from "./events";
 import { shellLabelsFor } from "./labels";
-import { INITIAL_CANVAS, canvasReducer, hasCanvasContent, type Pending } from "./state";
+import { INITIAL_CANVAS, canvasReducer, hasCanvasContent, nextSkeletonIn, visiblePending, type Pending } from "./state";
 import type { CanvasOp, Visual } from "./types";
 
 export interface CanvasController {
   panels: Visual[];
+  /** The visuals on their way worth showing: skeletons that have waited SKELETON_DELAY_MS, and failure notes. */
   pending: Pending[];
-  /** Something to show: a panel or a visual on its way. False draws no canvas chrome at all. */
+  /** A visual is on its way, shown yet or not (the chart code can start loading). */
+  preparing: boolean;
+  /** Something to show: a panel or a skeleton. False draws no canvas chrome at all. */
   hasContent: boolean;
   /** Ids with a pin / remove / move in flight. */
   busy: ReadonlySet<string>;
@@ -65,6 +68,17 @@ export function useCanvas(chatId: string): CanvasController {
 
   // The turn streams (text SSE and the voice socket) publish here.
   useEffect(() => subscribeCanvasEvents(chatId, (event) => dispatch({ type: "event", event, now: Date.now() })), [chatId]);
+
+  // A skeleton waits SKELETON_DELAY_MS for its `ready` before it shows (lib/canvas/state.ts): this clock is what it is
+  // judged by, moved to the moment the next one is due. It starts at 0, so nothing shows before its own timer fires.
+  const [clock, setClock] = useState(0);
+  useEffect(() => {
+    const wait = nextSkeletonIn(state.pending, Date.now());
+    if (wait === null) return;
+    const timer = window.setTimeout(() => setClock(Date.now()), wait);
+    return () => window.clearTimeout(timer);
+  }, [state.pending, clock]); // (a timer that fired a millisecond early finds the skeleton not yet due and waits again)
+  const shown = useMemo(() => visiblePending(state.pending, clock), [state.pending, clock]);
 
   // A visual that never settles (a lost event) doesn't keep its skeleton forever.
   const hasPending = state.pending.length > 0;
@@ -122,8 +136,9 @@ export function useCanvas(chatId: string): CanvasController {
 
   return {
     panels: state.panels,
-    pending: state.pending,
-    hasContent: hasCanvasContent(state),
+    pending: shown,
+    preparing: state.pending.some((p) => p.phase === "preparing"),
+    hasContent: hasCanvasContent({ ...state, pending: shown }),
     busy,
     announcement,
     op,

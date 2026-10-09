@@ -16,6 +16,7 @@ import { lazy, Suspense, useEffect, useRef, useState } from "react";
 
 import type { ProjectDocument } from "@/lib/api";
 import { shellLabelsFor } from "@/lib/canvas/labels";
+import { SKELETON_DELAY_MS } from "@/lib/canvas/state";
 import type { CanvasController } from "@/lib/canvas/use-canvas";
 
 import { Icon } from "../Icon";
@@ -44,10 +45,16 @@ export function CanvasPanel({
   const preparing = fresh.filter((p) => p.phase === "preparing");
 
   // The chart code starts loading as soon as a visual is on its way, so the skeleton becomes the chart without a second wait.
-  const anyPreparing = pending.some((p) => p.phase === "preparing");
+  const anyPreparing = canvas.preparing || pending.some((p) => p.phase === "preparing");
   useEffect(() => {
     if (anyPreparing) void loadBoard();
   }, [anyPreparing]);
+
+  // A skeleton on screen stays until its chart can replace it (the chart code may still be loading when `ready` comes).
+  const skeletons = useRef(new Set<string>());
+  useEffect(() => {
+    for (const p of preparing) skeletons.current.add(p.id);
+  });
 
   const gridRef = useRef<HTMLDivElement>(null);
   const [page, setPage] = useState(0);
@@ -85,7 +92,11 @@ export function CanvasPanel({
               </p>
             )}
           >
-            <Suspense fallback={panels.map((p) => <PanelSkeleton key={p.id} text={labels.preparing} />)}>
+            <Suspense
+              fallback={panels.map((p) => (
+                <DelayedSkeleton key={p.id} text={labels.preparing} immediate={skeletons.current.has(p.id)} />
+              ))}
+            >
               <LazyBoard panels={panels} updating={updating} busy={busy} docsById={docsById} onOp={op} />
             </Suspense>
           </CanvasBoundary>
@@ -128,6 +139,22 @@ export function CanvasPanel({
       )}
     </section>
   );
+}
+
+/**
+ * A skeleton that appears only if what it stands for hasn't arrived after SKELETON_DELAY_MS: the fallback of the lazy
+ * chart code, which is usually there within a frame (a chunk already fetched, or fetched while the draft was being
+ * made) and would otherwise flash a placeholder in the panel's place. `immediate`: a skeleton of this visual is on
+ * screen already, and stays until the chart replaces it (no blank frame between the two).
+ */
+export function DelayedSkeleton({ text, immediate = false }: { text: string; immediate?: boolean }) {
+  const [shown, setShown] = useState(immediate);
+  useEffect(() => {
+    if (immediate) return;
+    const timer = window.setTimeout(() => setShown(true), SKELETON_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [immediate]);
+  return shown ? <PanelSkeleton text={text} /> : null;
 }
 
 /** What a visual looks like while it is being prepared: a card with a title line and quiet bars, never a spinner. */
