@@ -3,6 +3,7 @@
 import { filenameFromDisposition } from "./download";
 import { readSse } from "./sse";
 import { normalizeSummary } from "./summary-model";
+import { parseTool, type ToolEvent } from "./web-search";
 
 export type Language = "en" | "hi";
 
@@ -104,22 +105,37 @@ export type Role = "user" | "agent" | "event";
 export type Modality = "voice" | "text";
 
 /**
- * A source an answer cites: the answer text marks it as `[S1]`, `[S2]`, … Every field is optional in the type because
- * messages saved before typed citations hold free-form JSON (e.g. `document_id`, `page`, `chunk_id`); read them
- * through `lib/citations.ts`, which tolerates both.
+ * A source an answer cites: the answer text marks it as `[S1]`, `[S2]`, … for a passage of the documents and `[W1]`,
+ * `[W2]`, … for a live web result (docs/DESIGN.md §3.7). Every field is optional in the type because messages saved
+ * before typed citations hold free-form JSON (e.g. `document_id`, `page`, `chunk_id`); read them through
+ * `lib/citations.ts`, which tolerates both. A citation without `kind` is a document passage.
  */
 export interface Citation {
   source_id?: string;
   document_id?: string;
+  /** Web results: the site. */
   filename?: string;
   page_start?: number | null;
   page_end?: number | null;
   chunk_id?: string;
-  /** Up to ~300 characters of the cited passage. */
+  /** Up to ~300 characters of the cited passage (web results: of the result's text). */
   snippet?: string;
   /** Older messages: a single page. */
   page?: number;
+  /** "web" for a live web result; absent (or "document") for a passage of the user's documents. */
+  kind?: "document" | "web";
+  /** Web results only: the page's address, title, site and publication date (when the engine gave one). */
+  url?: string | null;
+  title?: string | null;
+  site?: string | null;
+  published?: string | null;
   [key: string]: unknown;
+}
+
+/** A web result as the backend sends it (in `sources`, `tool results`, saved `citations`). */
+export interface WebCitation extends Citation {
+  source_id: string;
+  kind: "web";
 }
 
 export interface Message {
@@ -163,12 +179,15 @@ export interface ChatPatch {
 
 // ------------------------------------------------------------------ summaries, export, titles (docs/DESIGN.md §3.9)
 
-/** A document page range a summary key point rests on. */
+/** A document page range a summary key point rests on, or (`web`) a web site it drew on: no pages, no link. */
 export interface SummarySource {
   document_id: string | null;
+  /** Web sources: the site. */
   filename: string;
   page_start: number | null;
   page_end: number | null;
+  /** A live web result (the backend sends `document_id: ""` and the site as `filename`). */
+  web?: boolean;
 }
 
 export interface SummaryKeyPoint {
@@ -234,9 +253,15 @@ export interface StreamFailure {
   stage: StreamStage | (string & {}) | null;
 }
 
-/** POST /api/chats/{id}/messages streams these, in this order (error can replace any step after user_message). */
+/**
+ * POST /api/chats/{id}/messages streams these, in this order (error can replace any step after user_message). A turn
+ * that searches the web also streams `tool` events (lib/web-search.ts): `start` first, `results` as web results arrive,
+ * then `done` / `timeout` / `failed`, which can come in the middle of the answer's deltas. Only `agent_message` (or
+ * `error`) ends the turn.
+ */
 export type ChatEvent =
   | { type: "user_message"; message: Message }
+  | { type: "tool"; tool: ToolEvent }
   | { type: "sources"; payload: SourcesPayload }
   | { type: "delta"; text: string }
   | { type: "agent_message"; message: Message }
@@ -493,6 +518,12 @@ async function* sendMessage(
       case "user_message":
         yield { type: "user_message", message: parseEventData<Message>(ev.event, ev.data) };
         break;
+      case "tool": {
+        // Progress of the web search, not the answer: one that can't be read is skipped rather than failing the turn.
+        const tool = parseTool(parseJson(ev.data));
+        if (tool) yield { type: "tool", tool };
+        break;
+      }
       case "sources": {
         const p = parseEventData<Partial<SourcesPayload>>(ev.event, ev.data);
         yield {

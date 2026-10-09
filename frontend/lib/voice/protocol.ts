@@ -5,7 +5,7 @@
  * Server → client audio is a 12-byte header (uint32 LE turn_id, chunk_index, seq) followed by PCM16 LE mono 24 kHz.
  */
 
-import type { Language, Message, SourcesPayload } from "../api";
+import type { Citation, Language, Message, SourcesPayload } from "../api";
 
 export const INPUT_SAMPLE_RATE = 16_000;
 export const OUTPUT_SAMPLE_RATE = 24_000;
@@ -42,8 +42,11 @@ export type ServerMessage =
   | { type: "user_message"; message: Message }
   | { type: "turn"; turn_id: number }
   | ({ type: "sources" } & Partial<SourcesPayload>)
+  /** The turn's live web search (docs/DESIGN.md §3.7); the fields are those of the SSE `tool` event (lib/web-search.ts). */
+  | { type: "tool"; turn_id: number; name?: string; phase?: string; query?: string; sources?: Citation[]; count?: number; elapsed_ms?: number; detail?: string }
   | { type: "delta"; turn_id: number; text: string }
-  | { type: "audio_chunk"; turn_id: number; chunk_index: number; text: string; duration_ms: number }
+  /** `filler`: the short "Let me look that up." spoken while the web is searched; not part of the answer. */
+  | { type: "audio_chunk"; turn_id: number; chunk_index: number; text: string; duration_ms: number; filler?: boolean }
   | { type: "agent_message"; message: Message }
   | { type: "barge_in"; turn_id: number; decision: "stop" | "resume" }
   | { type: "error"; detail: string; stage: ErrorStage | (string & {}) | null };
@@ -56,6 +59,7 @@ const SERVER_TYPES = new Set([
   "user_message",
   "turn",
   "sources",
+  "tool",
   "delta",
   "audio_chunk",
   "agent_message",

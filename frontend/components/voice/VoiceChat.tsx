@@ -4,7 +4,8 @@
  * The voice-first chat page (docs/DESIGN.md §1, §3.8, §3.9). Voice conversation is the product; text is for
  * revisiting and for when speaking isn't possible.
  *
- *   stage:  presence field · live captions · the current answer's sources · state label · mic controls · "Type instead"
+ *   stage:  presence field · live captions · what was searched on the web and the current answer's sources · state
+ *           label · mic controls · "Type instead"
  *   panel:  the transcript and the summary ("Transcript | Summary" tabs, components/Summary.tsx), beside the stage (or
  *           over it on narrow screens); the stage keeps its mic either way
  *
@@ -15,14 +16,16 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import type { Chat, ProjectDocument, SourcesPayload } from "@/lib/api";
+import { useBackend } from "@/lib/backend-context";
 import { citedIds, toSourceRefs, type SourceRef } from "@/lib/citations";
-import { answerKindOf, basisOf, showsSources } from "@/lib/route";
+import { LIVE_NOTE_TEXT, answerKindOf, basisOf, liveNoteOf, showsSources, sourcesToShow } from "@/lib/route";
 import { consumeAutoStart } from "@/lib/voice/autostart";
 import { MIC_ERROR_TEXT, voiceSupport, type MicErrorKind } from "@/lib/voice/capture";
-import type { VoiceSession, VoiceSnapshot } from "@/lib/voice/session";
+import { searchingNow, type VoiceSession, type VoiceSnapshot } from "@/lib/voice/session";
 
 import { CitationPopoverProvider, SourceList } from "../Citations";
 import { Icon } from "../Icon";
+import { WebSearchNote } from "../WebSearchNote";
 import { Captions } from "./Captions";
 import { PresenceField } from "./PresenceField";
 
@@ -43,6 +46,8 @@ function stateText(s: VoiceSnapshot, unavailable: boolean): string {
       return s.turn || s.messages.length > 0 ? "Paused · tap the microphone to talk" : "Tap the microphone to talk";
     case "live":
       if (s.ducked && s.audible) return "Interrupted · listening";
+      // The server stays in `speaking` through the silent search after the filler: the label follows the search then.
+      if (!s.audible && searchingNow(s)) return "Searching the web…";
       if (s.audible || s.serverState === "speaking") return "Speaking";
       if (s.serverState === "thinking") return "Thinking…";
       if (s.serverState === "interrupted") return "Interrupted · listening";
@@ -63,10 +68,13 @@ const STAGE_TITLE: Record<string, string> = {
 
 /**
  * The sources the current answer cites: chips appear as the text that cites them is announced, then the saved ones.
- * Only an answer that draws on the documents has any: once the saved answer says it is a general-knowledge answer, an
- * acknowledgement or a clarifying question (`route.answer`, lib/route.ts) there are no chips, whatever retrieval found
- * for it, so the sources of the previous question can't stay on screen under an answer that doesn't use them. The
- * same goes for "Not in your documents": an answer given from general knowledge on purpose isn't an abstention.
+ * Only an answer that draws on the documents or the web has any: once the saved answer says it is a general-knowledge
+ * answer (with no web results), an acknowledgement or a clarifying question (`route.answer`, lib/route.ts) there are no
+ * chips, whatever retrieval found for it, so the sources of the previous question can't stay on screen under an answer
+ * that doesn't use them. The same goes for "Not in your documents": an answer given from general knowledge or from the
+ * web on purpose isn't an abstention. Web results (`[W#]`) come from the `sources` message and the search's `tool
+ * results` while the answer is written (a `[W3]` that only a late `tool results` carries still has its chip), and from
+ * the saved citations, which are authoritative.
  */
 function useAnswerSources(turn: VoiceSnapshot["turn"], docsById: Record<string, ProjectDocument>): {
   refs: SourceRef[];
@@ -76,14 +84,20 @@ function useAnswerSources(turn: VoiceSnapshot["turn"], docsById: Record<string, 
     if (!turn) return { refs: [], abstained: false };
     const message = turn.message;
     const kind = message ? answerKindOf(message) : null;
-    if (message && !showsSources(kind)) return { refs: [], abstained: false };
-    const general = !!message && basisOf(message, true) === "general";
-    const abstained = !general && (turn.sources?.abstained ?? false);
-    const live: SourcesPayload["sources"] = turn.sources?.sources ?? [];
     const saved = message ? toSourceRefs(message.citations, docsById) : [];
-    if (saved.length > 0) return { refs: saved, abstained };
-    const text = turn.message?.text ?? (turn.chunks.length ? turn.chunks.map((c) => c.text).join(" ") : turn.deltaText);
-    const byId = new Map(toSourceRefs(live, docsById).map((r) => [r.sourceId, r] as const));
+    const savedWeb = saved.some((r) => r.kind === "web");
+    if (message && !showsSources(kind)) return { refs: [], abstained: false };
+    const live: SourcesPayload["sources"] = turn.sources?.sources ?? [];
+    const basis = message ? basisOf(message, { documents: saved.some((r) => r.kind === "document"), web: savedWeb }) : null;
+    const webResults = turn.web.sources.length > 0 || live.some((c) => c.kind === "web");
+    const abstained = !basis && !webResults && (turn.sources?.abstained ?? false);
+    if (saved.length > 0) return { refs: sourcesToShow(kind, saved), abstained };
+    // The filler ("Let me look that up.") is spoken but isn't the answer: it can't cite anything.
+    const spoken = turn.chunks.filter((c) => !c.filler);
+    const text = turn.message?.text ?? (spoken.length ? spoken.map((c) => c.text).join(" ") : turn.deltaText);
+    const byId = new Map(
+      [...toSourceRefs(turn.web.sources, docsById), ...toSourceRefs(live, docsById)].map((r) => [r.sourceId, r] as const),
+    );
     const refs = citedIds(text)
       .map((id) => byId.get(id))
       .filter((r): r is SourceRef => !!r);
@@ -263,6 +277,13 @@ export function VoiceChat({
   }, [typeOpen, typeId]);
 
   const { refs: sourceRefs, abstained } = useAnswerSources(snapshot.turn, docsById);
+  // What was searched on the web (the session leaves it out when `features.web_search` is off), and the hint about live
+  // data that couldn't be had. The previous answer's note goes while the user is speaking the next question.
+  const { config } = useBackend();
+  const userTalking = snapshot.caption === "user" && !snapshot.userFinal;
+  const search = userTalking ? null : (snapshot.turn?.web.search ?? null);
+  const liveNote = config?.features.web_search === true && snapshot.turn?.message && !userTalking ? liveNoteOf(snapshot.turn.message) : null;
+  const searching = searchingNow(snapshot);
 
   // ---- the mic
   const micError = snapshot.micError ?? (blocked ? { kind: "denied" as const, message: MIC_ERROR_TEXT.denied } : null);
@@ -280,6 +301,7 @@ export function VoiceChat({
     micRef.current?.focus({ preventScroll: true }); // the stop button is about to go dim
   };
   const label = stateText(snapshot, micError !== null);
+  const tone = live ? (searching && !snapshot.audible ? "searching" : (snapshot.serverState ?? "listening")) : "idle";
   const micLabel = live ? "End the voice conversation" : "Start a voice conversation";
   const notice = snapshot.notice;
   const showRetry = micError && micError.kind !== "unsupported" && micError.kind !== "insecure";
@@ -327,6 +349,13 @@ export function VoiceChat({
             />
             <CitationPopoverProvider>
               <div className="vc-sources" aria-live="off">
+                {search && <WebSearchNote search={search} stage />}
+                {liveNote && (
+                  <span className="vc-abstain">
+                    <Icon name="info" size={13} />
+                    {LIVE_NOTE_TEXT[liveNote]}
+                  </span>
+                )}
                 {snapshot.caption === "user" ? null : abstained && snapshot.turn?.message ? (
                   <span className="vc-abstain">
                     <Icon name="info" size={13} />
@@ -341,7 +370,7 @@ export function VoiceChat({
         </div>
 
         <div ref={dockRef} className="vc-dock">
-          <p className="vc-state" role="status" aria-live="polite" data-tone={live ? snapshot.serverState ?? "listening" : "idle"}>
+          <p className="vc-state" role="status" aria-live="polite" data-tone={tone}>
             {label}
           </p>
 

@@ -14,7 +14,7 @@ import { useEffect, useRef, type RefObject } from "react";
 
 import { clamp, createMeter, measure } from "@/lib/voice/analysis";
 import { PresenceRenderer, type FrameState, type Layout } from "@/lib/voice/presence-renderer";
-import type { VoiceSession } from "@/lib/voice/session";
+import { searchingNow, type VoiceSession } from "@/lib/voice/session";
 
 /** Ring radius unit relative to the slot: the outer ring's diameter is ~74% of the slot's short side. */
 const SCALE = 0.8;
@@ -107,7 +107,9 @@ export function PresenceField({ session, anchorRef }: { session: VoiceSession; a
       measure(session.agentAnalyser, agent, dt, t, sr, motion > 0);
       measure(session.userAnalyser, user, dt, t, sr, motion > 0);
 
-      const thinking = snap.phase === "live" && snap.serverState === "thinking" && !snap.audible;
+      // Thinking swirls the rings: while the server thinks, and through the silent web search after the filler (the
+      // server stays in `speaking` then, with nothing audible).
+      const thinking = snap.phase === "live" && (snap.serverState === "thinking" || searchingNow(snap)) && !snap.audible;
       think += ((thinking ? 1 : 0) - think) * (1 - Math.exp(-dt / 0.35));
       // Ducked while the server decides; a short hold after the agent is cut off so the dip is seen.
       const cut = snap.turn?.cut === true;

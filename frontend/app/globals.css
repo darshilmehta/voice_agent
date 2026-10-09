@@ -39,6 +39,11 @@
   --voice-agent: #3b5bdb;
   --voice-user: #d9480f;
   --voice-dim: #94938c;
+  /* live web results (docs §3.7): a teal of their own, apart from the documents' blue */
+  --web: #0f766e;
+  --web-soft: #e1f2ef;
+  --web-text: #0b5f58;
+  --on-web: #ffffff;
   --radius: 12px;
   --shadow: 0 1px 2px rgb(0 0 0 / 4%), 0 1px 1px rgb(0 0 0 / 3%);
   --shadow-lg: 0 12px 32px rgb(0 0 0 / 12%), 0 2px 6px rgb(0 0 0 / 6%);
@@ -82,6 +87,10 @@
     --voice-agent: #8fb0ff;
     --voice-user: #ff9a6b;
     --voice-dim: #77766f;
+    --web: #4fc3b8;
+    --web-soft: rgb(79 195 184 / 14%);
+    --web-text: #8be0d6;
+    --on-web: #06201d;
     --shadow: none;
     --shadow-lg: 0 16px 40px rgb(0 0 0 / 55%), 0 0 0 1px #33322f;
     color-scheme: dark;

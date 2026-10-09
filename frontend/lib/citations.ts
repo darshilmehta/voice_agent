@@ -1,8 +1,10 @@
 /**
- * Citations as the UI sees them. Answers mark sources inline as `[S1]` (also `[S1, S2]` or `[S1][S2]`); the
- * message's `citations` (or, while streaming, the `sources` event) say which document, pages and passage each
- * marker means. Older messages hold free-form citation JSON (`document_id`, `page`, `chunk_id`, maybe a name);
- * everything here reads both shapes and never throws on odd input.
+ * Citations as the UI sees them. Answers mark sources inline as `[S1]` for a passage of the documents and `[W1]` for a
+ * live web result (also `[S1, S2]`, `[S1][W2]`); the message's `citations` (or, while streaming, the `sources` event
+ * and the web search's `tool results`) say which document, pages and passage, or which web page, each marker means. A
+ * citation without `kind` is a document passage; `kind: "web"` carries `url`, `title`, `site` and `published`. Older
+ * messages hold free-form citation JSON (`document_id`, `page`, `chunk_id`, maybe a name); everything here reads all
+ * the shapes and never throws on odd input.
  */
 
 import type { Citation, ProjectDocument } from "./api";
@@ -10,16 +12,24 @@ import type { Citation, ProjectDocument } from "./api";
 export interface SourceRef {
   /** Stable React key. */
   key: string;
-  /** "S1", when the citation is numbered. */
+  /** A passage of the user's documents, or a live web result. */
+  kind: "document" | "web";
+  /** "S1" or "W1", when the citation is numbered. */
   sourceId: string | null;
-  /** 1 for "S1". */
+  /** 1 for "S1" and for "W1" (the kind says which). */
   number: number | null;
   documentId: string | null;
+  /** Documents: the file name. Web results: the site. */
   filename: string;
   pageStart: number | null;
   pageEnd: number | null;
   snippet: string | null;
   chunkId: string | null;
+  /** Web results: where the page is (http or https only; anything else is dropped), its title, site and date. */
+  url: string | null;
+  title: string | null;
+  site: string | null;
+  published: string | null;
   /** What the popover says when there is no passage to show (default: none was saved). */
   note?: string;
 }
@@ -29,10 +39,68 @@ const int = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : n
 
 export const normalizeSourceId = (id: string) => id.trim().toUpperCase();
 
+/** The URL when it is an absolute http(s) address, else null: a link from the web is never `javascript:` or `data:`. */
+export function safeHttpUrl(value: unknown): string | null {
+  const raw = str(value);
+  if (!raw) return null;
+  try {
+    const url = new URL(raw.trim());
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+/** "reuters.com" for "https://www.reuters.com/markets/…". */
+export function hostOf(url: string | null): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).hostname.replace(/^www\./i, "") || null;
+  } catch {
+    return null;
+  }
+}
+
+/** A web result's date: "8 Oct 2026" for an ISO date, the text as given when it isn't one ("2 days ago"), or null. */
+export function publishedText(published: string | null): string | null {
+  if (!published) return null;
+  const text = published.trim();
+  if (/^\d{4}-\d{2}-\d{2}(?:[T ]|$)/.test(text)) {
+    const d = new Date(/^\d{4}-\d{2}-\d{2}$/.test(text) ? `${text}T00:00:00Z` : text);
+    if (!Number.isNaN(d.getTime())) {
+      return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+    }
+  }
+  return text;
+}
+
 export function toSourceRef(c: Citation, docsById: Record<string, ProjectDocument> = {}): SourceRef {
   const raw = (c ?? {}) as Record<string, unknown>;
+  // A citation without `kind` is a document passage; a web result never looks in the documents (its `document_id` is empty).
+  const web = raw.kind === "web";
   const sourceId = str(raw.source_id) ? normalizeSourceId(raw.source_id as string) : null;
-  const num = sourceId ? Number(/^S(\d+)$/.exec(sourceId)?.[1] ?? NaN) : NaN;
+  const num = sourceId ? Number(/^[SW](\d+)$/.exec(sourceId)?.[1] ?? NaN) : NaN;
+  if (web) {
+    const url = safeHttpUrl(raw.url);
+    const site = str(raw.site) ?? str(raw.filename) ?? hostOf(url);
+    const title = str(raw.title);
+    return {
+      key: sourceId ?? `web:${url ?? site ?? title ?? ""}`,
+      kind: "web",
+      sourceId,
+      number: Number.isFinite(num) ? num : null,
+      documentId: null,
+      filename: site ?? "Web",
+      pageStart: null,
+      pageEnd: null,
+      snippet: str(raw.snippet) ?? str(raw.text),
+      chunkId: null,
+      url,
+      title,
+      site: site ?? null,
+      published: str(raw.published),
+    };
+  }
   const documentId = str(raw.document_id);
   const doc = documentId ? docsById[documentId] : undefined;
   const filename =
@@ -44,6 +112,7 @@ export function toSourceRef(c: Citation, docsById: Record<string, ProjectDocumen
   const chunkId = str(raw.chunk_id);
   return {
     key: sourceId ?? `${documentId ?? filename}:${pageStart ?? ""}:${chunkId ?? ""}`,
+    kind: "document",
     sourceId,
     number: Number.isFinite(num) ? num : null,
     documentId,
@@ -52,6 +121,10 @@ export function toSourceRef(c: Citation, docsById: Record<string, ProjectDocumen
     pageEnd,
     snippet: str(raw.snippet) ?? str(raw.text),
     chunkId,
+    url: null,
+    title: null,
+    site: null,
+    published: null,
   };
 }
 
@@ -84,11 +157,34 @@ export function pagesLong(ref: SourceRef): string | null {
     : `Page ${ref.pageStart}`;
 }
 
-/** Spoken/accessible description: "Source 1: annual_report.pdf, page 4". */
+/** What the answer text calls it: "W1" for a web result, "1" for the numbered document passage "S1". */
+export function markerOf(ref: SourceRef): string | null {
+  if (ref.number === null) return null;
+  return ref.kind === "web" ? `W${ref.number}` : String(ref.number);
+}
+
+/**
+ * Spoken/accessible description: "Source 1: annual_report.pdf, page 4", "Web result 1: Rupee gains, reuters.com,
+ * 8 Oct 2026".
+ */
 export function describeSource(ref: SourceRef): string {
+  if (ref.kind === "web") {
+    const label = ref.number !== null ? `Web result ${ref.number}` : "Web result";
+    const detail = [ref.title, ref.site ?? ref.filename, publishedText(ref.published)].filter(Boolean).join(", ");
+    return detail ? `${label}: ${detail}` : label;
+  }
   const pages = pagesLong(ref);
   const label = ref.number !== null ? `Source ${ref.number}` : "Source";
   return `${label}: ${ref.filename}${pages ? `, ${pages.toLowerCase()}` : ""}`;
+}
+
+/** Documents first, then web results; each in numbered order (un-numbered last, in the order they came). */
+export function sortSources<T extends SourceRef>(refs: readonly T[]): T[] {
+  const rank = (r: SourceRef) => (r.kind === "web" ? 1 : 0);
+  return refs
+    .map((r, i) => ({ r, i }))
+    .sort((a, b) => rank(a.r) - rank(b.r) || (a.r.number ?? Infinity) - (b.r.number ?? Infinity) || a.i - b.i)
+    .map((x) => x.r);
 }
 
 // ------------------------------------------------------------------ table snippets
@@ -170,20 +266,28 @@ export function isNumericCell(cell: string): boolean {
 
 export type AnswerPart = { kind: "text"; text: string } | { kind: "cite"; ids: string[]; raw: string };
 
-const MARKER = /\[\s*(S\d+(?:\s*[,;]\s*S?\d+)*)\s*\]/gi;
+const MARKER = /\[\s*([SW]\d+(?:\s*[,;]\s*[SW]?\d+)*)\s*\]/gi;
 
-/** Split answer text into plain text and citation markers. `[S1, 2]` reads as S1 and S2. */
+/**
+ * Split answer text into plain text and citation markers. `[S1, 2]` reads as S1 and S2, `[W1, 2]` as W1 and W2 (a bare
+ * number goes with the kind before it), `[S1, W2]` as one of each.
+ */
 export function splitCitations(text: string): AnswerPart[] {
   const parts: AnswerPart[] = [];
   let last = 0;
   for (const m of text.matchAll(MARKER)) {
     const at = m.index ?? 0;
     if (at > last) parts.push({ kind: "text", text: text.slice(last, at) });
+    let prefix = "S";
     const ids = m[1]
       .split(/[,;]/)
       .map((s) => s.trim())
       .filter(Boolean)
-      .map((s) => normalizeSourceId(/^\d+$/.test(s) ? `S${s}` : s));
+      .map((s) => {
+        if (/^\d+$/.test(s)) return `${prefix}${s}`;
+        prefix = s[0].toUpperCase();
+        return normalizeSourceId(s);
+      });
     parts.push({ kind: "cite", ids, raw: m[0] });
     last = at + m[0].length;
   }
@@ -191,9 +295,9 @@ export function splitCitations(text: string): AnswerPart[] {
   return parts;
 }
 
-/** While streaming, hide a marker that is still being typed ("… margins [S", "[S1, S") so it doesn't flash as text. */
+/** While streaming, hide a marker that is still being typed ("… margins [S", "[W1, W", "[") so it doesn't flash as text. */
 export function withoutPartialMarker(text: string): string {
-  return text.replace(/\[\s*(?:S\d*(?:\s*[,;]\s*S?\d*)*)?$/i, "");
+  return text.replace(/\[\s*(?:[SW]\d*(?:\s*[,;]\s*[SW]?\d*)*)?$/i, "");
 }
 
 /** Source ids in the order the text first cites them. */

@@ -11,13 +11,15 @@ import { VoiceSession, type VoiceSnapshot } from "./session";
  * goes (navigating away stops the microphone and the socket); it does nothing until `start()`.
  */
 export function useVoiceSession(chatId: string, language: Language | null): { session: VoiceSession; snapshot: VoiceSnapshot } {
-  const { backendUrl } = useBackend();
-  const [session] = useState(() => new VoiceSession({ chatId, backendUrl, language }));
+  const { backendUrl, config } = useBackend();
+  // `features.web_search`: with it off the web search's badge, label and note stay off (docs/DESIGN.md §3.7).
+  const webSearch = config?.features.web_search === true;
+  const [session] = useState(() => new VoiceSession({ chatId, backendUrl, language, webSearch }));
   const snapshot = useSyncExternalStore(session.subscribe, session.getSnapshot, session.getSnapshot);
 
   useEffect(() => {
-    session.setOptions({ language, backendUrl });
-  }, [session, language, backendUrl]);
+    session.setOptions({ language, backendUrl, webSearch });
+  }, [session, language, backendUrl, webSearch]);
 
   useEffect(() => {
     // Development aid: window.__voice is the live session (counters, snapshot) for debugging and browser tests.

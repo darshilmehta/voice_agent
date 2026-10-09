@@ -121,6 +121,20 @@
   color: var(--text);
 }
 
+/* The filler said while the web is searched ("Let me look that up."): a light aside above the answer. */
+.vc-aside {
+  display: block;
+  margin-bottom: 0.2em;
+  font-size: 0.68em;
+  font-weight: 450;
+  letter-spacing: 0;
+  text-wrap: balance;
+}
+
+.vc-aside .vc-w.on {
+  color: var(--text-muted);
+}
+
 .vc-w.pending {
   opacity: 0.6;
 }
@@ -137,9 +151,17 @@
 
 .vc-sources {
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
   min-height: 32px;
   margin-top: 8px;
+}
+
+.web-note.is-stage {
+  justify-content: center;
+  max-width: min(560px, 100%);
 }
 
 .vc-sources .cites {
@@ -177,6 +199,10 @@
 }
 
 .vc-state[data-tone="speaking"] {
+  color: var(--voice-agent);
+}
+
+.vc-state[data-tone="searching"] {
   color: var(--voice-agent);
 }
 

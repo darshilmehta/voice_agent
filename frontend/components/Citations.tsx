@@ -1,13 +1,17 @@
 "use client";
 
 /**
- * Citations in answers: `[S1]` markers become small numbered chips inside the text, each message lists the sources
- * it cites, and hovering, focusing or clicking a chip opens one shared popover with the document, page(s) and the
- * cited passage.
+ * Citations in answers: `[S1]` markers (documents) and `[W1]` markers (live web results, docs/DESIGN.md §3.7) become
+ * small chips inside the text, each message lists the sources it cites (documents first, then web), and hovering,
+ * focusing or clicking a chip opens one shared popover with the document, page(s) and the cited passage, or the web
+ * result's title, site, date and a link to the page.
  *
  * The popover is a tooltip-style description of the chip (role="tooltip", linked with aria-describedby): keyboard
  * focus or hover shows it, a click pins it open until you click again, press Esc, move focus away or click
- * elsewhere. It follows the chip when the transcript scrolls.
+ * elsewhere. It follows the chip when the transcript scrolls. A web result's popover holds a link, so it is a small
+ * non-modal dialog instead: with the keyboard, Tab from the chip moves into the link (the popover sits at the end of
+ * the page, outside the chip's tab order), Tab or Shift+Tab from the link goes back to the chip, and Esc closes it
+ * and returns to the chip. The link opens the page in a new tab (`noopener noreferrer`) and only ever for http(s).
  */
 
 import {
@@ -20,6 +24,8 @@ import {
   useMemo,
   useRef,
   useState,
+  type FocusEvent as ReactFocusEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
@@ -27,10 +33,14 @@ import { createPortal } from "react-dom";
 
 import {
   describeSource,
+  hostOf,
   isNumericCell,
+  markerOf,
   pagesLong,
   pagesShort,
   parseTableSnippet,
+  publishedText,
+  sortSources,
   splitCitations,
   withoutPartialMarker,
   type SourceRef,
@@ -49,7 +59,7 @@ interface Open {
 interface PopoverApi {
   openFor: (anchor: HTMLElement, source: SourceRef, mode: Mode) => void;
   toggle: (anchor: HTMLElement, source: SourceRef) => void;
-  closeFor: (anchor: HTMLElement, modes?: Mode[]) => void;
+  closeFor: (anchor: HTMLElement, modes?: Mode[], focusingTo?: Node | null) => void;
   hoverOut: (anchor: HTMLElement) => void;
   /** Id of the popover while it describes this anchor. */
   /** The popover's id while it describes the trigger with this element id. */
@@ -170,6 +180,8 @@ export function CitationPopoverProvider({ children }: { children: ReactNode }) {
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
+        // Focus was in the popover (its link): back to the chip, so it isn't lost when the popover goes.
+        if (popRef.current?.contains(document.activeElement)) open.anchor.focus({ preventScroll: true });
         setOpen(null);
       }
     };
@@ -196,8 +208,9 @@ export function CitationPopoverProvider({ children }: { children: ReactNode }) {
     () => ({
       openFor,
       toggle,
-      closeFor: (a, modes) => {
+      closeFor: (a, modes, focusingTo) => {
         if (pointerInside.current) return; // selecting text in the popover blurs the chip; keep it open
+        if (focusingTo && popRef.current?.contains(focusingTo)) return; // focus is going to the popover's link
         closeFor(a, modes);
       },
       hoverOut,
@@ -210,6 +223,7 @@ export function CitationPopoverProvider({ children }: { children: ReactNode }) {
 
   const source = open?.source;
   const pages = source ? pagesLong(source) : null;
+  const web = source?.kind === "web";
 
   return (
     <PopoverContext value={api}>
@@ -220,9 +234,10 @@ export function CitationPopoverProvider({ children }: { children: ReactNode }) {
           <div
             ref={popRef}
             id={popoverId}
-            role="tooltip"
+            role={source.url ? "dialog" : "tooltip"}
             aria-labelledby={titleId}
             className="cite-pop"
+            data-kind={web ? "web" : undefined}
             data-above={pos?.above || undefined}
             style={pos ? { top: pos.top, left: pos.left } : { top: 0, left: 0, visibility: "hidden" }}
             onMouseEnter={() => {
@@ -236,24 +251,83 @@ export function CitationPopoverProvider({ children }: { children: ReactNode }) {
             onPointerUp={() => {
               window.setTimeout(() => (pointerInside.current = false), 0);
             }}
+            onBlur={(e) => {
+              // Focus left the popover (its link) for somewhere other than the chip: it has done its job.
+              const to = e.relatedTarget as Node | null;
+              if (open.mode !== "hover" && !pointerInside.current && !popRef.current?.contains(to) && to !== open.anchor) setOpen(null);
+            }}
           >
-            <div className="cite-pop-head">
-              {source.number !== null && <span className="cite-pop-num">{source.number}</span>}
-              <Icon name="doc" size={14} className="cite-pop-icon" />
-              <strong id={titleId} className="cite-pop-name">
-                {source.filename}
-              </strong>
-            </div>
-            {pages && <p className="cite-pop-pages">{pages}</p>}
-            {source.snippet ? (
-              <SnippetView snippet={source.snippet} />
+            {web ? (
+              <WebSourceCard source={source} titleId={titleId} anchor={open.anchor} />
             ) : (
-              <p className="cite-pop-empty">{source.note ?? "No passage was saved with this citation."}</p>
+              <>
+                <div className="cite-pop-head">
+                  {source.number !== null && <span className="cite-pop-num">{source.number}</span>}
+                  <Icon name="doc" size={14} className="cite-pop-icon" />
+                  <strong id={titleId} className="cite-pop-name">
+                    {source.filename}
+                  </strong>
+                </div>
+                {pages && <p className="cite-pop-pages">{pages}</p>}
+                {source.snippet ? (
+                  <SnippetView snippet={source.snippet} />
+                ) : (
+                  <p className="cite-pop-empty">{source.note ?? "No passage was saved with this citation."}</p>
+                )}
+              </>
             )}
           </div>,
           document.body,
         )}
     </PopoverContext>
+  );
+}
+
+/** A live web result in the popover: title, site and date, the result's text, and a link to the page. */
+function WebSourceCard({ source, titleId, anchor }: { source: SourceRef; titleId: string; anchor: HTMLElement }) {
+  const marker = markerOf(source);
+  const published = publishedText(source.published);
+  const site = source.site ?? source.filename;
+  const host = hostOf(source.url);
+  const title = source.title ?? site;
+  const meta = [source.title ? site : null, published].filter(Boolean).join(" · ");
+  // The popover sits at the end of the page, outside the chip's tab order: Tab from the link goes back to the chip
+  // (and on from there), Shift+Tab to the chip.
+  const onLinkKey = (e: ReactKeyboardEvent<HTMLAnchorElement>) => {
+    if (e.key !== "Tab") return;
+    if (e.shiftKey) e.preventDefault();
+    anchor.focus({ preventScroll: true });
+  };
+  return (
+    <>
+      <div className="cite-pop-head">
+        {marker && <span className="cite-pop-num cite-pop-num-web">{marker}</span>}
+        <Icon name="globe" size={14} className="cite-pop-icon" />
+        <strong id={titleId} className="cite-pop-name cite-pop-title">
+          {title}
+        </strong>
+      </div>
+      {meta && <p className="cite-pop-pages">{meta}</p>}
+      {source.snippet ? (
+        <blockquote className="cite-pop-snippet">{source.snippet}</blockquote>
+      ) : (
+        <p className="cite-pop-empty">{source.note ?? "No text was saved with this result."}</p>
+      )}
+      {source.url && (
+        <a
+          className="cite-pop-link"
+          href={source.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          title={source.url}
+          aria-label={`Open ${title}${host ? ` on ${host}` : ""} (opens in a new tab)`}
+          onKeyDown={onLinkKey}
+        >
+          <Icon name="external" size={14} />
+          <span>{host ? `Open on ${host}` : "Open the page"}</span>
+        </a>
+      )}
+    </>
   );
 }
 
@@ -322,7 +396,17 @@ function useSourceTrigger(source: SourceRef) {
       const el = ref.current;
       if (el && el.matches(":focus-visible")) pop.openFor(el, source, "focus");
     },
-    onBlur: () => ref.current && pop.closeFor(ref.current, ["focus", "click"]),
+    onBlur: (e: ReactFocusEvent<HTMLButtonElement>) =>
+      ref.current && pop.closeFor(ref.current, ["focus", "click"], e.relatedTarget as Node | null),
+    // A web result's popover holds a link and sits at the end of the page: Tab from its open chip goes into the link.
+    onKeyDown: (e: ReactKeyboardEvent<HTMLButtonElement>) => {
+      const el = ref.current;
+      if (e.key !== "Tab" || e.shiftKey || !el || !source.url || pop.current !== el) return;
+      const link = document.getElementById(pop.popoverId)?.querySelector<HTMLElement>("a[href]");
+      if (!link) return;
+      e.preventDefault();
+      link.focus({ preventScroll: true });
+    },
     // Real mouse movement only: content scrolling under a resting pointer fires mouseenter but no pointermove.
     onPointerMove: (e: ReactPointerEvent<HTMLButtonElement>) => {
       const el = ref.current;
@@ -332,12 +416,13 @@ function useSourceTrigger(source: SourceRef) {
   };
 }
 
-/** One inline marker chip ("1"). Unknown source ids stay visible but inert. */
+/** One inline marker chip: "1" for `[S1]`, "W1" for `[W1]`. Unknown source ids stay visible but inert. */
 export function CiteChip({ id, source }: { id: string; source: SourceRef | undefined }) {
   if (!source) {
+    const web = /^W/i.test(id);
     return (
-      <span className="cite-chip missing" title={`${id}: this source isn't available`}>
-        {id.replace(/^S/i, "")}
+      <span className={`cite-chip missing${web ? " web" : ""}`} title={`${id}: this source isn't available`}>
+        {web ? id.toUpperCase() : id.replace(/^S/i, "")}
       </span>
     );
   }
@@ -347,8 +432,13 @@ export function CiteChip({ id, source }: { id: string; source: SourceRef | undef
 function CiteChipButton({ source }: { source: SourceRef }) {
   const trigger = useSourceTrigger(source);
   return (
-    <button type="button" className="cite-chip" aria-label={describeSource(source)} {...trigger}>
-      {source.number ?? "•"}
+    <button
+      type="button"
+      className={source.kind === "web" ? "cite-chip web" : "cite-chip"}
+      aria-label={describeSource(source)}
+      {...trigger}
+    >
+      {markerOf(source) ?? "•"}
     </button>
   );
 }
@@ -385,10 +475,10 @@ export function AnswerText({
   );
 }
 
-/** The sources a message cites, under the bubble; same numbers as the inline chips. */
+/** The sources a message cites, under the bubble; same numbers as the inline chips. Documents first, then web results. */
 export function SourceList({ sources }: { sources: SourceRef[] }) {
   if (sources.length === 0) return null;
-  const sorted = [...sources].sort((a, b) => (a.number ?? Infinity) - (b.number ?? Infinity));
+  const sorted = sortSources(sources);
   return (
     <ul className="cites" aria-label="Sources">
       {sorted.map((s) => (
@@ -403,6 +493,17 @@ export function SourceList({ sources }: { sources: SourceRef[] }) {
 function SourceButton({ source }: { source: SourceRef }) {
   const trigger = useSourceTrigger(source);
   const pages = pagesShort(source);
+  if (source.kind === "web") {
+    // A live web result: a globe and the site (the page itself is one click further, in the popover).
+    const marker = markerOf(source);
+    return (
+      <button type="button" className="cite cite-web" aria-label={describeSource(source)} {...trigger}>
+        <Icon name="globe" size={13} />
+        <span className="cite-name">{source.site ?? source.filename}</span>
+        {marker && <span className="cite-page">{marker}</span>}
+      </button>
+    );
+  }
   return (
     <button type="button" className="cite" aria-label={describeSource(source)} {...trigger}>
       {source.number !== null ? (

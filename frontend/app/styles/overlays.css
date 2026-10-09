@@ -211,6 +211,54 @@
   white-space: nowrap;
 }
 
+/* A live web result: the title may take two lines, the passage's bar and number are web teal, and the page is one link away. */
+.cite-pop[data-kind="web"] .cite-pop-snippet {
+  border-left-color: var(--web);
+}
+
+.cite-pop-num-web {
+  background: var(--web);
+  color: var(--on-web);
+}
+
+.cite-pop-title {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.cite-pop-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  margin-top: 10px;
+  padding: 5px 11px 5px 9px;
+  border-radius: 999px;
+  background: var(--web-soft);
+  color: var(--web-text);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.cite-pop-link > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cite-pop-link > .icon {
+  flex: none;
+}
+
+.cite-pop-link:hover {
+  background: color-mix(in srgb, var(--web) 24%, transparent);
+}
+
 .cite-pop-pages {
   margin: 3px 0 0;
   color: var(--text-muted);

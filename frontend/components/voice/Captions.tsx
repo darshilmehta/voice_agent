@@ -5,13 +5,17 @@
  * audio that is actually playing (lib/voice/captions.ts); the user's words appear in the warm colour while they
  * speak, then as the saved transcript. After an interruption the caption keeps only what was heard, then "…".
  *
+ * A turn that searches the web first says a short filler ("Let me look that up."): it shows as a light aside above the
+ * answer while it is spoken and while the search runs, and gives way to the answer's captions once that has started
+ * (the filler is not part of the answer: the transcript doesn't have it).
+ *
  * Captions are visual, with no live region: the spoken answer is already audio, and state changes are announced by
  * the state label. The whole conversation is in the transcript.
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { chunkWords, plainSpeech, spokenCount, turnWords, type CaptionWord } from "@/lib/voice/captions";
+import { agentCaptionWords, plainSpeech, spokenCount, type CaptionWord } from "@/lib/voice/captions";
 import type { VoiceSession, VoiceSnapshot } from "@/lib/voice/session";
 
 const split = (text: string): string[] => plainSpeech(text).split(" ").filter(Boolean);
@@ -39,14 +43,12 @@ export function Captions({
   const heardText = turn?.message?.heard_text ?? null;
   /** Cut off by the user: show what was heard, then "…". */
   const interrupted = !!turn && (turn.cut || heardText !== null);
-  /** Interrupted, and no audio was announced for it: the server's "what was heard" is all there is. */
-  const trustServer = !!turn?.message && heardText !== null && turn.chunks.length === 0;
-  const agentWords = useMemo<CaptionWord[]>(() => {
-    if (!turn) return [];
-    if (trustServer) return chunkWords(heardText ?? "", 0);
-    if (turn.message && turn.chunks.length === 0) return chunkWords(turn.message.text, 0); // spoken without caption timing
-    return turnWords(turn.chunks, turn.deltaText);
-  }, [turn, trustServer, heardText]);
+  // The agent's words, with their timing (lib/voice/captions.ts). `trustServer`: interrupted with no answer audio ever
+  // announced, so the server's "what was heard" is all there is.
+  const { words: agentWords, trustServer } = useMemo<{ words: CaptionWord[]; trustServer: boolean }>(
+    () => (turn ? agentCaptionWords(turn) : { words: [], trustServer: false }),
+    [turn],
+  );
 
   const settled = !!turn?.message && !audible && !interrupted; // saved, and the audio has played out (or never came)
   const agentId = turn?.id ?? null;
@@ -75,16 +77,23 @@ export function Captions({
     return () => cancelAnimationFrame(raf);
   }, [session, showAgent, trustServer, agentId, agentWords, settled, interrupted]);
 
-  const words: { text: string; on: boolean; pending: boolean }[] = showUser
-    ? userWords.map((text) => ({ text, on: true, pending: false }))
+  const words: { text: string; on: boolean; pending: boolean; aside: boolean }[] = showUser
+    ? userWords.map((text) => ({ text, on: true, pending: false, aside: false }))
     : agentWords.map((w, i) => ({
         text: w.text,
         on: trustServer || settled || i < spoken,
         pending: w.chunk < 0 && !settled,
+        aside: w.aside === true,
       }));
   // After an interruption only what was heard stays, followed by "…".
   const cutOff = showAgent && interrupted;
-  const visible = cutOff ? words.filter((w) => w.on) : words;
+  const heardWords = cutOff ? words.filter((w) => w.on) : words;
+  // The filler is an aside: once it has been said and the answer has begun (its words are there, or were heard), it
+  // gives way to the answer.
+  const aside = heardWords.filter((w) => w.aside);
+  const answer = heardWords.filter((w) => !w.aside);
+  const hideAside = aside.length > 0 && aside.every((w) => w.on) && answer.length > 0;
+  const visible = hideAside ? answer : heardWords;
 
   // Keep the word being spoken in view when the answer is longer than the caption area.
   const onCount = visible.filter((w) => w.on).length;
@@ -96,6 +105,9 @@ export function Captions({
   }, [onCount, visible.length]);
 
   const lang = showUser ? (language ?? undefined) : (turn?.message?.language ?? language ?? undefined);
+  const indexed = visible.map((w, i) => ({ w, i }));
+  const asideShown = indexed.filter((x) => x.w.aside);
+  const answerShown = indexed.filter((x) => !x.w.aside);
 
   return (
     <p
@@ -109,7 +121,16 @@ export function Captions({
           <span className="vc-caption-hint">{showUser ? "…" : hint}</span>
         ) : (
           <>
-            {visible.map((w, i) => (
+            {asideShown.length > 0 && (
+              <span className="vc-aside">
+                {asideShown.map(({ w, i }) => (
+                  <span key={i} data-i={i} className={`vc-w${w.on ? " on" : ""}`}>
+                    {w.text}{" "}
+                  </span>
+                ))}
+              </span>
+            )}
+            {answerShown.map(({ w, i }) => (
               <span key={i} data-i={i} className={`vc-w${w.on ? " on" : ""}${w.pending ? " pending" : ""}`}>
                 {w.text}{" "}
               </span>
