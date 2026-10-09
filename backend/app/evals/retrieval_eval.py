@@ -6,7 +6,7 @@ way the chat pipeline does, with the real ``RetrievalService`` (hybrid search, R
 reports ranking quality before and after the reranker, citation accuracy, the abstention gate and latency.
 
     cd backend
-    uv run --group ml python -m app.evals.retrieval_eval            # the default config, both query variants
+    uv run --group ml python -m app.evals.retrieval_eval            # the default config, every query variant
     uv run --group ml python -m app.evals.retrieval_eval --prefetch-k 8,12,20 --rerank-top-n 5 --threshold 0.05
     uv run --group ml python -m app.evals.retrieval_eval --answers  # also run the answer LLM (Ollama must be up)
     uv run python -m app.evals.retrieval_eval --render ../data/eval/results/<run>/results.json   # re-render summary.md
@@ -17,8 +17,9 @@ runs in the backend's environment (``--group ml``), and its pure parts (``manife
 
 Query variants (per question): ``raw`` = ``retrieve(question)``, what the phase-1 pipeline does; ``routed`` =
 ``retrieve(question, query_en=...)`` for Hindi/Hinglish questions, what the phase-3 router will do (both queries are
-searched and fused, the reranker scores the English one); ``clean`` = the correctly transcribed question for ASR-noise
-questions. The headline ("pipeline") uses ``routed`` where a question has an English query and ``raw`` otherwise.
+searched and fused, the reranker scores the English one); ``english`` = ``retrieve(query_en)`` alone; ``clean`` = the
+correctly transcribed question for ASR-noise questions. The headline ("pipeline") uses ``routed`` where a question
+has an English query and ``raw`` otherwise.
 Candidates (before the reranker) come from the public ``RetrievalService.search``; everything after comes from
 ``RetrievalService.retrieve``, untouched. Nothing in the retrieval code is changed or reimplemented here.
 
