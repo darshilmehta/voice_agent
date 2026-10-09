@@ -207,8 +207,9 @@ def test_7_the_playback_fallback_follows_the_audio_as_it_was_sent(voice, monkeyp
         second_chunk = time.monotonic()  # the client starts playing the 1.6 s second chunk now
         c.until(is_state("listening"), timeout=8)
         waited = time.monotonic() - second_chunk
-    # gapless arithmetic (first audio + 1.7 s + grace) would end the turn ~0.8 s too early, mid-chunk
-    assert waited >= 1.6 + 0.3 - 0.1, waited
+    # gapless arithmetic (first audio + 1.7 s + grace) would end the turn ~0.8 s too early, mid-chunk (waited ≈ 1.1 s).
+    # The client's clock starts when it receives the frame, a little after the server sent it, so allow 0.25 s.
+    assert waited >= 1.6 + 0.3 - 0.25, waited
 
 
 def test_7_playback_reports_push_the_fallback_back(voice, monkeypatch):
