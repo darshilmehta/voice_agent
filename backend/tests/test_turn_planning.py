@@ -353,6 +353,40 @@ async def test_b1_a_question_about_the_company_the_documents_dont_answer_abstain
     assert p.decision.overrides[-1] == "general_qa→document_qa: asks about the documents' subject (best match 0.00)"
 
 
+HOTEL = "What is the hotel limit per night for level 3 and level 4 employees in tier 1 cities?"
+
+
+async def test_b1_a_clarification_of_a_question_that_stands_on_its_own_is_answered_from_the_documents(b1):
+    """Found in the final end-to-end run: the 4B router answered the hotel-limit question (no document named) with
+    "which organization do you mean?", while §5.1 of the travel policy has the figure. A clarification is for a
+    reference to something never mentioned, so a self-contained fact question is checked against the documents like a
+    "general" one."""
+    text = "Hotel limits per night in Tier-1 cities: grades L3 to L4 may spend 7,500 rupees."
+    await b1.store.upsert([IndexedChunk(make_chunk(13, text=text), vector_for(text))])
+    b1.llm.route = {"intent": "clarification", "query": None}
+    p = await plan(b1, req(HOTEL))
+    assert (p.intent, p.mode, p.needs_retrieval) == ("document_qa", "grounded", True)
+    assert p.decision.overrides[-1].startswith("clarification→document_qa: the documents match (")
+    result, outcome = await p.prefetched
+    assert outcome == "used" and result.chunks[0].chunk.text == text
+
+
+async def test_b1_a_clarification_that_leans_on_the_conversation_stays_a_clarification(b1):
+    b1.reranker.scorer = lambda q, passage: 0.95  # whatever is asked, the documents match
+    for utterance in ("What about that one?", "And what is the limit for it?", "What did they say about this?"):
+        b1.llm.route = {"intent": "clarification", "query": None}
+        p = await plan(b1, req(utterance))
+        assert (p.intent, p.mode, p.needs_retrieval, p.prefetched) == ("clarification", "clarification", False, None)
+        assert p.decision.retrieval_wait_ms is None, utterance
+
+
+async def test_b1_a_clarification_the_documents_dont_match_stays_a_clarification(b1):
+    b1.llm.route = {"intent": "clarification", "query": None}
+    p = await plan(b1, req("Which butterfly migrates the furthest across the Atlantic every spring?"))
+    assert (p.intent, p.mode, p.needs_retrieval, p.prefetched) == ("clarification", "clarification", False, None)
+    assert p.decision.overrides[-1].startswith("clarification kept: the documents don't match")
+
+
 def test_a_second_acknowledgement_in_a_row_gets_nothing():
     ack = history(("user", "okay"), ("agent", "Anything else?"))
     ack[1] = ack[1].model_copy(update={"route": {"answer": "ack"}})

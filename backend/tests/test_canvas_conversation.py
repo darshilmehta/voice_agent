@@ -98,6 +98,8 @@ def test_an_answer_with_three_figures_suggests_a_visual():
         ("delete that chart", CanvasEdit("remove")),
         ("हटा दो", CanvasEdit("remove")),
         ("isko hata do", CanvasEdit("remove")),
+        ("Hatado", CanvasEdit("remove")),  # how Whisper wrote a spoken "हटा दो" in the final end-to-end run
+        ("isko hatado", CanvasEdit("remove")),
         ("pin this", CanvasEdit("pin")),
         ("pin kar do", CanvasEdit("pin")),
         ("इसे पिन करो", CanvasEdit("pin")),

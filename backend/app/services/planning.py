@@ -8,7 +8,8 @@
         ├─ a standalone question whose speculative retrieval is confident before the router answers
         │     → document question, router call cancelled (no model wait)
         ├─ the router's proposal, validated (services/router.py)
-        │     "general" or "conversation" for a question about facts, in a chat with READY documents (B1): wait for
+        │     "general", "conversation" or "clarification" for a question about facts, in a chat with READY documents
+        │     (B1; a clarification only when the question needs no conversation to be understood): wait for
         │     the speculative retrieval (at most ``FACT_WAIT_S`` more); it passes the confidence gate → a document
         │     question (strong match, or the question names the documents' subject) or a mixed one; it doesn't, but
         │     the question is about the documents' subject ("the company", "FY24") → a document question that
@@ -67,6 +68,7 @@ from .router import (
     asks_for_judgement,
     fallback_route,
     fast_route,
+    leans_on_the_conversation,
     retrieval_route,
     standalone_question,
     validate,
@@ -339,13 +341,17 @@ class TurnPlanner:
     ) -> tuple[RouteDecision, Prefetched | None]:
         """A "general" (or "conversation") proposal for a question about facts, in a chat with READY documents: the
         documents may well answer it (the 4B router labels "How many employees did the company have at year end?"
-        general), so wait for the speculative retrieval, at most ``fact_wait_s`` (module docstring, B1). Returns the
-        decision (upgraded or not) and the retrieval to hand to the turn."""
+        general), so wait for the speculative retrieval, at most ``fact_wait_s`` (module docstring, B1). The same for a
+        "clarification" of a question that stands on its own: the router answers "What is the hotel limit per night for
+        level 3 and level 4 employees in tier 1 cities?" with "which organization do you mean?", while the documents
+        have the answer (a clarification is for a reference to something never mentioned: "what about that one?", which
+        ``leans_on_the_conversation``). Returns the decision (upgraded or not) and the retrieval to hand to the turn."""
         route, proposal = decision.route, decision.proposal
         if (
             decision.source != "llm"
             or proposal is None
-            or route.intent not in ("general_qa", "conversation")
+            or route.intent not in ("general_qa", "conversation", "clarification")
+            or (route.intent == "clarification" and leans_on_the_conversation(req.utterance))
             or speculation is None
             or not asks_about_facts(req.utterance)
             or req.live_cue(route.rewritten_query, proposal.query) is not None  # live data: the web search decides

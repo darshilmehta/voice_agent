@@ -102,6 +102,22 @@ def test_an_answer_full_of_numbers_suggests_a_visual():
     )
 
 
+def test_digits_inside_identifiers_are_not_figures():
+    """Found in the final end-to-end run: "Valmora's CIN is L24119GJ1994PLC023871" counted as three numbers, suggested
+    a chart, and the planner drew an unrelated KPI tile that the voice announced ("It's on screen now.")."""
+    question = "What is the company's corporate identification number?"
+    assert visual_intent(question, "The CIN is L24119GJ1994PLC023871 [S1].") == "none"
+    assert visual_intent(question, "The policy number is GHI/2024/00418377, valid from 1 April 2024.") == "none"
+    assert (
+        visual_intent("Which grades fly business class?", "Grades L5 to L7 fly business class; L1 to L4 fly economy.")
+        == "none"
+    )
+    # real figures still count, with or without a unit, a sign or a trailing sentence stop
+    assert visual_intent(question, "Freight ₹2,609 crore, Contract ₹1,896 crore, Digital ₹481 crore.") == "suggested"
+    assert visual_intent(question, "Margins were 18.8%, 19.5% and 19.9%.") == "suggested"
+    assert visual_intent(question, "Revenue moved from 6,482 to 7,365 and then 8,100.") == "suggested"
+
+
 def test_candidates_ranked_by_the_question():
     ranked = rank_candidates("Show quarterly revenue for FY24", POOL, limit=3)
     assert ranked[0].id == "ds_q_fy24"

@@ -115,10 +115,10 @@ _LANGUAGE_REQUEST_WORDS = wordset(
     """
     please pls plz now from on can could would you will answer reply respond speak talk say tell explain write
     continue switch use repeat in into to me it that this the same again it's language
-    hindi english angrezi angreji batao bataiye bolo boliye bol karo kariye baat jawab do dijiye mein me main ab se
-    zara thoda
-    हिंदी हिन्दी अंग्रेज़ी अंग्रेजी इंग्लिश में बताओ बताइए बताइये बोलो बोलिए बोलिये कीजिए करो करें बात जवाब दो दीजिए अब से
-    ज़रा थोड़ा यह इसे
+    hindi english angrezi angreji batao bataiye bataye batayein bolo boliye bol karo kariye baat jawab do dijiye mein
+    me main ab se zara thoda
+    हिंदी हिन्दी अंग्रेज़ी अंग्रेजी इंग्लिश में बताओ बताइए बताइये बताये बतायें बताएं बताएँ बोलो बोलिए बोलिये कीजिए करो
+    करें बात जवाब दो दीजिए अब से ज़रा थोड़ा यह इसे
     """
 )
 GREETING_PHRASES = _phrases(
@@ -146,6 +146,15 @@ _BACK_REFERENCES = wordset(
     else previous earlier above former latter then there one ones and or but so यह वह ये वो इसका इसकी इसके उसका उसकी
     उसके इसमें उसमें इसे उसे इन उन इनका उनका और भी फिर वही वहाँ वहां तब yeh ye woh wo vo iska iski iske uska uski
     uske isme usme aur bhi phir fir wahi
+    """
+)
+# Words that point at something said before or shown on screen, leaving out the conjunctions and adverbs of
+# ``_BACK_REFERENCES`` ("level 3 and level 4" is no back-reference): what a clarification is really for.
+_DEICTIC = wordset(
+    """
+    it its it's that this these those they them their theirs he she him her his hers same previous earlier above
+    former latter one ones यह वह ये वो इसका इसकी इसके उसका उसकी उसके इसमें उसमें इसे उसे इन उन इनका उनका वही वहाँ वहां
+    yeh ye woh wo vo iska iski iske uska uski uske isme usme wahi
     """
 )
 _FOLLOW_UP_START = re.compile(f"^(?:and|or|but|so|also|what about|how about|why|aur|to|toh|और|तो){_END}")
@@ -199,6 +208,14 @@ def refers_back(text: str) -> bool:
     ("and…", "what about…")."""
     n = normalize(text)
     return bool(_FOLLOW_UP_START.match(n)) or any(w in _BACK_REFERENCES for w in n.split())
+
+
+def leans_on_the_conversation(text: str) -> bool:
+    """Can't be understood without something said or shown before ("what about that one?", "and in FY23?", "why did
+    it grow?"): the one kind of utterance for which asking back is right. "What is the hotel limit per night for level
+    3 and level 4 employees in tier 1 cities?" stands on its own."""
+    n = normalize(text)
+    return bool(_FOLLOW_UP_START.match(n)) or any(w in _DEICTIC for w in n.split())
 
 
 def is_correction(text: str) -> bool:

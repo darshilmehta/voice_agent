@@ -350,7 +350,7 @@ class CanvasEdit:
 _REMOVE = (
     r"remove|delete|drop|hide|close|discard|get\s+rid\s+of|take\s+(?:it\s+|that\s+|this\s+)?(?:away|off|down)|"
     r"हटा|हटाओ|हटाइए|हटाएं|हटाएँ|हटा\s+दो|हटा\s+दीजिए|मिटा|मिटाओ|मिटा\s+दो|"
-    r"hata|hatao|hataiye|hatayein|hata\s+do|hata\s+dijiye|mita|mitao|mita\s+do"
+    r"hata|hatao|hataiye|hatayein|hata\s*do|hata\s+dijiye|mita|mitao|mita\s*do"
 )
 _CLEAR = (
     r"clear\s+(?:the\s+)?(?:canvas|screen|board|charts?|everything|all)|"
