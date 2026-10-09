@@ -67,7 +67,7 @@ _KINDS_ASKED: tuple[tuple[re.Pattern[str], VisualKind], ...] = tuple(
         (r"bar\s+(?:chart|graph)s?|bars|column\s+chart|बार\s+(?:चार्ट|ग्राफ़|ग्राफ)", "bar"),
         (r"line\s+(?:chart|graph)s?|trend\s+line|लाइन\s+(?:चार्ट|ग्राफ़|ग्राफ)|रेखा\s+(?:चार्ट|ग्राफ़|ग्राफ)", "line"),
         (r"timeline|टाइमलाइन", "timeline"),
-        (r"tables?|tabular|exact\s+(?:\S+\s+){0,2}?(?:figures|numbers)|टेबल|तालिका|सारणी", "table"),
+        (r"tables?|tabular|exact\s+(?:\S+\s+){0,2}?(?:figures|numbers)|टेबल|तेबल|तालिका|सारणी", "table"),
         (r"kpis?|tiles", "kpi"),
     )
 )
