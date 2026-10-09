@@ -467,12 +467,15 @@ def test_C_real_words_after_an_acknowledgement_still_cut_the_answer(voice):
 
 
 def test_C_an_acknowledgement_alone_is_never_answered_as_a_question(voice):
+    """While the agent is silent, "Yeah, right." reaches the router's keyword fast path: a short spoken
+    acknowledgement, no model call, never "I couldn't find that in the documents"."""
     voice.fakes.stt.scripts[SAID] = "Yeah, right."
     with voice.connect() as ws:
         c = VoiceClient(ws)
         c.start()
-        c.say(SAID)  # the agent is silent: nothing to acknowledge, nothing to answer
-        items = c.until(is_state("listening"))
-        assert kinds(items) == ["user_speech", "user_speech", "state", "state"]  # thinking, then listening
-        assert not of(c.quiet(0.3), "user_message")
-    assert voice.transcript() == [] and voice.fakes.llm.calls == []
+        c.say(SAID)
+        items = c.until("agent_message")
+        agent = one(items, "agent_message")["message"]
+        assert agent["route"]["intent"] == "backchannel" and agent["route"]["abstained"] is False
+        assert [ch["text"] for ch in of(items, "audio_chunk")] == [agent["text"]]  # a short reply, spoken
+    assert voice.fakes.llm.calls == []  # neither the router model nor the answer model was asked

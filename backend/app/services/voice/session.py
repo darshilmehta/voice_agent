@@ -85,7 +85,6 @@ from .speech_text import (
     SpeechChunker,
     SpokenChunk,
     heard_text,
-    is_acknowledgement,
     is_backchannel,
     is_filler,
     normalize_utterance,
@@ -588,8 +587,10 @@ class VoiceSession:
                 await self._decide(pending, "stop")
             else:  # no barge_in_start (or it was resolved already): use its played_ms only if it was this speech
                 await self._interrupt(agent, "barge_in", self._barge_in_played(agent, ended), decision=True)
-        # Noise, hums, or only acknowledgements ("Yeah, right."): not a question, nothing to answer.
-        if not normalize_utterance(text) or is_filler(text) or is_acknowledgement(text):
+        # Noise and hums ("M M", "hmm"): nothing to answer. Lexical acknowledgements said while the agent is idle
+        # ("okay", "yes please", "theek hai") go to the router, which replies briefly (or not at all) and never
+        # abstains, and can tell "yes" to the agent's offer from a bare "okay".
+        if not normalize_utterance(text) or is_filler(text):
             await self._ignored_utterance(done_processing=True)
             return
         await self._start_turn(transcript, ended, stt_ms, speculative)
