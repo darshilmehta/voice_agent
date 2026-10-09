@@ -20,6 +20,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from typing import Literal, NamedTuple
 
 from ...domain.canvas import Visual
 from ...domain.datasets import ChartKind, TypedDataset
@@ -283,7 +284,7 @@ _HI_EN: Mapping[str, str] = {
     "केंद्र": "centre", "प्रशिक्षण": "training", "अवधि": "duration", "सप्ताह": "weeks", "राजस्व": "revenue",
     "आय": "income", "मुनाफा": "profit", "मुनाफ़ा": "profit", "लाभ": "profit", "कर्मचारी": "employees",
     "खंड": "segment", "क्षेत्र": "region", "योग्यता": "qualification", "न्यूनतम": "minimum", "कुल": "total",
-    "आवेदन": "applications", "राशि": "amount", "संख्या": "number", "और": "and",
+    "आवेदन": "applications", "राशि": "amount", "संख्या": "number", "और": "and", "वर्ष": "year", "पूर्ण": "full",
 }  # fmt: skip
 _EN_HI: Mapping[str, str] = {
     "seats": "सीटें", "seat": "सीट", "course": "पाठ्यक्रम", "courses": "पाठ्यक्रम", "district": "जिला",
@@ -291,7 +292,7 @@ _EN_HI: Mapping[str, str] = {
     "centres": "केंद्र", "training": "प्रशिक्षण", "duration": "अवधि", "weeks": "सप्ताह", "revenue": "राजस्व",
     "income": "आय", "profit": "मुनाफ़ा", "employees": "कर्मचारी", "segment": "खंड", "segments": "खंड",
     "region": "क्षेत्र", "qualification": "योग्यता", "minimum": "न्यूनतम", "total": "कुल",
-    "applications": "आवेदन", "amount": "राशि", "number": "संख्या", "and": "और",
+    "applications": "आवेदन", "amount": "राशि", "number": "संख्या", "and": "और", "year": "वर्ष", "full": "पूर्ण",
 }  # fmt: skip
 _GENERIC_X = frozenset({"particulars", "metric", "item", "row", "category", "विवरण"})
 _LABEL_PUNCT = re.compile(r"[()\[\]{},.:;/]")
@@ -307,6 +308,87 @@ def in_language(label: str, language: str) -> str:
     if not words or any(w is None for w in found):
         return label
     return " ".join(w for w in found if w)
+
+
+class LabelName(NamedTuple):
+    """How a sentence in one language names a data label (``label_name``).
+
+    ``kind``: "own" (the label is in the sentence's language, or has no words: "FY24", "EBITDA"), "translated" (a
+    name from the label itself or the word list; ``printed`` is the label as printed, for a reader who wants to find
+    it) or "quoted" (no translation: the label as printed, between quotation marks)."""
+
+    text: str
+    printed: str | None
+    kind: Literal["own", "translated", "quoted"]
+
+
+_CODE = re.compile(r"^[^a-zऀ-ॿ]+$")  # no lowercase letter and no Devanagari: FY24, Q3, EBITDA, ₹
+_MONTH = re.compile(
+    r"^(?:january|february|march|april|may|june|july|august|september|october|november|december"
+    r"|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)$",
+    re.IGNORECASE,
+)
+_PARTS = re.compile(r"\s*[()\[\]/|]\s*|\s+[-–—]\s+")  # "सीटें (Seats)", "Seats / सीटें", "Seats - सीटें"  # noqa: RUF001
+_MIN_LETTERS = {"en": 4, "hi": 2}  # a printed English name has words ("Seats"), not a unit or an acronym ("kW", "GST")
+
+
+def _is_code(text: str) -> bool:
+    """A label that is not a word of any language: FY24, Q3 FY24, EBITDA, 31 Mar 2024."""
+    words = text.split()
+    return bool(words) and all(_CODE.match(w) or _MONTH.match(w) for w in words)
+
+
+def _bilingual(label: str, language: str) -> tuple[str, str] | None:
+    """A label printed in both languages ("सीटें (Seats)", "Seats / सीटें"): (its part in ``language``, the other
+    part). The document's own words for it, when it has them."""
+    parts = [p for p in (s.strip() for s in _PARTS.split(label)) if p]
+    scripts = [script_of(p) for p in parts]
+    if len(parts) != 2 or set(scripts) != {"en", "hi"}:
+        return None
+    mine = scripts.index(language)
+    letters = _LATIN if language == "en" else _DEVANAGARI
+    if len(letters.findall(parts[mine])) < _MIN_LETTERS[language]:
+        return None
+    return parts[mine], parts[1 - mine]
+
+
+def _translated(label: str, language: str) -> str | None:
+    """``label`` word by word from the word list (``in_language``'s), where a word that has no letters of the label's
+    script (a number, FY24, EBITDA) stays as it is; None when no word is translated."""
+    table = _HI_EN if language == "en" else _EN_HI
+    source = _DEVANAGARI if language == "en" else _LATIN
+    out: list[str] = []
+    found = False
+    for word in _LABEL_PUNCT.sub(" ", label).split():
+        known = table.get(word) or table.get(word.casefold())
+        if known:
+            out.append(known)
+            found = True
+        elif not source.search(word) or _is_code(word):
+            out.append(word)
+        else:
+            return None
+    return " ".join(out) if found else None
+
+
+def label_name(label: str, language: str) -> LabelName:
+    """A data label as a sentence in ``language`` names it, so that a summary is in one language:
+
+    1. a label printed in both ("सीटें (Seats)") gives the part in the language, the other part as ``printed``;
+    2. a label in the language (or without words) stays as it is;
+    3. a label every word of which is on the word list is translated (``printed``: the label);
+    4. any other is quoted as printed (“सिलाई एवं परिधान निर्माण”): the sentence's frame stays in the language and the
+       label is shown to be a name from the document."""
+    language = "hi" if language == "hi" else "en"
+    pair = _bilingual(label, language)
+    if pair is not None:
+        return LabelName(pair[0], pair[1], "translated")
+    if script_of(label) in (None, language) or _is_code(label):
+        return LabelName(label, None, "own")
+    words = _translated(label, language)
+    if words is not None:
+        return LabelName(words, label, "translated")
+    return LabelName(f"“{label}”", None, "quoted")
 
 
 _PHRASES = {

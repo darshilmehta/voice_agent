@@ -59,7 +59,7 @@ from .store import CanvasStore
 
 log = logging.getLogger(__name__)
 
-OVERVIEW_VERSION = "o2"  # bump when the overview's choices change, so stored overviews are rebuilt
+OVERVIEW_VERSION = "o3"  # bump when the overview's choices or texts change, so stored overviews are rebuilt
 
 
 class CanvasService:
