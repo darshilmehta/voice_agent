@@ -11,7 +11,7 @@ import pytest
 
 from app.evals.manifest import DocumentEntry, Fact, Manifest
 from app.evals.questions import Expected, Question
-from app.evals.report import render_markdown
+from app.evals.report import pipeline_rows, render_markdown
 from app.evals.retrieval_eval import (
     PROJECT_ID,
     EvalOptions,
@@ -445,6 +445,16 @@ async def test_outputs_are_a_json_file_a_markdown_summary_and_the_chunks(harness
         assert heading in md, heading
     assert "Recall@5" in md and "hallucination risk" in md.lower() and "a.lost" in md  # the dropped fact is listed
     assert "Unanswerable questions by subtype" in md and "near_miss_year" in md
+
+
+async def test_miss_and_gate_error_listings_name_each_question_once(harness, docs):
+    """The listings follow the headline's pipeline view: the routed query of a Hindi question, not also its raw one
+    (raw rows carry no English query, so they can't be told apart by it)."""
+    results, _ = await run(harness, docs)
+    rows = results["runs"][0]["rows"]
+    pairs = pipeline_rows(rows)
+    assert ("q3", "routed") in pairs and ("q3", "raw") not in pairs and ("q1", "raw") in pairs
+    assert len(pairs) == len({r["id"] for r in rows}) == 7
 
 
 async def test_summary_can_be_rendered_again_from_results_json(harness, docs, tmp_path):

@@ -487,6 +487,17 @@ def _misses(rows: Sequence[Mapping[str, Any]], pipeline_variants: set[tuple[str,
     return "\n".join(out)
 
 
+def pipeline_rows(rows: Sequence[Mapping[str, Any]]) -> set[tuple[str, str]]:
+    """(question id, variant) of the pipeline view, as in the headline: the routed query where a question has one,
+    else the raw question (each question once)."""
+    routed = {r["id"] for r in rows if r["variant"] == "routed"}
+    return {
+        (r["id"], r["variant"])
+        for r in rows
+        if r["variant"] == "routed" or (r["variant"] == "raw" and r["id"] not in routed)
+    }
+
+
 def _gate_errors(rows: Sequence[Mapping[str, Any]], pipeline_variants: set[tuple[str, str]], threshold: float) -> str:
     sel = [r for r in rows if (r["id"], r["variant"]) in pipeline_variants]
     false_abstain = sorted(
@@ -601,11 +612,7 @@ def _run_section(results: Mapping[str, Any], run: Mapping[str, Any], index: int)
     out.append("\n### Latency per stage (ms, pipeline queries)\n")
     out.append(_latency(pipeline))
     out.append("\n### Misses\n")
-    pipeline_pairs = {
-        (r["id"], r["variant"])
-        for r in run["rows"]
-        if r["variant"] == "routed" or (r["variant"] == "raw" and not r["query_en"])
-    }
+    pipeline_pairs = pipeline_rows(run["rows"])
     out.append(_misses(run["rows"], pipeline_pairs))
     out.append("\n### Abstention errors\n")
     out.append(_gate_errors(run["rows"], pipeline_pairs, p["threshold"]))
