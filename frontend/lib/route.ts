@@ -184,6 +184,21 @@ export function rewrittenQueryOf(agent: Routed, userText: string): string | null
 }
 
 /**
+ * The visual an answer added to the chat's canvas (`route.visual_id`, docs/DESIGN.md §12.1): the transcript says
+ * "Chart added". The backend writes it onto the saved message once the visual is ready, which is usually after the
+ * answer arrived, so a live turn patches it in from the `visual` event (`withVisual`).
+ */
+export function visualIdOf(m: Routed): string | null {
+  const id = m.route?.visual_id;
+  return typeof id === "string" && id ? id : null;
+}
+
+/** `m` with the visual its turn produced (a `visual {phase: "ready"}` event), as the backend saves it. */
+export function withVisual(m: Message, visualId: string): Message {
+  return { ...m, route: { ...(m.route ?? {}), visual_id: visualId, visual_status: "ready" } };
+}
+
+/**
  * For each user message that the router understood differently ("no, I meant FY25" became "What was revenue in
  * FY25?"; Whisper heard the wrong word), the question it worked from, by user message id. A user message belongs to
  * the first agent message after it, before the next user message.

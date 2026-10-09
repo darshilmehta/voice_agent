@@ -259,6 +259,44 @@ class CanvasStore(Service):
             await s.flush()
             return _visual(row)
 
+    async def panel_spec(self, chat_id: str, visual_id: str) -> dict[str, Any]:
+        """The spec a chat's panel was built from. Raises NotFound."""
+        async with self.db.session() as s:
+            row = await s.get(orm.CanvasVisual, visual_id)
+            if row is None or row.chat_id != chat_id:
+                raise NotFound("visual", visual_id)
+            return dict(row.spec)
+
+    async def replace_panel(
+        self, chat_id: str, visual_id: str, visual: Visual, spec: dict[str, Any], document_ids: Sequence[str]
+    ) -> Visual:
+        """Rebuild a chat's panel in place (an edit: another kind, other periods): same id, position, pin and
+        creation time, the new visual and spec. Raises NotFound."""
+        async with self.db.session() as s:
+            row = await s.get(orm.CanvasVisual, visual_id)
+            if row is None or row.chat_id != chat_id:
+                raise NotFound("visual", visual_id)
+            created = Visual.model_validate(row.visual).created_at
+            row.kind = visual.kind
+            row.spec = spec
+            row.document_ids = list(document_ids)
+            row.visual = visual.model_copy(update={"created_at": created}).model_dump(mode="json")
+            row.updated_at = self.now()
+            await s.flush()
+            return _visual(row)
+
+    async def remove_unpinned(self, chat_id: str) -> list[Visual]:
+        """Clear a chat's canvas except its pinned panels; returns what is left."""
+        async with self.db.session() as s:
+            await get_or_404(s, orm.Chat, chat_id, "chat")
+            rows = await self._chat_rows(s, chat_id)
+            for row in [r for r in rows if not r.pinned]:
+                rows.remove(row)
+                await s.delete(row)
+            self._renumber(rows)
+            await s.flush()
+            return [_visual(r) for r in rows]
+
     @staticmethod
     async def _evict(s: AsyncSession, rows: list[orm.CanvasVisual], keep: orm.CanvasVisual, max_panels: int) -> None:
         """Past ``max_panels``, remove the oldest unpinned panels (never ``keep``, the one just added)."""

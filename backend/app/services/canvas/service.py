@@ -8,7 +8,9 @@ canvases and the entry point the conversation will use. Long-lived (one per app,
                                         (current) datasets, then rebuild overviews that are out of date
     API ─────────────canvas, ops, POST visuals (spec → validate → build → store), overview, datasets
     conversation ────prepare_visual(chat, question, …) → VisualEvent preparing / ready | failed, CanvasEvent
-                     (not wired into turns yet: the integration step calls it)
+                     (a turn runs it after its answer's text is complete: ``conversation.TurnVisual``)
+                     edit(chat, CanvasEdit, …) → the canvas events of a spoken edit, then its EditResult
+                     visual_tables(chat, visual) → the tables behind a visual (questions about what is on screen)
 """
 
 from __future__ import annotations
@@ -24,19 +26,20 @@ from datetime import datetime
 from ...db.types import new_id, utcnow
 from ...domain.canvas import CanvasEvent, CanvasOp, CanvasPanels, ProjectOverview, Visual, VisualEvent
 from ...domain.datasets import DatasetSummary, TableContext, TypedDataset
-from ...domain.projects import Citation
+from ...domain.projects import Citation, DocumentTable
 from ...providers.ingestion import Chunk, ParsedDocument
 from ...providers.llm import LLMClient
 from ...providers.registry import Container
 from ...providers.runtime import LANE_LONG, JobQueue
 from ...providers.storage import MetadataDB
 from ...settings import Settings
-from ..base import InvalidInput
+from ..base import InvalidInput, NotFound
 from ..documents import DocumentService
 from .builder import build_visual
+from .conversation import CanvasEdit, EditOutcome, EditResult, describe, resolve_target
 from .datasets import TYPER_VERSION, table_contexts, type_document
 from .overview import overview_specs
-from .planner import VisualPlanner, visual_intent
+from .planner import VisualPlanner, builds, first_valid, visual_intent
 from .spec import SpecError, VisualSpec, resolve, split_ref
 from .store import CanvasStore
 
@@ -334,6 +337,7 @@ class CanvasService:
         sources: Sequence[Citation] = (),
         query_en: str | None = None,
         force: bool = False,
+        visual_id: str | None = None,
     ) -> AsyncIterator[VisualEvent | CanvasEvent]:
         """The conversation's entry point (run beside the spoken answer, never before it): decide whether the
         question deserves a visual, plan it with the model, build it from the cells, add it to the chat's canvas.
@@ -341,12 +345,13 @@ class CanvasService:
         Yields nothing when the question doesn't call for a visual (``visual_intent`` "none", unless ``force``);
         otherwise ``visual{phase: preparing}`` first (show a skeleton), then ``visual{phase: ready, visual}`` and
         ``canvas{panels}``, or ``visual{phase: failed, detail}``. ``sources``: the turn's citations, so the visual's
-        cells reuse their [S#] ids. Never raises for planning or building problems."""
+        cells reuse their [S#] ids. ``visual_id``: the id to give it (the turn announces it before planning starts).
+        Never raises for planning or building problems."""
         if self.planner is None:
             return
         if visual_intent(question, answer) == "none" and not force:
             return
-        visual_id = new_id("vis")
+        visual_id = visual_id or new_id("vis")
         yield VisualEvent(phase="preparing", visual_id=visual_id)
         try:
             project_id, datasets, filenames, _ = await self._chat_datasets(chat_id)
@@ -382,6 +387,184 @@ class CanvasService:
         yield VisualEvent(phase="ready", visual_id=visual_id, visual=stored)
         with suppress(Exception):
             yield CanvasEvent(panels=await self.store.panels(chat_id))
+
+    # -------------------------------------------------------------- the conversation's edits and questions
+
+    async def edit(
+        self,
+        chat_id: str,
+        edit: CanvasEdit,
+        *,
+        utterance: str,
+        language: str,
+        query_en: str | None = None,
+    ) -> AsyncIterator[VisualEvent | CanvasEvent | EditResult]:
+        """An edit said in the conversation (``conversation.parse_edit``), applied to the visual it means
+        (``resolve_target``). Yields the canvas events (a rebuilt visual: ``visual{ready}`` with its id kept, a model
+        rebuild ``visual{preparing}`` first; then the ``canvas`` snapshot) and, last, the ``EditResult``. Rebuilds go
+        through the spec, the validator and the builder: every number is still a cell. Never raises for an edit that
+        can't be done (the result says why)."""
+        panels = await self.store.panels(chat_id)
+        if not panels:
+            yield EditResult("nothing", edit.op)
+            return
+        if edit.op == "clear":
+            yield CanvasEvent(panels=await self.store.remove_unpinned(chat_id))
+            yield EditResult("done", edit.op)
+            return
+        target = resolve_target(utterance, panels, kind_hint=edit.target_kind)
+        assert target is not None
+        if edit.op in ("remove", "pin", "unpin"):
+            canvas = await self.apply(chat_id, CanvasOp(op=edit.op, visual_id=target.id))
+            yield CanvasEvent(panels=canvas.panels)
+            yield EditResult("done", edit.op, target.id)
+            return
+        project_id, datasets, filenames, _ = await self._chat_datasets(chat_id)
+        try:
+            spec = VisualSpec.model_validate(await self.store.panel_spec(chat_id, target.id))
+        except (NotFound, ValueError):
+            yield EditResult("failed", edit.op, target.id, detail="the visual's spec can't be read")
+            return
+        changed: VisualSpec | None = None
+        outcome: EditOutcome = "done"
+        if edit.op == "kind" and edit.kind is not None:
+            if edit.kind == target.kind:
+                yield EditResult("same", edit.op, target.id)
+                return
+            changed = first_valid(spec.model_copy(update={"kind": edit.kind}), datasets, builds(datasets, filenames))
+            outcome = "done" if changed is not None else "cannot"
+        elif edit.op in ("periods", "only"):
+            available = _periods_of(spec, datasets)
+            asked = [p for p in edit.periods if p in available]
+            if asked and edit.op == "only":
+                changed = spec.model_copy(update={"periods": asked, "highlight": [], "calculations": []})
+            elif asked:
+                shown = list(spec.periods) or list(available)
+                if all(p in shown for p in asked):
+                    yield EditResult("already", edit.op, target.id)
+                    return
+                order = {p: n for n, p in enumerate(available)}
+                periods = sorted(dict.fromkeys([*shown, *asked]), key=lambda p: order.get(p, 0))
+                changed = spec.model_copy(update={"periods": periods, "calculations": []})
+            if changed is not None:
+                changed = first_valid(changed, datasets, builds(datasets, filenames))
+                outcome = "done" if changed is not None else "cannot"
+        if changed is None and outcome == "done":  # the rules can't say: the planner, with the visual as context
+            async for event in self._edit_with_model(
+                chat_id, target, edit, utterance=utterance, language=language, query_en=query_en
+            ):
+                yield event
+            return
+        if changed is None:
+            yield EditResult(outcome, edit.op, target.id)
+            return
+        visual = self._build(
+            changed,
+            datasets,
+            filenames,
+            project_id=project_id,
+            chat_id=chat_id,
+            visual_id=target.id,
+            sources=target.sources,
+        )
+        stored = await self.store.replace_panel(
+            chat_id, target.id, visual, changed.model_dump(mode="json", by_alias=True), _documents(changed, datasets)
+        )
+        yield VisualEvent(phase="ready", visual_id=target.id, visual=stored)
+        yield CanvasEvent(panels=await self.store.panels(chat_id))
+        yield EditResult("done", edit.op, target.id)
+
+    async def _edit_with_model(
+        self,
+        chat_id: str,
+        target: Visual,
+        edit: CanvasEdit,
+        *,
+        utterance: str,
+        language: str,
+        query_en: str | None,
+    ) -> AsyncIterator[VisualEvent | CanvasEvent | EditResult]:
+        """An edit the rules can't read ("add profit to that chart", FY23 from another table): the planner chooses
+        again for the request, told what is on screen, with the visual's tables first among the candidates."""
+        if self.planner is None:
+            yield EditResult("failed", edit.op, target.id, source="model", detail="no planner")
+            return
+        yield VisualEvent(phase="preparing", visual_id=target.id)  # "Updating…" on the panel
+        try:
+            project_id, datasets, filenames, _ = await self._chat_datasets(chat_id)
+            spec = VisualSpec.model_validate(await self.store.panel_spec(chat_id, target.id))
+            chunks = [d.chunk_id for d in (datasets.get(i) for i in spec.datasets) if d is not None and d.chunk_id]
+            question = f"Change the chart on screen ({describe(target)}): {utterance}"
+            english = f"Change the chart on screen ({describe(target)}): {query_en}" if query_en else None
+            changed = await self.planner.plan(
+                question,
+                language,
+                list(datasets.values()),
+                filenames=filenames,
+                query_en=english,
+                source_chunks=chunks,
+                force=True,
+            )
+            if changed is None:
+                yield VisualEvent(phase="failed", visual_id=target.id, detail="no table fits that change")
+                yield EditResult("failed", edit.op, target.id, source="model", detail="no table fits that change")
+                return
+            visual = self._build(
+                changed,
+                datasets,
+                filenames,
+                project_id=project_id,
+                chat_id=chat_id,
+                visual_id=target.id,
+                sources=target.sources,
+            )
+            stored = await self.store.replace_panel(
+                chat_id,
+                target.id,
+                visual,
+                changed.model_dump(mode="json", by_alias=True),
+                _documents(changed, datasets),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("canvas: editing %s with the model failed: %s", target.id, e)
+            yield VisualEvent(phase="failed", visual_id=target.id, detail=str(e)[:300])
+            yield EditResult("failed", edit.op, target.id, source="model", detail=str(e)[:300])
+            return
+        yield VisualEvent(phase="ready", visual_id=target.id, visual=stored)
+        yield CanvasEvent(panels=await self.store.panels(chat_id))
+        yield EditResult("done", edit.op, target.id, source="model")
+
+    async def visual_tables(self, chat_id: str, visual: Visual) -> list[tuple[TypedDataset, DocumentTable]]:
+        """The tables a chat's visual was built from (a question about what is on screen is answered from them)."""
+        try:
+            spec = VisualSpec.model_validate(await self.store.panel_spec(chat_id, visual.id))
+        except (NotFound, ValueError):
+            return []
+        _, datasets, _, _ = await self._chat_datasets(chat_id)
+        out = []
+        for dataset_id in spec.datasets:
+            ds = datasets.get(dataset_id)
+            if ds is None:
+                continue
+            table = next((t for t in await self.documents.tables(ds.document_id) if t.id == ds.table_id), None)
+            if table is not None:
+                out.append((ds, table))
+        return out
+
+
+def _periods_of(spec: VisualSpec, datasets: dict[str, TypedDataset]) -> list[str]:
+    """The periods of the spec's datasets, in time order."""
+    found: dict[str, tuple[int, int]] = {}
+    for dataset_id in spec.datasets:
+        ds = datasets.get(dataset_id)
+        if ds is None:
+            continue
+        for p in [*(c.period for c in ds.columns), *(r.period for r in ds.rows)]:
+            if p is not None:
+                found.setdefault(p.label, p.sort_key)
+    return sorted(found, key=lambda label: found[label])
 
 
 def _spec_key(spec: dict[str, object]) -> str:

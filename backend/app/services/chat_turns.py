@@ -28,6 +28,15 @@ complete (``AnswerStop.answered``), a stop saves it complete: only its continuat
 
 Every saved agent message has ``route.basis`` (``answer_basis``): what it drew on, documents / web / general.
 
+The live visual canvas (§12.1): with a ``CanvasService``, the canvas is read before routing (``RouteRequest.screen``:
+the router sees what is on screen; a question about a chart there gets that chart's tables first among its sources).
+A document answer whose question calls for a visual (``route.visual``), or whose figures suggest one, starts it once
+its text is complete (``_start_visual``: never ahead of the answer's own request on the serial model) → VisualEvent
+preparing / ready | failed, CanvasEvent, in this stream after the answer (the stream stays open for them, bounded)
+or, with ``run(on_visual=…)`` (voice), to the caller as they come. A visual still being planned is cancelled by the
+next turn that needs the model, waited for by an edit. A ``canvas_edit`` turn applies the edit (its events in the
+stream) and says "Done." / "हो गया।".
+
 Every turn that doesn't fail ends with ``AgentMessageEvent``. A "stop" turn says nothing: no ``DeltaEvent``, and the
 message it ends with has role ``event`` (a short notice for the transcript, carrying the route).
 
@@ -60,19 +69,37 @@ import functools
 import logging
 import re
 import time
-from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import Any, ClassVar, Literal
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from ..domain.conversation import ConversationState
+from ..db.types import new_id
+from ..domain.canvas import CanvasEvent, Visual, VisualEvent
+from ..domain.conversation import ConversationState, VisualWant
 from ..domain.projects import Chat, Citation, Message, Modality
 from ..providers.base import PlaceholderProvider
+from ..providers.ingestion import Chunk
 from ..providers.llm import LLMClient, LLMMessage
 from ..providers.registry import Container
 from ..providers.storage import MetadataDB
 from ..providers.web_search import WebSearch
 from ..settings import Language, Settings
 from .base import InvalidInput
+from .canvas.conversation import (
+    CanvasEdit,
+    EditResult,
+    TurnVisual,
+    describe,
+    edit_reply,
+    parse_edit,
+    point_reference,
+    refers_to_screen,
+    resolve_target,
+    screen_lines,
+    visual_in_progress,
+    visual_want,
+)
+from .canvas.planner import visual_intent
 from .chats import ChatService
 from .conversation import ConversationStateService, TurnOutcome, state_writes
 from .documents import DocumentService
@@ -86,7 +113,7 @@ from .language import (
 from .live_data import LiveNote
 from .memory import MemoryKeeper, chat_activity
 from .messages import MessageService
-from .planning import DocumentQARouter, TurnPlan, TurnPlanner, interrupted_answer
+from .planning import VISUAL_INTENTS, DocumentQARouter, TurnPlan, TurnPlanner, interrupted_answer
 from .prompts import (
     ANSWER_LENGTHS,
     CONTINUATION_NOTHING,
@@ -116,10 +143,13 @@ from .prompts import (
     resume_text,
     with_memory,
 )
-from .retrieval import Confidence, RetrievalResult, RetrievalService, SpeculationOutcome
-from .router import LLMTurnRouter, RouteRequest, TurnRouter, heard
+from .retrieval import Confidence, RankedChunk, RetrievalResult, RetrievalService, SpeculationOutcome
+from .router import LLMTurnRouter, RouteRequest, TurnRouter, fast_route, heard
 from .sources import Source, build_sources, finalize_answer, says_not_covered, strip_markers, trim_open_marker
 from .web_search import ToolEvent, WebSearchRun, WebSource
+
+if TYPE_CHECKING:
+    from .canvas.service import CanvasService
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +180,7 @@ HISTORY_STEP = 4
 HISTORY_MESSAGES = HISTORY_MIN + HISTORY_STEP - 1  # the most the window holds (7)
 HISTORY_CHARS = 1000  # per message
 SHORT_REPLY_TOKENS = 96  # conversation replies and clarifying questions: one sentence
+VISUAL_BUILD_S = 2.0  # after the planner's timeout: a heuristic fallback, building from the cells, storing (§12.1)
 CONTINUATION_TOKENS = 96  # one sentence about results that arrived after the answer started (§3.7)
 # The end of a continuation's first sentence: a full stop before a capitalised word or a Devanagari one ("Rs. 997"
 # and "U.S. dollar" don't end it).
@@ -257,7 +288,18 @@ class ErrorEvent:
         return {"detail": self.detail, "stage": self.stage}
 
 
-ChatEvent = UserMessageEvent | SourcesEvent | DeltaEvent | AgentMessageEvent | ErrorEvent | ToolEvent
+ChatEvent = (
+    UserMessageEvent
+    | SourcesEvent
+    | DeltaEvent
+    | AgentMessageEvent
+    | ErrorEvent
+    | ToolEvent
+    | VisualEvent
+    | CanvasEvent
+)
+# Where a turn's visual events go when they don't travel in its own stream (voice: they may follow agent_message).
+VisualSink = Callable[[VisualEvent | CanvasEvent], Awaitable[None]]
 
 
 # ------------------------------------------------------------------ turn
@@ -341,6 +383,14 @@ class _Progress:
     notice: LiveNote | None = None  # the live-data notice the answer started with
     language_retry: bool = False  # the answer came out in the wrong script and was asked again (B5)
     name_documents: bool = False  # the answer says which document its figures come from (UX5)
+    # The canvas (§12.1)
+    panels: list[Visual] = field(default_factory=list)  # on screen when the turn started
+    visual_sink: VisualSink | None = None  # the transport's channel for the visual (None: the turn's own stream)
+    visual: TurnVisual | None = None  # the answer's visual, prepared after its text is complete
+    visual_want: VisualWant = "none"  # route.visual, with the answer's own figures counted
+    screen_visual: Visual | None = None  # the visual a question is about ("what's the second bar?")
+    screen: list[str] = field(default_factory=list)  # that visual, described for the answer prompt
+    edit: dict[str, Any] | None = None  # route.canvas_edit of an edit turn
 
     @property
     def citable(self) -> list[Source | WebSource]:
@@ -358,6 +408,22 @@ class _Clock:
 def _describe(e: BaseException) -> str:
     text = str(e)
     return f"{type(e).__name__}: {text}" if text else type(e).__name__
+
+
+def with_evidence(result: RetrievalResult | None, shown: Sequence[RankedChunk], query: str) -> RetrievalResult:
+    """The retrieval with the tables of the visual a question is about put first (§12.1): the user pointed at them,
+    so they pass the gate whatever the search scored."""
+    ids = {c.chunk.chunk_id for c in shown}
+    if result is None:
+        confidence = Confidence(top_score=1.0, gap=1.0, dense_similarity=None, above_threshold=True)
+        return RetrievalResult(query, query, list(shown), len(shown), confidence)
+    chunks = [*shown, *(c for c in result.chunks if c.chunk.chunk_id not in ids)]
+    confidence = (
+        replace(result.confidence, above_threshold=True, missing_periods=(), missing_subjects=())
+        if result.confidence is not None
+        else Confidence(top_score=1.0, gap=1.0, dense_similarity=None, above_threshold=True)
+    )
+    return replace(result, chunks=chunks, confidence=confidence)
 
 
 Basis = Literal["documents", "web", "general"]
@@ -418,7 +484,9 @@ class ChatTurnService:
         settings: Settings,
         router: TurnRouter | None = None,
         web_search: WebSearch | None = None,
+        canvas: CanvasService | None = None,
     ) -> None:
+        self.canvas = canvas  # None: no visuals in turns (§12.1)
         self.chats = ChatService(db)
         self.messages = MessageService(db)
         self.documents = DocumentService(db)
@@ -434,7 +502,8 @@ class ChatTurnService:
         self.memory = MemoryKeeper(db, llm, settings, window=6)
 
     @classmethod
-    def from_container(cls, container: Container) -> ChatTurnService:
+    def from_container(cls, container: Container, *, canvas: CanvasService | None = None) -> ChatTurnService:
+        """``canvas``: the app's long-lived canvas service (``app.state.canvas``); without it turns make no visuals."""
         db, llm = container["metadata_db"], container["llm"]
         if not isinstance(db, MetadataDB) or not isinstance(llm, LLMClient):
             raise TypeError(
@@ -448,6 +517,7 @@ class ChatTurnService:
             llm=llm,
             settings=container.settings,
             web_search=web_search,
+            canvas=canvas,
         )
 
     def available_tools(self) -> frozenset[str]:
@@ -533,22 +603,42 @@ class ChatTurnService:
         )
 
     async def run(
-        self, turn: Turn, *, stop: AnswerStop | None = None, user: Message | None = None
+        self,
+        turn: Turn,
+        *,
+        stop: AnswerStop | None = None,
+        user: Message | None = None,
+        on_visual: VisualSink | None = None,
     ) -> AsyncGenerator[ChatEvent, None]:
         """The turn's events. ``stop``: see ``AnswerStop`` (callers that know what was heard of a stopped answer).
         ``user``: the user message, if the caller already saved it with ``save_user_message``. While the turn runs,
-        the chat's memory summary waits (or gives way if it is running): one LLM serves both."""
+        the chat's memory summary waits (or gives way if it is running): one LLM serves both.
+
+        The answer's visual (§12.1) is planned once the answer's text is complete. Its events (``VisualEvent``,
+        ``CanvasEvent``) travel in this stream unless ``on_visual`` is given: the stream then stays open after
+        ``AgentMessageEvent`` until the visual is ready, failed or given up (``canvas.planner_timeout_ms`` and a
+        little more). With ``on_visual`` (voice) they go there instead, as they come, and the stream ends with the
+        answer. A canvas edit's events are always in the stream (they come before its reply). The memory summary and
+        the next prompt's warm-up wait for the visual too: they would queue behind it on the model."""
         activity = chat_activity()
         activity.turn_started(turn.chat.id)
+        p = _Progress(TurnPlan(query=turn.text, language=turn.language), stop=stop, visual_sink=on_visual)
         try:
-            async with contextlib.aclosing(self._run(turn, stop, user)) as events:
+            async with contextlib.aclosing(self._run(turn, stop, user, p)) as events:
                 async for event in events:
                     yield event
         finally:
             job = functools.partial(self._after_turn, turn)
-            activity.turn_finished(turn.chat.id, job, spawn=detach)
+            visual = p.visual
+            if visual is not None and visual.task is not None and not visual.done:
+                chat_id = turn.chat.id
+                visual.task.add_done_callback(lambda _: activity.turn_finished(chat_id, job, spawn=detach))
+            else:
+                activity.turn_finished(turn.chat.id, job, spawn=detach)
 
-    async def _run(self, turn: Turn, stop: AnswerStop | None, user: Message | None) -> AsyncGenerator[ChatEvent, None]:
+    async def _run(
+        self, turn: Turn, stop: AnswerStop | None, user: Message | None, p: _Progress
+    ) -> AsyncGenerator[ChatEvent, None]:
         clock = _Clock()
         chat = turn.chat
         if user is None:
@@ -566,13 +656,19 @@ class ChatTurnService:
             log.exception("chat %s: reading the chat history failed", chat.id)
             yield ErrorEvent("storage", f"could not read the chat history: {_describe(e)}")
             return
-        p = _Progress(TurnPlan(query=turn.text, language=turn.language), stop=stop)
         try:
             yield UserMessageEvent(user)
             async with contextlib.aclosing(self._answer(turn, history, clock, p)) as answer:
                 async for event in answer:
                     yield event
+            if p.visual is not None and p.visual_sink is None:
+                # The answer is saved; the stream stays open for its visual, bounded (the planner's own timeout, then
+                # building it from the cells).
+                async for event in p.visual.events(timeout=self._visual_wait_s()):
+                    yield event
         except (asyncio.CancelledError, GeneratorExit):
+            if p.visual is not None and p.visual_sink is None:
+                p.visual.cancel()  # the stream that would carry it is gone
             # Stopped (client gone, barge-in, "stop"): keep what was generated. Saves run as their own tasks, so a
             # consumer whose cancellation keeps re-firing (anyio cancel scopes) can't interrupt them; this frame waits
             # if it can. A caller passing ``stop`` (voice) always gets a saved answer, even an empty one.
@@ -625,11 +721,23 @@ class ChatTurnService:
             available_tools=self.available_tools(),
             enabled_tools=self.enabled_tools(),
         )
+        request = await self._with_screen(chat.id, request, p)
         plan = p.plan = await self.planner.plan(
             request, project_id=chat.project_id, ready=ready, retrieval_enabled=state.retrieval_enabled
         )
         if plan.speculated and plan.speculation is None:
             p.speculation = "discarded"  # the route needs no retrieval
+
+        if plan.mode == "canvas":
+            async for event in self._canvas_edit(turn, p, clock):
+                yield event
+            return
+        if plan.needs_retrieval and p.panels and refers_to_screen(turn.text):
+            # "What's the second bar?", "why did it dip there?": answered from the tables of the visual it means.
+            target = p.screen_visual = resolve_target(turn.text, p.panels, infer_kind=True)
+            if target is not None:
+                point = point_reference(turn.text, target)
+                p.screen = [describe(target) + ".", *([f"It points at {point}."] if point else [])]
 
         if plan.mode == "silent":
             yield SourcesEvent([], None, abstained=False)
@@ -675,6 +783,8 @@ class ChatTurnService:
                 log.warning("chat %s: retrieval failed: %s", chat.id, _describe(e))
                 yield ErrorEvent("retrieval", f"document search failed: {_describe(e)}")
                 return
+            if p.screen_visual is not None and ready and (shown := await self._screen_evidence(chat, p)):
+                result = p.result = with_evidence(result, shown, plan.query)
             p.retrieval_ms = clock.ms()
             confidence = result.confidence if result is not None else None
         covered = plan.needs_retrieval and confidence is not None and confidence.above_threshold
@@ -790,6 +900,10 @@ class ChatTurnService:
             # The documents passed the gate but the answer says they don't cover it (B9): it is an abstention, listed
             # among the summary's unanswered questions, not an answer.
             p.abstained, p.reason = True, "not_covered"
+        self._start_visual(turn, p, answer)
+        if p.visual is not None and p.visual_sink is None:
+            for event in p.visual.pending():  # "preparing": the skeleton shows while the answer is saved
+                yield event
         route = self._route(turn, p, abstained=p.abstained, reason=p.reason)
         if p.abstained:
             route["abstained_by"] = "answer"  # the gate let it through; the answer itself said so
@@ -833,6 +947,150 @@ class ChatTurnService:
             if held:
                 yield "".join(held)
             return
+
+    # -------------------------------------------------------------- the canvas (§12.1)
+
+    def _visual_wait_s(self) -> float:
+        """How long a turn waits for a visual still being prepared: the planner's timeout, then building it."""
+        return self.settings.canvas.planner_timeout_ms / 1000 + VISUAL_BUILD_S
+
+    async def _panels(self, chat_id: str) -> list[Visual]:
+        if self.canvas is None:
+            return []
+        try:
+            return (await self.canvas.canvas(chat_id)).panels
+        except Exception as e:  # the canvas is optional: the conversation goes on without it
+            log.warning("chat %s: reading the canvas failed: %s", chat_id, _describe(e))
+            return []
+
+    async def _with_screen(self, chat_id: str, request: RouteRequest, p: _Progress) -> RouteRequest:
+        """The canvas as context for the route (``RouteRequest.screen``), and the previous turn's visual if it is
+        still being prepared: an edit waits for it ("make it a bar chart" said while it is drawn); a turn that needs
+        the model cancels it (the model serves one request at a time: the new question comes first); an
+        acknowledgement, thanks or a greeting leaves it alone."""
+        if self.canvas is None:
+            return request
+        previous = visual_in_progress(chat_id)
+        p.panels = await self._panels(chat_id)
+        request = replace(request, screen=screen_lines(p.panels, request.utterance))
+        if previous is not None:
+            if parse_edit(request.utterance) is not None:  # about the visual being drawn (the canvas may be empty)
+                await previous.wait(self._visual_wait_s())
+                p.panels = await self._panels(chat_id)
+                return replace(request, screen=screen_lines(p.panels, request.utterance))
+            fast = fast_route(request)
+            if fast is None or fast.route.intent == "stop" or fast.route.needs_retrieval or fast.language_request:
+                previous.cancel()
+        return request
+
+    async def _canvas_edit(self, turn: Turn, p: _Progress, clock: _Clock) -> AsyncGenerator[ChatEvent, None]:
+        """A canvas edit: applied (``CanvasService.edit``: its canvas events in this stream), then a fixed reply,
+        "Done." / "हो गया।" or why not ("There's no chart on screen yet."). Never an abstention."""
+        plan = p.plan
+        edit = parse_edit(turn.text) or CanvasEdit("model")
+        yield SourcesEvent([], None, abstained=False)
+        result = EditResult("nothing", edit.op)
+        if self.canvas is not None:
+            route = plan.route
+            english = plan.query_en or (route.rewritten_query if route is not None else None)
+            try:
+                async for event in self.canvas.edit(
+                    turn.chat.id, edit, utterance=turn.text, language=plan.language, query_en=english
+                ):
+                    if isinstance(event, EditResult):
+                        result = event
+                    else:
+                        yield event
+            except Exception as e:  # a bug in an edit must not end the turn without a reply
+                log.exception("chat %s: the canvas edit failed", turn.chat.id)
+                result = EditResult("failed", edit.op, detail=_describe(e)[:300])
+        p.edit = result.record(edit)
+        answer = edit_reply(result.outcome, plan.language)
+        p.parts.append(answer)
+        yield DeltaEvent(answer)
+        route_json = self._route(turn, p, abstained=False, reason=None, model_used=False)
+        latency = self._latency(clock, p, first_delta_ms=clock.ms(), llm_ms=None)
+        async for event in self._save_answer(turn, answer, [], route_json, latency, p):
+            yield event
+
+    def _start_visual(self, turn: Turn, p: _Progress, answer: str) -> None:
+        """The answer's visual (§12.1), started once the answer's text is complete (and before it is saved): Ollama
+        serves one request at a time, so a planner sent earlier would delay the answer's first token (measured: 0.8
+        → 4.1 s), and sent with the answer's first token it lands no sooner than now (§12.1). Only for an answer from
+        the documents (document, mixed or correction turns with sources, not abstained) whose question calls for a
+        visual (``route.visual``), or whose own figures suggest one when it drew on a table."""
+        plan = p.plan
+        route = plan.route
+        if self.canvas is None or self.canvas.planner is None or route is None:
+            return
+        if plan.intent not in VISUAL_INTENTS or plan.mode not in ("grounded", "mixed"):
+            return
+        if p.abstained or not p.sources or p.screen_visual is not None:  # (a question about a chart on screen)
+            return
+        spoken = strip_markers(answer)
+        want = route.visual if route.visual != "none" else visual_want(answer=spoken)
+        p.visual_want = want
+        if want == "none":
+            return
+        if want == "suggest" and not any(s.chunk.content_type == "table" for s in p.sources):
+            p.visual_want = "none"  # a suggestion needs a table behind the answer
+            return
+        question = plan.query
+        if want == "suggest" and visual_intent(question, spoken) == "none":
+            question = turn.text  # the words that suggested it
+        visual = p.visual = TurnVisual(turn.chat.id, new_id("vis"), want, announce=want == "requested")
+        visual.start(
+            self.canvas.prepare_visual(
+                turn.chat.id,
+                question,
+                language=plan.language,
+                answer=spoken,
+                sources=[s.citation() for s in p.sources],
+                query_en=plan.query_en,
+                force=want == "requested",
+                visual_id=visual.visual_id,
+            )
+        )
+        if p.visual_sink is not None:
+            detach(self._forward_visual(visual, p.visual_sink))
+
+    @staticmethod
+    async def _forward_visual(visual: TurnVisual, sink: VisualSink) -> None:
+        async for event in visual.events():
+            try:
+                await sink(event)
+            except Exception as e:  # the transport is gone: the visual is still on the canvas
+                log.info("a visual event couldn't be sent: %s", _describe(e))
+
+    async def _screen_evidence(self, chat: Chat, p: _Progress) -> list[RankedChunk]:
+        """The tables of the visual a question is about, as passages that rank first (a question about what is on
+        screen is answered from the cells it shows, cited like any source)."""
+        if self.canvas is None or p.screen_visual is None:
+            return []
+        try:
+            tables = await self.canvas.visual_tables(chat.id, p.screen_visual)
+        except Exception as e:
+            log.warning("chat %s: reading the tables of %s failed: %s", chat.id, p.screen_visual.id, _describe(e))
+            return []
+        out = []
+        for ds, table in tables:
+            chunk = Chunk(
+                chunk_id=ds.chunk_id or f"{ds.document_id}:table:{ds.table_index}",
+                project_id=chat.project_id,
+                document_id=ds.document_id,
+                version=ds.version,
+                chunk_index=-1,
+                chunking_version="canvas",
+                page_start=ds.page_start,
+                page_end=ds.page_end,
+                heading_path=[*table.heading_path[-1:], ds.title] if table.heading_path else [ds.title],
+                content_type="table",
+                language="hi" if any("ऀ" <= ch <= "ॿ" for ch in table.markdown) else "en",
+                text=table.markdown,
+                token_count=len(table.markdown) // 4,
+            )
+            out.append(RankedChunk(chunk, rerank_score=1.0, fused_score=1.0, dense_score=None, search_rank=0))
+        return out
 
     # -------------------------------------------------------------- live data (§3.7)
 
@@ -1008,8 +1266,14 @@ class ChatTurnService:
                 live_note=notice,
                 live_hint=plan.live_hint and notice is None,
             )
+            route = plan.route
             question = answer_user_prompt(
-                plan.query, sources, language, name_documents=p is not None and p.name_documents
+                plan.query,
+                sources,
+                language,
+                name_documents=p is not None and p.name_documents,
+                visual_requested=route is not None and route.visual == "requested" and self.canvas is not None,
+                screen=p.screen if p is not None else (),
             )
         elif plan.mode == "general":
             notice = p.notice if p is not None else None
@@ -1079,6 +1343,16 @@ class ChatTurnService:
         prompt = PROMPT_IDS[plan.mode] if model_used else None
         if model_used and p.web_sources:
             prompt = LIVE_PROMPT_VERSION + (f"+{CONTINUATION_PROMPT_VERSION}" if p.continuations else "")
+        canvas: dict[str, Any] = {
+            # §12.1: what the user's words (or the answer's figures) asked for; visual_status / visual_id only when a
+            # visual was started (none for an abstention, a general answer, …)
+            "visual": p.visual_want if p.visual_want != "none" else (route.visual if route is not None else "none"),
+            **(p.visual.record() if p.visual is not None else {}),
+        }
+        if p.screen_visual is not None:
+            canvas["screen_visual_id"] = p.screen_visual.id  # the visual a question was about
+        if p.edit is not None:
+            canvas["canvas_edit"] = p.edit
         return {
             "intent": plan.intent,
             "needs_retrieval": plan.needs_retrieval,
@@ -1111,6 +1385,7 @@ class ChatTurnService:
             "length": turn.length,
             "model": self.settings.llm.chat_model if prompt is not None else None,
             "prompt": prompt,
+            **canvas,
         }
 
     @staticmethod
@@ -1201,7 +1476,23 @@ class ChatTurnService:
             yield ErrorEvent("storage", f"could not save the answer: {_describe(e)}")
             return
         p.final = agent
+        self._record_visual(p, agent)
         yield AgentMessageEvent(agent)
+
+    def _record_visual(self, p: _Progress, message: Message) -> None:
+        """The turn's visual on its saved message (``route.visual_id`` once ready, §12.1): written when the visual
+        settles, if that is after the save (the transcript then shows "chart added")."""
+        visual = p.visual
+        if visual is None:
+            return
+        saved = (message.route or {}).get("visual_status")
+
+        async def write(v: TurnVisual) -> None:
+            record = v.record()
+            if record and record.get("visual_status") != saved:
+                await self.messages.update_route(message.id, record)
+
+        visual.when_settled(write)
 
     async def _save_silent(self, turn: Turn, p: _Progress, clock: _Clock) -> AsyncGenerator[ChatEvent, None]:
         """A turn that gets no answer ("stop", a repeated "okay"): an ``event`` message records its route."""
@@ -1242,6 +1533,7 @@ class ChatTurnService:
             return
         if stop is not None:
             stop.saved = message
+        self._record_visual(p, message)
         self._advance_state(turn, p, message.citations, completed=False, message_id=message.id)
         log.info("chat %s: answer stopped after %d characters", turn.chat.id, len(text))
 
@@ -1273,4 +1565,5 @@ class ChatTurnService:
         p.final = message
         if stop is not None:
             stop.completed = message
+        self._record_visual(p, message)
         log.info("chat %s: answer saved complete, its live-data continuation dropped (stopped)", turn.chat.id)

@@ -22,7 +22,10 @@
       thanks / greeting (fast path), backchannel                             → no search, fixed short reply
       resume without a question                                              → no search, fixed text
       stop, or a backchannel right after "Anything else?"                    → nothing is said
+      canvas_edit ("make that a bar chart", "हटा दो", §12.1)                  → no search, the edit, "Done."
       document search off for the chat → general answer saying so; no READY documents → abstain (mixed: general)
+    route.visual (§12.1): "requested" / "suggest" from the user's words for document, mixed and correction turns
+      answered from the documents, else "none"
     live data (§3.7, router.with_live_tools): a question with a live-data cue gets tools=["web_search"] when the
       tool is available, and the search query built from its English standalone question (live_data.web_query);
       no search otherwise (``live_hint``: the answer never guesses current figures); with web search turned on but
@@ -47,6 +50,7 @@ from dataclasses import dataclass, replace
 from ..domain.conversation import Intent, TurnRoute
 from ..domain.projects import Message
 from ..settings import Language
+from .canvas.conversation import refers_to_screen, visual_want
 from .language import message_language
 from .live_data import LiveNote, web_query
 from .prompts import AckKind, AnswerMode, GeneralNote
@@ -177,7 +181,10 @@ _MODES: dict[Intent, tuple[AnswerMode, bool]] = {
     "backchannel": ("ack", False),  # "Anything else?"; nothing if that was just said (below)
     "resume_document": ("resume", False),  # with a question: grounded (below)
     "correction": ("grounded", True),  # of a general question: general (below)
+    "canvas_edit": ("canvas", False),  # the edit applied, then "Done." / "हो गया।" (§12.1)
 }
+# Turns whose answer may get a visual on the canvas (§12.1), when answered from the documents.
+VISUAL_INTENTS: frozenset[Intent] = frozenset({"document_qa", "mixed", "correction"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,7 +226,16 @@ def policy(
         mode, search, note = "general", False, "retrieval_off"
     elif search and not has_documents and mode == "mixed":
         mode, search, note = "general", False, "no_documents"
-    route = route.model_copy(update={"needs_retrieval": search})
+    # route.visual (§12.1): a document answer may get a visual when the user's words call for one (the answer's own
+    # figures may still suggest one later, services/chat_turns.py).
+    # A question about a chart on screen ("what's the second bar on the chart?") is answered, not drawn again.
+    about_the_screen = bool(req.screen) and refers_to_screen(req.utterance)
+    visual = (
+        visual_want(req.utterance, route.rewritten_query, route.query_en)
+        if intent in VISUAL_INTENTS and mode in ("grounded", "mixed") and not about_the_screen
+        else "none"
+    )
+    route = route.model_copy(update={"needs_retrieval": search, "visual": visual})
     return Policy(replace(decision, route=route), mode, note, ack)
 
 

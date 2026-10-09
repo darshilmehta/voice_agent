@@ -11,8 +11,8 @@ and which one.
              → for a "requested" visual the model can't place (timeout, invalid): a default chart of the best
                candidate (``source: "heuristic"``)
 
-Not wired into the router or the turns yet: ``VisualPlanner.plan`` is the entry point the integration calls (through
-``CanvasService.prepare_visual``).
+A turn calls ``VisualPlanner.plan`` once its answer's text is complete (``CanvasService.prepare_visual`` through
+``conversation.TurnVisual``), and a spoken edit the rules can't read asks it again with the visual as context.
 """
 
 from __future__ import annotations
@@ -58,7 +58,10 @@ _SUGGESTED = re.compile(
     r"|तुलना|रुझान|बढ़त|वृद्धि|बढ़ा|घटा|हिस्सा|बंटवारा|हर\s+तिमाही|तिमाही|सालाना|खंड",
     re.I,
 )
-_PERIOD_TOKEN = re.compile(r"\b(?:FY\s?'?\d{2,4}|Q[1-4]|H[12]|(?:19|20)\d{2})\b", re.I)
+# "Q3 FY24" is one period (a single quarter's figure is a fact, not a comparison); "Q3 and Q4", "FY23 vs FY24" are two.
+_PERIOD_TOKEN = re.compile(
+    r"\b(?:(?:Q[1-4]|H[12])\s*FY\s?'?\d{2,4}|FY\s?'?\d{2,4}|Q[1-4]|H[12]|(?:19|20)\d{2})\b", re.I
+)
 _NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
 

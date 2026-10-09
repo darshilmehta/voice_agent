@@ -9,9 +9,12 @@ JSON text frames (field ``type``)
     client → server  start {language} · barge_in_start {turn_id, played_ms} · playback {turn_id, played_ms} ·
                      playback_done {turn_id} · stop {} · end {}
     server → client  ready · state · user_speech · transcript_partial · user_message · turn · tool · sources ·
-                     delta · audio_chunk · agent_message · barge_in · error
+                     delta · audio_chunk · agent_message · barge_in · error · visual · canvas
                      (tool {turn_id, name: "web_search", phase: start|results|done|timeout|failed, query, …}: live
                      data, §3.7; a turn that searches the web speaks a filler first: audio_chunk {…, filler: true})
+                     (visual {turn_id, phase: preparing|ready|failed, visual_id, visual?, detail?} and canvas
+                     {turn_id, panels}: the answer's visual, §12.1, possibly after its agent_message; when it is ready
+                     while the answer is still heard, audio_chunk {…, tail: true} "It's on screen now." follows)
 
 Close codes: 1000 end, 1001 server shutdown, 1011 internal error, 4403 origin not allowed (browser pages from origins
 outside server.cors_allowed_origins), 4404 unknown chat, 4409 replaced by a newer session for the chat.

@@ -1,0 +1,589 @@
+{
+  "about": "Hold-out set written without seeing the planner prompt or the tuning set; questions were composed from the extracted table inventory (corpus_tables.txt) plus the document generators' text, then labelled with every chart kind/table a reasonable analyst would accept.",
+  "documents": {
+    "AR": "valmora_annual_report_fy24.pdf",
+    "DECK": "zephyra_investor_deck_q4fy24.pptx",
+    "POL": "valmora_travel_expense_policy.docx",
+    "HI": "suryodaya_yojana_soochna.docx"
+  },
+  "cases": [
+    {
+      "id": "h01",
+      "language": "en",
+      "question": "How did Valmora's revenue move quarter by quarter in FY24?",
+      "kinds": [
+        "line",
+        "bar",
+        "grouped_bar"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "quarterly performance: fy24"
+        ]
+      ],
+      "series": [
+        "revenue"
+      ]
+    },
+    {
+      "id": "h02",
+      "language": "en",
+      "question": "Which of Valmora's three businesses contributes the most to sales?",
+      "kinds": [
+        "donut",
+        "bar",
+        "stacked_bar"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "business overview"
+        ],
+        [
+          "AR",
+          "segment results"
+        ]
+      ],
+      "series": [
+        "revenue",
+        "chemicals",
+        "plastics",
+        "digital"
+      ]
+    },
+    {
+      "id": "h03",
+      "language": "en",
+      "question": "Compare the EBITDA margin of each Valmora segment this year with last year.",
+      "kinds": [
+        "grouped_bar",
+        "bar",
+        "comparison"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "segment results"
+        ]
+      ],
+      "series": [
+        "margin"
+      ]
+    },
+    {
+      "id": "h04",
+      "language": "en",
+      "question": "Show me how Valmora's cash moved over the year, from the opening balance to the closing one.",
+      "kinds": [
+        "waterfall",
+        "bar",
+        "table"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "cash flow statement"
+        ]
+      ],
+      "series": [
+        "cash",
+        "operating",
+        "investing",
+        "financing"
+      ]
+    },
+    {
+      "id": "h05",
+      "language": "en",
+      "question": "Put Valmora's FY24 headline numbers up against the previous year.",
+      "kinds": [
+        "kpi",
+        "comparison",
+        "grouped_bar",
+        "table"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "financial highlights"
+        ]
+      ],
+      "series": []
+    },
+    {
+      "id": "h06",
+      "language": "en",
+      "question": "Who owns Valmora? Break the shareholders down for me.",
+      "kinds": [
+        "donut",
+        "bar",
+        "stacked_bar"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "shareholding pattern"
+        ]
+      ],
+      "series": [
+        "promoter",
+        "foreign",
+        "mutual",
+        "public",
+        "share"
+      ]
+    },
+    {
+      "id": "h07",
+      "language": "en",
+      "question": "How does Zephyra's fourth quarter stack up against the same quarter a year ago and against Q3?",
+      "kinds": [
+        "grouped_bar",
+        "comparison",
+        "bar",
+        "kpi"
+      ],
+      "datasets": [
+        [
+          "DECK",
+          "q4 fy24 results"
+        ]
+      ],
+      "series": [
+        "revenue",
+        "ebitda",
+        "profit"
+      ]
+    },
+    {
+      "id": "h08",
+      "language": "en",
+      "question": "Which Zephyra business line grew the fastest in FY24?",
+      "kinds": [
+        "bar",
+        "grouped_bar",
+        "comparison",
+        "table"
+      ],
+      "datasets": [
+        [
+          "DECK",
+          "segment overview"
+        ]
+      ],
+      "series": [
+        "growth",
+        "revenue",
+        "freight",
+        "contract",
+        "digital"
+      ]
+    },
+    {
+      "id": "h09",
+      "language": "en",
+      "question": "Which company runs the better EBITDA margin, Valmora or Zephyra?",
+      "kinds": [
+        "bar",
+        "grouped_bar",
+        "comparison",
+        "kpi",
+        "table"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "financial highlights"
+        ],
+        [
+          "DECK",
+          "zephyra at a glance"
+        ]
+      ],
+      "series": [
+        "margin"
+      ]
+    },
+    {
+      "id": "h10",
+      "language": "en",
+      "question": "Walk me through how Zephyra's FY24 revenue turns into profit after tax.",
+      "kinds": [
+        "waterfall",
+        "bar",
+        "table"
+      ],
+      "datasets": [
+        [
+          "DECK",
+          "fy24 profit and loss summary"
+        ]
+      ],
+      "series": [
+        "revenue",
+        "ebitda",
+        "profit",
+        "tax"
+      ]
+    },
+    {
+      "id": "h11",
+      "language": "en",
+      "question": "How much more can a senior employee spend on a hotel night than a junior one, in the big cities versus the smaller ones?",
+      "kinds": [
+        "grouped_bar",
+        "bar",
+        "table"
+      ],
+      "datasets": [
+        [
+          "POL",
+          "hotel limits"
+        ]
+      ],
+      "series": [
+        "tier"
+      ]
+    },
+    {
+      "id": "h12",
+      "language": "en",
+      "question": "When did each version of the travel policy come into force?",
+      "kinds": [
+        "timeline",
+        "table"
+      ],
+      "datasets": [
+        [
+          "POL",
+          "revision history"
+        ]
+      ],
+      "series": []
+    },
+    {
+      "id": "h13",
+      "language": "hi",
+      "question": "सूर्योदय योजना में किस पाठ्यक्रम में सबसे ज़्यादा सीटें हैं?",
+      "query_en": "Which course in the Suryodaya scheme has the most seats?",
+      "kinds": [
+        "bar",
+        "donut",
+        "table"
+      ],
+      "datasets": [
+        [
+          "HI",
+          "पाठ्यक्रम और सीटें"
+        ]
+      ],
+      "series": [
+        "सीट"
+      ]
+    },
+    {
+      "id": "h14",
+      "language": "hi",
+      "question": "सभी ज़िलों का आवंटित बजट बार चार्ट में दिखाओ।",
+      "query_en": "Show the allocated budget of all districts in a bar chart.",
+      "kinds": [
+        "bar"
+      ],
+      "datasets": [
+        [
+          "HI",
+          "जिलेवार लक्ष्य एवं बजट"
+        ]
+      ],
+      "series": [
+        "बजट"
+      ]
+    },
+    {
+      "id": "h15",
+      "language": "hi",
+      "question": "योजना की मुख्य तारीखें टाइमलाइन पर दिखाओ।",
+      "query_en": "Show the scheme's key dates on a timeline.",
+      "kinds": [
+        "timeline",
+        "table"
+      ],
+      "datasets": [
+        [
+          "HI",
+          "महत्वपूर्ण तिथियाँ"
+        ]
+      ],
+      "series": []
+    },
+    {
+      "id": "h16",
+      "language": "hi",
+      "question": "ज़ेफ़िरा के नेटवर्क में पिछले साल के मुक़ाबले क्या बदला है, शाखाएँ, गोदाम, ट्रक?",
+      "query_en": "What has changed in Zephyra's network compared with last year: branches, warehouses, trucks?",
+      "kinds": [
+        "grouped_bar",
+        "comparison",
+        "kpi",
+        "table",
+        "bar"
+      ],
+      "datasets": [
+        [
+          "DECK",
+          "network and fleet"
+        ]
+      ],
+      "series": [
+        "branch",
+        "warehouse",
+        "truck"
+      ]
+    },
+    {
+      "id": "h17",
+      "language": "hi",
+      "question": "वालमोरा का राजस्व और मुनाफ़ा पिछले साल की तुलना में कैसा रहा?",
+      "query_en": "How did Valmora's revenue and profit do compared with last year?",
+      "kinds": [
+        "kpi",
+        "grouped_bar",
+        "comparison",
+        "bar",
+        "table"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "financial highlights"
+        ],
+        [
+          "AR",
+          "consolidated statement of profit and loss"
+        ]
+      ],
+      "series": [
+        "revenue",
+        "profit"
+      ]
+    },
+    {
+      "id": "h18",
+      "language": "hi",
+      "question": "ज़ेफ़िरा के तीनों सेगमेंट का राजस्व हिस्सा गोल चार्ट में दिखाओ।",
+      "query_en": "Show Zephyra's three segments' revenue share in a donut chart.",
+      "kinds": [
+        "donut"
+      ],
+      "datasets": [
+        [
+          "DECK",
+          "segment overview"
+        ]
+      ],
+      "series": [
+        "revenue",
+        "freight",
+        "contract",
+        "digital"
+      ]
+    },
+    {
+      "id": "h19",
+      "language": "hi",
+      "question": "वालमोरा की तिमाही आय का रुझान कैसा है?",
+      "query_en": "What is the trend of Valmora's quarterly income (revenue)?",
+      "kinds": [
+        "line",
+        "bar"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "quarterly performance"
+        ]
+      ],
+      "series": [
+        "revenue"
+      ]
+    },
+    {
+      "id": "h20",
+      "language": "hi",
+      "question": "Valmora ka EBITDA margin har quarter mein kaisa raha, thoda trend batao",
+      "query_en": "How was Valmora's EBITDA margin in each quarter? Tell me the trend.",
+      "kinds": [
+        "line",
+        "bar"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "quarterly performance"
+        ]
+      ],
+      "series": [
+        "margin"
+      ]
+    },
+    {
+      "id": "h21",
+      "language": "hi",
+      "question": "FY24 aur FY23 ke quarterly revenue ki tulna karo",
+      "query_en": "Compare the quarterly revenue of FY24 and FY23.",
+      "kinds": [
+        "grouped_bar",
+        "line",
+        "comparison",
+        "bar"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "quarterly performance: fy24"
+        ],
+        [
+          "AR",
+          "quarterly performance: fy23"
+        ]
+      ],
+      "series": [
+        "revenue"
+      ]
+    },
+    {
+      "id": "h22",
+      "language": "hi",
+      "question": "Zephyra ka overall performance ek nazar mein dikhao, bas headline numbers",
+      "query_en": "Show Zephyra's overall performance at a glance, just the headline numbers.",
+      "kinds": [
+        "kpi",
+        "table"
+      ],
+      "datasets": [
+        [
+          "DECK",
+          "zephyra at a glance"
+        ]
+      ],
+      "series": []
+    },
+    {
+      "id": "h23",
+      "language": "hi",
+      "question": "Valmora ki balance sheet mein assets pichle saal se kitne badle?",
+      "query_en": "How much did the assets on Valmora's balance sheet change from last year?",
+      "kinds": [
+        "grouped_bar",
+        "bar",
+        "comparison",
+        "table"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "balance sheet as at 31 march 2024: assets"
+        ]
+      ],
+      "series": [
+        "assets",
+        "property",
+        "inventor",
+        "receivable",
+        "cash"
+      ]
+    },
+    {
+      "id": "h24",
+      "language": "hi",
+      "question": "Valmora ka karza kis kis cheez se bana hai? Borrowings ka breakdown chahiye",
+      "query_en": "What does Valmora's debt consist of? I need a breakdown of the borrowings.",
+      "kinds": [
+        "donut",
+        "stacked_bar",
+        "bar",
+        "table"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "note 14: borrowings"
+        ]
+      ],
+      "series": [
+        "loan",
+        "debenture",
+        "paper",
+        "borrowings"
+      ]
+    },
+    {
+      "id": "h25",
+      "language": "hi",
+      "question": "Kaun se district ka youth target sabse zyada hai aur uska budget kitna hai?",
+      "query_en": "Which district has the highest youth target and how much is its budget?",
+      "kinds": [
+        "bar",
+        "grouped_bar",
+        "table"
+      ],
+      "datasets": [
+        [
+          "HI",
+          "जिलेवार लक्ष्य एवं बजट"
+        ]
+      ],
+      "series": [
+        "लक्ष्य",
+        "बजट"
+      ]
+    },
+    {
+      "id": "h26",
+      "language": "hi",
+      "question": "Valmora ke employees ke baare mein attrition, training hours aur women share pichle saal ke saath compare karo",
+      "query_en": "Compare Valmora's employee attrition, training hours and women's share with last year.",
+      "kinds": [
+        "grouped_bar",
+        "comparison",
+        "kpi",
+        "table",
+        "bar"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "people and culture"
+        ]
+      ],
+      "series": [
+        "employee",
+        "attrition",
+        "training",
+        "women"
+      ]
+    },
+    {
+      "id": "h27",
+      "language": "en",
+      "question": "I need the exact dividend numbers Valmora declared: per share, total outflow and payout ratio, for both years.",
+      "kinds": [
+        "table",
+        "kpi",
+        "comparison"
+      ],
+      "datasets": [
+        [
+          "AR",
+          "dividend"
+        ]
+      ],
+      "series": [
+        "dividend",
+        "payout",
+        "outflow"
+      ]
+    }
+  ]
+}

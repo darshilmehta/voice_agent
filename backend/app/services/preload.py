@@ -6,11 +6,13 @@ reranker, then the LLM is asked to load its chat model. A model that can't load 
 missing) is reported and still loads on first use if that becomes possible; nothing here fails startup.
 
 With web search enabled, the voice filler ("Let me look that up.", §3.7) is synthesized right after TTS loads, in
-every configured language, so speaking it costs no TTS time.
+every configured language, so speaking it costs no TTS time. (The visual's spoken tail, §12.1, is synthesized by a
+voice session when its first visual starts.)
 
-Once the LLM is loaded, its first prompts are warmed (``warm_prompts``): the router's prompt and the voice answer's
-system prompt in every configured language are read once, so Ollama's prompt cache holds them before the first turn.
-Without it the first routed turns after startup read the router prompt cold and hit the router timeout (§3.4, §9.5).
+Once the LLM is loaded, its first prompts are warmed (``warm_prompts``): the router's prompt, the voice answer's
+system prompt in every configured language and the visual planner's system prompt are read once, so Ollama's prompt
+cache holds them before the first turn. Without it the first routed turns after startup read the router prompt cold
+and hit the router timeout (§3.4, §9.5).
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from ..providers.models import ModelUnavailableError
 from ..providers.registry import Container
 from ..providers.speech import SpeechSynthesizer
 from ..settings import Settings
+from .canvas.planner import SYSTEM_PROMPT as PLANNER_SYSTEM_PROMPT
 from .prompts import answer_system_prompt
 from .router import RouteRequest, router_messages
 from .voice.fillers import filler_audio
@@ -156,3 +159,6 @@ async def warm_prompts(llm: LLMClient, settings: Settings) -> None:
     systems = dict.fromkeys(answer_system_prompt(language, "short") for language in settings.client.languages)
     answers = [[LLMMessage("system", system), LLMMessage("user", "Hello")] for system in systems]
     await llm.warm_up(answers, model=settings.llm.chat_model)
+    # The visual planner (§12.1): its system prompt, read once (it runs after an answer, while it is spoken).
+    planner = [LLMMessage("system", PLANNER_SYSTEM_PROMPT), LLMMessage("user", "Question: Show me revenue")]
+    await llm.warm_up([planner], model=settings.llm.router_model)

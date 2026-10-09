@@ -1,5 +1,9 @@
-"""The visual planner on the real model (qwen3:4b-instruct via Ollama) over 30 labelled EN / HI / Hinglish questions
-about the eval corpus (opt-in).
+"""The visual planner on the real model (qwen3:4b-instruct via Ollama) over labelled EN / HI / Hinglish questions
+about the eval corpus (opt-in), two sets:
+
+- ``tuning`` (``canvas_planner_cases.json``, 30 questions): the set the planner's prompt was tuned on;
+- ``holdout`` (``canvas_planner_holdout.json``, 27 questions): written afterwards from the corpus's table inventory and
+  the documents' text by someone who had not seen the planner's prompt or the tuning set: the honest number.
 
     CANVAS_PARSE_CACHE=<folder> RUN_INTEGRATION=1 uv run pytest tests/integration/test_canvas_planner_eval.py -s
 
@@ -31,6 +35,7 @@ from app.domain.datasets import TypedDataset
 from app.providers.base import ProviderContext
 from app.providers.llm import OllamaLLM
 from app.services.canvas.builder import build_visual, check_grounding
+from app.services.canvas.conversation import visual_want
 from app.services.canvas.planner import VisualPlanner
 from app.services.canvas.spec import resolve, split_ref
 from app.settings import load_settings
@@ -40,8 +45,8 @@ from .conftest import LOCAL_CONFIG, METRICS
 
 pytestmark = pytest.mark.integration
 
-CASES = json.loads((Path(__file__).parent / "canvas_planner_cases.json").read_text(encoding="utf-8"))
-MIN_DATASET_ACCURACY = 0.7  # a floor against regressions; the measured numbers are printed
+SETS = {"tuning": "canvas_planner_cases.json", "holdout": "canvas_planner_holdout.json"}
+MIN_DATASET_ACCURACY = 0.7  # a floor against regressions on the tuning set; the measured numbers are printed
 EVAL_TIMEOUT_S = float(os.environ.get("CANVAS_PLANNER_EVAL_TIMEOUT_S", "30"))
 
 
@@ -55,12 +60,14 @@ def _pct(values: list[float], q: float) -> float:
     return ordered[min(len(ordered) - 1, int(q * (len(ordered) - 1) + 0.5))]
 
 
-async def test_planner_on_the_real_model(corpus: dict[str, CorpusDocument], tmp_path):
+@pytest.mark.parametrize("which", list(SETS))
+async def test_planner_on_the_real_model(corpus: dict[str, CorpusDocument], tmp_path, which: str):
+    cases = json.loads((Path(__file__).parent / SETS[which]).read_text(encoding="utf-8"))
     settings = load_settings(LOCAL_CONFIG, {"APP_ROOT_DIR": str(tmp_path)})
     datasets = [d for doc in corpus.values() for d in doc.datasets]
     by_id = {d.id: d for d in datasets}
     filenames = {doc.document_id: doc.filename for doc in corpus.values()}
-    names = CASES["documents"]
+    names = cases["documents"]
     timings: list[dict] = []
 
     async def record(response: httpx.Response) -> None:
@@ -91,13 +98,21 @@ async def test_planner_on_the_real_model(corpus: dict[str, CorpusDocument], tmp_
         )
         await planner.plan("Show me quarterly revenue", "en", datasets[:4], filenames=filenames)  # warm up
         results = []
-        for case in CASES["cases"]:
+        for case in cases["cases"]:
             timings.clear()
             started = time.perf_counter()
+            # Forced: the planner itself is measured on every question; whether the conversation would ask for a
+            # visual at all (``route.visual`` from the question's words, as a turn computes it) is reported apart.
             plan = await planner.plan_detailed(
-                case["question"], case["language"], datasets, filenames=filenames, query_en=case.get("query_en")
+                case["question"],
+                case["language"],
+                datasets,
+                filenames=filenames,
+                query_en=case.get("query_en"),
+                force=True,
             )
             wall = time.perf_counter() - started
+            want = visual_want(case["question"], case.get("query_en"))
             spec = plan.spec
             kind_ok = spec is not None and spec.kind in case["kinds"]
             accepted = [(names[d], title.casefold()) for d, title in case["datasets"]]
@@ -131,6 +146,9 @@ async def test_planner_on_the_real_model(corpus: dict[str, CorpusDocument], tmp_
                     "grounded": grounded,
                     "wall": wall,
                     "model": (t.get("prompt_eval_duration", 0) + t.get("eval_duration", 0)) / 1e9 if t else None,
+                    "read_s": t.get("prompt_eval_duration", 0) / 1e9 if t else None,
+                    "write_s": t.get("eval_duration", 0) / 1e9 if t else None,
+                    "want": want,
                     "prompt_tokens": t.get("prompt_eval_count"),
                     "output_tokens": t.get("eval_count"),
                     "reason": plan.reason,
@@ -146,27 +164,41 @@ async def test_planner_on_the_real_model(corpus: dict[str, CorpusDocument], tmp_
     def correct(r: dict) -> bool:
         return all(r["ok"].values())
 
-    METRICS["planner questions"] = f"{n} ({dict(Counter(r['language'] for r in results))})"
-    METRICS["planner kind / table / series accuracy"] = f"{share('kind')} / {share('table')} / {share('series')}"
-    METRICS["planner all correct"] = f"{sum(map(correct, results))}/{n} = {sum(map(correct, results)) / n:.0%}"
+    out: dict[str, str] = {}  # this set's lines (printed with the set's name in front)
+    out["planner questions"] = f"{n} ({dict(Counter(r['language'] for r in results))})"
+    out["planner kind / table / series accuracy"] = f"{share('kind')} / {share('table')} / {share('series')}"
+    out["planner all correct"] = f"{sum(map(correct, results))}/{n} = {sum(map(correct, results)) / n:.0%}"
     for language in ("en", "hi"):
         rows = [r for r in results if r["language"] == language]
-        METRICS[f"planner all correct ({language})"] = f"{sum(map(correct, rows))}/{len(rows)}"
-    METRICS["planner sources"] = str(dict(Counter(r["source"] for r in results)))
+        out[f"planner all correct ({language})"] = f"{sum(map(correct, rows))}/{len(rows)}"
+    out["planner sources"] = str(dict(Counter(r["source"] for r in results)))
+    wanted = [r for r in results if r["want"] != "none"]
+    out["a visual wanted by the question's words (route.visual)"] = (
+        f"{len(wanted)}/{n} ({dict(Counter(r['want'] for r in results))}); all correct among them: "
+        f"{sum(map(correct, wanted))}/{len(wanted)}"
+    )
+    gate_misses = [r["id"] for r in results if r["want"] == "none"]
+    if gate_misses:
+        out["no visual wanted by the words (the conversation wouldn't plan one)"] = ", ".join(gate_misses)
     walls = [r["wall"] for r in results]
-    METRICS["planner wall p50 / p95 / max"] = (
+    out["planner wall p50 / p95 / max"] = (
         f"{statistics.median(walls):.2f} / {_pct(walls, 0.95):.2f} / {max(walls):.2f} s (includes queueing in Ollama)"
     )
     model = [r["model"] for r in results if r["model"] is not None]
     if model:
         budget = settings.canvas.planner_timeout_ms / 1000
-        METRICS["planner model time p50 / p95 / max"] = (
+        out["planner model time p50 / p95 / max"] = (
             f"{statistics.median(model):.2f} / {_pct(model, 0.95):.2f} / {max(model):.2f} s "
             f"({sum(1 for m in model if m <= budget)}/{len(model)} within canvas.planner_timeout_ms)"
         )
+        reads = [r["read_s"] for r in results if r["read_s"] is not None]
+        writes = [r["write_s"] for r in results if r["write_s"] is not None]
+        out["planner model time split p50: reading the prompt / writing the JSON"] = (
+            f"{statistics.median(reads):.2f} / {statistics.median(writes):.2f} s"
+        )
         tokens = [r["output_tokens"] for r in results if r["output_tokens"]]
         prompts = [r["prompt_tokens"] for r in results if r["prompt_tokens"]]
-        METRICS["planner tokens: prompt p50 / output p50, max"] = (
+        out["planner tokens: prompt p50 / output p50, max"] = (
             f"{statistics.median(prompts):.0f} / {statistics.median(tokens):.0f}, {max(tokens)}"
         )
     misses = [
@@ -176,6 +208,8 @@ async def test_planner_on_the_real_model(corpus: dict[str, CorpusDocument], tmp_
         if not correct(r)
     ]
     if misses:
-        METRICS["planner misses"] = "\n  " + "\n  ".join(misses)
+        out["planner misses"] = "\n  " + "\n  ".join(misses)
+    METRICS.update({f"[{which}] {k}": v for k, v in out.items()})
     assert all(r["grounded"] in (True, None) for r in results)
-    assert sum(1 for r in results if r["ok"]["table"]) / n >= MIN_DATASET_ACCURACY
+    if which == "tuning":
+        assert sum(1 for r in results if r["ok"]["table"]) / n >= MIN_DATASET_ACCURACY

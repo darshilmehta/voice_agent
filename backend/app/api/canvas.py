@@ -1,6 +1,6 @@
 """The live visual canvas (docs/DESIGN.md §12.1, contract v1): a chat's canvas and its edits, adding a visual from a
-spec (tests and the debug panel; the conversation adds visuals itself later), the project overview, and the project's
-typed datasets (what a spec can refer to).
+spec (tests and the debug panel; the conversation adds its own, services/chat_turns.py), the project overview, and
+the project's typed datasets (what a spec can refer to).
 
 Errors are the app's usual ones: unknown chat, project or visual → 404; a spec that doesn't resolve against the
 datasets → 422 with every problem listed.

@@ -352,7 +352,7 @@ class FakeLLM(LLMClient):
         self.released = False
         self.route: RouteScript | Callable[[list[LLMMessage]], RouteScript] = None
         self.json_calls: list[dict[str, Any]] = []
-        self.json_delay = 0.0
+        self.json_delay: float | Callable[[list[LLMMessage]], float] = 0.0  # a function of the messages: per call
         self.json_cancelled = 0  # router calls cancelled before they answered
         self.warmed: list[list[LLMMessage]] = []  # prompts read with warm_up (startup, the next turn's prefix)
 
@@ -366,9 +366,10 @@ class FakeLLM(LLMClient):
         max_tokens: int | None = None,
     ) -> M:
         self.json_calls.append({"messages": list(messages), "schema": schema, "model": model, "max_tokens": max_tokens})
+        delay = self.json_delay(list(messages)) if callable(self.json_delay) else self.json_delay
         try:
-            if self.json_delay:
-                await asyncio.sleep(self.json_delay)
+            if delay:
+                await asyncio.sleep(delay)
         except asyncio.CancelledError:
             self.json_cancelled += 1
             raise
