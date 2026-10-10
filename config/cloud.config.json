@@ -147,6 +147,28 @@
       "duck_volume": 0.2,
       "backchannel_max_words": 2,
       "decision_timeout_ms": 700
+    },
+    "noise": {
+      "denoise": "rnnoise",
+      "adaptive_gating": true,
+      "floor_window_ms": 8000,
+      "floor_percentile": 20,
+      "start_snr_db": 9,
+      "end_snr_db": 4,
+      "quiet_floor_dbfs": -60,
+      "loud_floor_dbfs": -35,
+      "noisy_threshold": 0.8,
+      "noisy_min_speech_ms": 400,
+      "drop_background_speech": true,
+      "assumed_user_dbfs": -28,
+      "assumed_margin_db": 4,
+      "far_field_db": 6,
+      "far_field_hard_db": 10,
+      "close_db": 6,
+      "min_snr_db": 6,
+      "unsure_avg_logprob": -0.65,
+      "unsure_no_speech_prob": 0.5,
+      "short_fragment_words": 3
     }
   },
 

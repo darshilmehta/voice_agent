@@ -6,8 +6,11 @@ Binary frames
                      ``seq`` counts the frames of one chunk from 0; play only the current turn's frames
 
 JSON text frames (field ``type``)
-    client → server  start {language} · barge_in_start {turn_id, played_ms} · playback {turn_id, played_ms} ·
-                     playback_done {turn_id} · stop {} · end {}
+    client → server  start {language, input_mode?} · barge_in_start {turn_id, played_ms} ·
+                     playback {turn_id, played_ms} · playback_done {turn_id} · stop {} · end {} ·
+                     input_mode {mode: vad|ptt} · ptt {state: down|up} (hold-to-talk, §3.10 "Noisy rooms": in "ptt"
+                     mode the VAD opens no turn; a turn is the audio between down and up, and "down" while the agent
+                     answers stops it at once)
     server → client  ready · state · user_speech · transcript_partial · user_message · turn · tool · sources ·
                      delta · audio_chunk · agent_message · barge_in · error · visual · canvas
                      (tool {turn_id, name: "web_search", phase: start|results|done|timeout|failed, query, …}: live
@@ -44,6 +47,7 @@ CLOSE_CHAT_NOT_FOUND = 4404
 CLOSE_REPLACED = 4409  # another voice session opened for the same chat
 
 AgentState = Literal["listening", "thinking", "speaking", "interrupted"]
+InputMode = Literal["vad", "ptt"]
 ErrorStage = Literal["stt", "retrieval", "llm", "tts", "storage", "audio"]
 
 
@@ -54,6 +58,21 @@ class _Message(BaseModel):
 class Start(_Message):
     type: Literal["start"]
     language: Language | None = None  # None: detect per utterance among stt.languages
+    input_mode: InputMode = "vad"  # "ptt": hold-to-talk from the start
+
+
+class SetInputMode(_Message):
+    """Switch between the VAD opening turns ("vad") and hold-to-talk ("ptt") during the session."""
+
+    type: Literal["input_mode"]
+    mode: InputMode
+
+
+class Ptt(_Message):
+    """Hold-to-talk: the talk button (or Space) went down or came up. "down" also switches to "ptt" mode."""
+
+    type: Literal["ptt"]
+    state: Literal["down", "up"]
 
 
 class BargeInStart(_Message):
@@ -81,7 +100,9 @@ class End(_Message):
     type: Literal["end"]
 
 
-ClientMessage = Annotated[Start | BargeInStart | Playback | PlaybackDone | Stop | End, Field(discriminator="type")]
+ClientMessage = Annotated[
+    Start | BargeInStart | Playback | PlaybackDone | Stop | End | SetInputMode | Ptt, Field(discriminator="type")
+]
 _CLIENT = TypeAdapter(ClientMessage)
 
 

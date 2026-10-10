@@ -301,8 +301,22 @@ def test_short_noises_are_ignored(voice):
         c = VoiceClient(ws)
         c.start()
         c.say(QUESTION, ms=150)  # under min_speech_ms (250)
-        assert [m["phase"] for m in of(c.quiet(0.5), "user_speech")] == ["start", "end"]
+        # The noise gate (§3.10) announces a turn only once it has min_speech_ms of speech: nothing reaches the client
+        assert of(c.quiet(0.5), "user_speech") == []
     assert voice.fakes.stt.calls == [] and voice.transcript() == []
+
+
+def test_short_noises_are_announced_and_closed_without_the_noise_gate(make_app, fakes):
+    fakes.stt.scripts[QUESTION] = EN
+    with make_app(VOICE__NOISE__ADAPTIVE_GATING="false") as api:
+        project, _ = project_with_report(api)
+        chat = new_chat(api, project)
+        with api.websocket_connect(f"/ws/chats/{chat}/voice") as ws:
+            c = VoiceClient(ws)
+            c.start()
+            c.say(QUESTION, ms=150)
+            assert [m["phase"] for m in of(c.quiet(0.5), "user_speech")] == ["start", "end"]
+    assert fakes.stt.calls == []
 
 
 def test_a_chat_without_ready_documents_still_talks_and_abstains(make_app, fakes):
