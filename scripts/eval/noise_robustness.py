@@ -576,6 +576,17 @@ async def main() -> None:
     print(f"models ready in {time.perf_counter() - t0:.1f} s", flush=True)
     sims = {"before": Simulator(settings, vad, stt, after=False), "after": Simulator(settings, vad, stt, after=True)}
 
+    # The user's level as the session learns it: the level of their clean questions, as measured after RNNoise ("after,
+    # user's level known" = after their first answered question).
+    pad = np.zeros(SR, dtype=np.float32)
+    calibration, _ = denoise_batch([mic(np.concatenate([pad, a, pad]), rng) for _, _, a in questions[:4]], out / "work")
+    levels = []
+    for x in calibration:
+        cal = await sims["after"].run(x, speaking=False)
+        levels += [u.level for u in cal.utterances if u.level is not None and u.outcome == "answer"]
+    known = float(np.median(levels)) if levels else USER_DBFS
+    print(f"the user's level, learnt: {known:.1f} dBFS", flush=True)
+
     # ---- noise-only streams: false turn starts, background replies, false barge-ins
     streams: list[tuple[str, int, np.ndarray]] = []
     for kind in NOISE_TYPES:
@@ -593,7 +604,7 @@ async def main() -> None:
         for mode, audio, user_dbfs in (
             ("before", raw, None),
             ("after", clean, None),
-            ("after_known", clean, USER_DBFS),
+            ("after_known", clean, known),
         ):
             sim = sims["before" if mode == "before" else "after"]
             idle = await sim.run(audio, speaking=False, user_dbfs=user_dbfs)
@@ -640,7 +651,7 @@ async def main() -> None:
         for mode, audio, user_dbfs in (
             ("before", raw, None),
             ("after", clean, None),
-            ("after_known", clean, USER_DBFS),
+            ("after_known", clean, known),
         ):
             sim = sims["before" if mode == "before" else "after"]
             run = await sim.run(audio, speaking=False, user_dbfs=user_dbfs)
@@ -653,6 +664,7 @@ async def main() -> None:
     print(f"{len(results)} question runs", flush=True)
 
     summary = summarize(noise_rows, results, cpu)
+    summary["user_level_learnt_dbfs"] = round(known, 1)
     (out / "results.json").write_text(
         json.dumps(
             {"noise_only": noise_rows, "questions": [asdict(r) for r in results], "summary": summary},
@@ -704,7 +716,8 @@ def render(s: dict[str, Any]) -> str:
     for row in s["noise_only"]:
         b, a, k = row["before"], row["after"], row["after_known"]
         lines.append(
-            f"| {row['noise']} | {row['snr']} dB below | {b['starts_per_min']} → {a['starts_per_min']} | "
+            f"| {row['noise']} | {row['snr']} dB below | {b['starts_per_min']} → {a['starts_per_min']}"
+            f" ({k['starts_per_min']}) | "
             f"{b['replies_per_min']} → {a['replies_per_min']} ({k['replies_per_min']}) | "
             f"{b['barge_ins_per_min']} → {a['barge_ins_per_min']} ({k['barge_ins_per_min']}) |"
         )

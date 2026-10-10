@@ -110,7 +110,7 @@ export const DEFAULT_VOICE_INPUT: PublicVoiceInput = {
   noisy_min_speech_ms: 400,
   assumed_user_dbfs: -26,
   assumed_margin_db: 2,
-  far_field_hard_db: 10,
+  far_field_hard_db: 8,
 };
 
 /** An utterance's level: this percentile of its speech frames' levels (its loud part), as on the server. */

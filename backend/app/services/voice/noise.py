@@ -44,6 +44,7 @@ MIN_FLOOR_FRAMES = 31  # ~1 s of audio before the floor is measured rather than 
 QUIET_FLOOR_DBFS = -70.0  # the floor assumed before then (a quiet room)
 _RECOMPUTE_EVERY = 4  # frames between two percentile computations (the floor moves over seconds)
 LEVEL_PERCENTILE = 80  # an utterance's level: this percentile of its speech frames' levels
+HOLD_SLACK_DB = 6.0  # a frame this far under the near-field minimum no longer holds a turn open (soft syllables do)
 
 
 class NoiseSettings(Protocol):
@@ -175,6 +176,12 @@ class NoiseGate:
     def audible(self, dbfs: float) -> bool:
         """Above the floor by end_snr_db: a frame at the floor is silence, whatever the VAD hears in it (babble)."""
         return dbfs >= self.floor_dbfs + self.cfg.end_snr_db
+
+    def holds(self, dbfs: float) -> bool:
+        """Loud enough to keep the user's turn going: within HOLD_SLACK_DB under the near-field minimum. After the
+        denoiser the TV's words stand far above the floor; without this they would hold the user's turn open after
+        they stopped (until the TV pauses, or 30 s)."""
+        return dbfs >= near_field_min(self.cfg, self.user.dbfs) - HOLD_SLACK_DB
 
     def near_field(self, level_dbfs: float | None) -> bool:
         """Loud enough to be the user: within far_field_hard_db of their level (and assumed_margin_db more while

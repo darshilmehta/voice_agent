@@ -116,6 +116,25 @@ Tables are typed into datasets after ingestion, and each project gets an overvie
 | `max_panels` | `12` | Panels per chat canvas; adding one more removes the oldest unpinned panel. |
 | `overview_panels` | `3` | Panels on a project's overview (KPI tiles, a trend, a composition); `0`: no overview. |
 
+## Noisy rooms
+
+`voice.noise` (DESIGN §3.10 "Noisy rooms", measured in §9.7). Levels are dBFS (10·log10 of the mean square of 32 ms frames); the browser gets its share as `voice_input` in `/api/config/public`.
+
+| `voice.noise` key | Local value | Meaning |
+|---|---|---|
+| `denoise` | `rnnoise` | The browser's denoiser on the microphone (`off`: none). |
+| `adaptive_gating` | `true` | The noise-floor gate on both VADs, and turns announced only near the user's level. |
+| `floor_window_ms`, `floor_percentile` | `8000`, `20` | The noise floor: this percentile of the last window of frame levels. |
+| `start_snr_db`, `end_snr_db` | `9`, `4` | A turn opens only this far above the floor; within `end_snr_db` of it is silence. |
+| `quiet_floor_dbfs`, `loud_floor_dbfs` | `-60`, `-35` | Between these floors the VAD threshold rises from `vad.threshold` to `noisy_threshold` (`0.8`) and the minimum speech from `vad.min_speech_ms` to `noisy_min_speech_ms` (`400`). |
+| `drop_background_speech` | `true` | Drop speech that wasn't said to the agent, silently (`false`: every transcript is answered or asked again). |
+| `assumed_user_dbfs`, `assumed_margin_db` | `-26`, `2` | The user's level before their first answered turn, and the extra room it gets. |
+| `far_field_db`, `far_field_hard_db` | `6`, `8` | Below the user's level by `far_field_hard_db`: dropped (and never announced); by `far_field_db`: dropped if unsure, a fragment or weak. |
+| `close_db` | `6` | Within this of the user's level, weak-against-the-floor speech is still theirs (a loud café). |
+| `min_snr_db` | `6` | "Weak against the floor". |
+| `unsure_avg_logprob`, `unsure_no_speech_prob` | `-0.65`, `0.5` | "Unsure": Whisper's confidence. |
+| `short_fragment_words` | `3` | "A fragment": this many words or fewer with no content word. |
+
 ## Provider status
 
 What the POC builds vs. what stays a placeholder. (No application code exists yet — see `docs/DESIGN.md` §10 for build phases.)

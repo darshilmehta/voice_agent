@@ -1,6 +1,6 @@
 """Noisy rooms (docs/DESIGN.md §3.10): the noise floor, the gate on the endpointer, whether speech was said to the
-agent, and hold-to-talk. The session tests use the fakes of test_voice_api.py: the audio's level encodes what was said (tone
-t ↔ amplitude t/100, i.e. 20·log10(t/100) dBFS: tone 30 is -10.5 dBFS), FakeVAD hears speech above tone 2.
+agent, and hold-to-talk. The session tests use the fakes of test_voice_api.py: the audio's level encodes what was
+said (tone t ↔ amplitude t/100, i.e. 20·log10(t/100) dBFS: tone 30 is -10.5 dBFS), FakeVAD hears speech above tone 2.
 """
 
 # ruff: noqa: F811  (the `voice` fixture is imported from test_voice_api and requested by name)
@@ -184,9 +184,18 @@ def test_near_speech_is_announced_after_min_speech_and_babble_doesnt_hold_it_ope
 def test_far_speech_is_never_announced():
     ep = gated()
     events = feed(ep, (1500, -80, 0.0), (1000, -50, 0.95), (800, -80, 0.0))
-    assert [type(e) for _, e in events] == [SpeechDiscarded]  # the TV across the room: below -42 dBFS
-    assert events[0][1] == SpeechDiscarded(pytest.approx(frames(1000) * 32), announced=False)
+    # the TV across the room (below -42 dBFS, and too quiet to hold a turn open): only quiet discards
+    assert events and all(isinstance(e, SpeechDiscarded) and not e.announced for _, e in events)
     assert not ep.in_utterance
+
+
+def test_far_speech_after_the_user_stops_doesnt_hold_their_turn_open():
+    ep = gated()
+    ep.gate.user.update(-18)  # type: ignore[union-attr]
+    # the user's question, then the TV (20 dB down, the VAD hears speech in it) goes on
+    events = feed(ep, (1500, -80, 0.0), (1000, -18, 0.95), (1500, -38, 0.95))
+    ended = [i for i, e in events if isinstance(e, SpeechEnded)]
+    assert ended == [frames(1500) + frames(1000) + frames(600) - 1]  # 600 ms after the user stopped
 
 
 def test_a_noisy_room_needs_longer_speech():
@@ -274,7 +283,7 @@ def test_hold_to_talk_messages():
 def test_noise_settings(load_local):
     n = load_local().voice.noise
     assert (n.denoise, n.adaptive_gating, n.drop_background_speech) == ("rnnoise", True, True)
-    assert (n.far_field_db, n.far_field_hard_db, n.assumed_user_dbfs, n.assumed_margin_db) == (6, 10, -26, 2)
+    assert (n.far_field_db, n.far_field_hard_db, n.assumed_user_dbfs, n.assumed_margin_db) == (6, 8, -26, 2)
     assert load_local(VOICE__NOISE__DENOISE="off").voice.noise.denoise == "off"
     with pytest.raises(ConfigError, match=r"voice\.noise\.denoise"):
         load_local(VOICE__NOISE__DENOISE="speex")
@@ -293,7 +302,7 @@ def test_the_browser_gets_the_same_thresholds(load_local):
     v = public_config(s).voice_input
     n = s.voice.noise
     assert (v.denoise, v.threshold, v.min_speech_ms) == ("rnnoise", s.vad.threshold, s.vad.min_speech_ms)
-    assert (v.start_snr_db, v.noisy_threshold, v.far_field_hard_db) == (n.start_snr_db, n.noisy_threshold, 10)
+    assert (v.start_snr_db, v.noisy_threshold, v.far_field_hard_db) == (n.start_snr_db, n.noisy_threshold, 8)
 
 
 # ------------------------------------------------------------------ the session

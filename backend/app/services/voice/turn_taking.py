@@ -203,7 +203,7 @@ class Endpointer:
         self._frames.append(frame)
         self._samples += n
         events: list[VADEvent] = []
-        audible = gate.audible(dbfs) if gating and gate is not None else True
+        audible = gate.audible(dbfs) and gate.holds(dbfs) if gating and gate is not None else True
         if probability >= self.on and audible:
             if self._silence and self._paused:
                 events.append(SpeechResumed())

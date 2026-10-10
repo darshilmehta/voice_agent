@@ -163,7 +163,7 @@
       "assumed_user_dbfs": -26,
       "assumed_margin_db": 2,
       "far_field_db": 6,
-      "far_field_hard_db": 10,
+      "far_field_hard_db": 8,
       "close_db": 6,
       "min_snr_db": 6,
       "unsure_avg_logprob": -0.65,
