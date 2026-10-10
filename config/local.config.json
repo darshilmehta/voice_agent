@@ -29,7 +29,7 @@
   },
 
   "client": {
-    "app_title": "Document Voice Agent",
+    "app_title": "Docent",
     "languages": ["en", "hi"],
     "default_language": "en",
     "voice_enabled": true,

@@ -10,6 +10,7 @@ import { useEffect, useId, useMemo, useState } from "react";
 
 import type { Chat, Project } from "@/lib/api";
 import { useBackend, useDocumentTitle } from "@/lib/backend-context";
+import { TAGLINE } from "@/lib/brand";
 import { LANGUAGE_NAMES, plural, relativeTime } from "@/lib/format";
 import { chatActivity, keys, slotOf, useWorkspace, useWorkspaceActions } from "@/lib/workspace";
 
@@ -35,7 +36,7 @@ export function HomeView() {
   const state = useWorkspace();
   const ws = useWorkspaceActions();
   const actions = useEntityActions();
-  useDocumentTitle(null);
+  useDocumentTitle(null, true);
 
   const slot = slotOf(state, keys.projects);
   const projects = (state.projectIds ?? [])
@@ -65,6 +66,7 @@ export function HomeView() {
 
       <header className="hero">
         <h1>{appTitle}</h1>
+        <p className="tagline">{TAGLINE}</p>
         <p className="lede">
           Talk with your documents out loud. Answers are short, spoken, and cite the pages they come from; typing is
           there when you can't speak.

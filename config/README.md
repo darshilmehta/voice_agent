@@ -1,6 +1,6 @@
 # Configuration
 
-One JSON file configures the whole backend. The frontend gets its settings from the backend at runtime.
+One JSON file configures the whole backend of Docent ("Talk to your documents"). `client.app_title` is the name the UI and the OpenAPI docs show ("Docent"); the config keys, `app.name` (`poc_gibberlink`) and paths are internal identifiers. The frontend gets its settings from the backend at runtime.
 
 | File | Used by | Purpose |
 |---|---|---|

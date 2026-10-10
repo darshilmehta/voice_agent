@@ -74,7 +74,7 @@ def test_public_config_local(load_local):
     with _client(s, mock_http()) as client:
         body = client.get("/api/config/public").json()
     assert body["profile"] == "local"
-    assert body["client"] == {"app_title": "Document Voice Agent", "languages": ["en", "hi"], "default_language": "en"}
+    assert body["client"] == {"app_title": "Docent", "languages": ["en", "hi"], "default_language": "en"}
     assert body["features"] == {"voice": True, "web_search": False, "debug_panel": True}
     assert body["auth"]["provider"] == "none"
     assert ".pdf" in body["limits"]["allowed_extensions"]

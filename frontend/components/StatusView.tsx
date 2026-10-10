@@ -18,7 +18,7 @@ export function StatusView() {
     <div className="page">
       <header className="page-head">
         <h1 className="page-title">System status</h1>
-        <p className="lede">Every component the agent depends on, checked live by the backend.</p>
+        <p className="lede">Every component Docent depends on, checked live by the backend.</p>
       </header>
 
       {error && <BackendDown />}

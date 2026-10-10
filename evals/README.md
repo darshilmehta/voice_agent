@@ -1,6 +1,6 @@
 # Evals
 
-Measuring the document agent against known answers. Today this is the **retrieval eval** (docs/DESIGN.md §10, phase 2 tuning and phase 9): does the right document and page come back, and does the agent stay quiet when the documents don't hold the answer? Conversation evals (`conversation_cases.jsonl`, §7) come later.
+Measuring Docent against known answers. Today this is the **retrieval eval** (docs/DESIGN.md §10, phase 2 tuning and phase 9): does the right document and page come back, and does the agent stay quiet when the documents don't hold the answer? Conversation evals (`conversation_cases.jsonl`, §7) come later.
 
 ```text
 evals/

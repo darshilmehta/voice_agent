@@ -37,6 +37,7 @@ import {
   type SourcesPayload,
 } from "@/lib/api";
 import { useBackend } from "@/lib/backend-context";
+import { PRODUCT_NAME } from "@/lib/brand";
 import type { Turn } from "@/lib/chat-turns";
 import { citedIds, toSourceRefs, type SourceRef } from "@/lib/citations";
 import { clockTime, dayKey, dayLabel, fullDateTime, plural } from "@/lib/format";
@@ -429,7 +430,7 @@ export function Transcript({
               <EmptyState icon="chat" title="No messages yet">
                 <p>
                   Ask a question about this project's documents. Answers cite the pages they come from, and every
-                  message — yours and the agent's — is kept here.
+                  message — yours and Docent's — is kept here.
                 </p>
               </EmptyState>
             </div>
@@ -650,7 +651,7 @@ function useSources(
 function MessageMeta({ m, isUser, extra }: { m: Message; isUser: boolean; extra?: ReactNode }) {
   return (
     <div className="msg-meta">
-      <span className="msg-who">{isUser ? "You" : "Agent"}</span>
+      <span className="msg-who">{isUser ? "You" : PRODUCT_NAME}</span>
       <span className="msg-mode">
         <Icon name={m.modality === "voice" ? "mic" : "keyboard"} size={13} />
         {m.modality === "voice" ? "Voice" : "Text"}
@@ -909,7 +910,7 @@ function LiveVoiceAnswer({
   return (
     <li className="msg msg-agent" aria-busy="true">
       <div className="msg-meta">
-        <span className="msg-who">Agent</span>
+        <span className="msg-who">{PRODUCT_NAME}</span>
         <span className="msg-mode">
           <Icon name="mic" size={13} />
           Voice
@@ -1014,7 +1015,7 @@ function LiveAnswer({
   return (
     <li className="msg msg-agent" aria-busy={turn.phase === "searching" || turn.phase === "answering" || undefined}>
       <div className="msg-meta">
-        <span className="msg-who">Agent</span>
+        <span className="msg-who">{PRODUCT_NAME}</span>
         {status && <span className="msg-status">{status}</span>}
       </div>
 

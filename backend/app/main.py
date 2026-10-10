@@ -19,6 +19,7 @@ from . import __version__
 from .api import canvas as canvas_api
 from .api import chats, documents, health, pins, projects, public_config, revisit, voice
 from .api.deps import install_error_handlers
+from .branding import TAGLINE
 from .logging_setup import configure_logging
 from .offline import apply_runtime_env
 from .providers.registry import Container, build_container
@@ -97,7 +98,7 @@ def create_app(
         unhook = add_agent_message_hook(titles.db, titles.on_agent_message) if auto_titles else None
         log.info(
             "started %s %s profile=%s strict_offline=%s config=%s",
-            settings.app.name,
+            settings.client.app_title,
             __version__,
             settings.profile,
             settings.strict_offline,
@@ -116,7 +117,12 @@ def create_app(
             await app.state.preloader.stop()
             await container.close()
 
-    app = FastAPI(title=settings.client.app_title, version=__version__, lifespan=lifespan)
+    app = FastAPI(
+        title=settings.client.app_title,
+        description=TAGLINE,
+        version=__version__,
+        lifespan=lifespan,
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.server.cors_allowed_origins,
