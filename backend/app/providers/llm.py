@@ -91,6 +91,10 @@ class LLMClient(Provider):
         model server with a prompt cache has their prefixes ready (the router's and the answers' system prompts, at
         startup). Default: nothing to warm."""
 
+    async def loaded(self) -> bool | None:
+        """Is the chat model in memory right now (a model server unloads an idle one)? None: can't tell."""
+        return None
+
 
 class _ThinkFilter:
     """Drops a leading ``<think>…</think>`` block from streamed text. With ``think: false`` instruct models emit none,
@@ -203,6 +207,18 @@ class OllamaLLM(LLMClient):
             raise LLMUnavailableError(f"Ollama unreachable at {self.base_url} ({type(e).__name__}: {e})") from e
         if response.status_code != 200:
             raise LLMError(_error_text(response))
+
+    async def loaded(self) -> bool | None:
+        """The chat model among Ollama's running models (``/api/ps``): it unloads one idle for ``keep_alive``."""
+        try:
+            r = await self.ctx.http.get(f"{self.base_url}/api/ps", timeout=2.0)
+        except httpx.HTTPError:
+            return None
+        if r.status_code != 200:
+            return None
+        model = self.config.chat_model  # type: ignore[attr-defined]
+        names = {m.get("name") or m.get("model") for m in r.json().get("models", [])}
+        return model in names or f"{model}:latest" in names
 
     async def warm_up(self, prompts: Sequence[Sequence[LLMMessage]], *, model: str | None = None) -> None:
         """Each prompt read once (one token, the router's temperature), one after another."""

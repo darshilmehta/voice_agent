@@ -31,6 +31,7 @@ from .services.messages import add_agent_message_hook
 from .services.preload import ModelPreloader
 from .services.titles import TitleService
 from .services.voice import VoiceSessions
+from .services.voice.vocabulary import VocabularyWarmer
 from .settings import Settings, load_settings
 
 log = logging.getLogger("app")
@@ -82,6 +83,14 @@ def create_app(
         await app.state.document_pipeline.start()  # re-queues ingestions a restart interrupted
         await canvas.schedule_backfill()
         app.state.voice_sessions = VoiceSessions(container, canvas=canvas)
+        # The document names' Devanagari spellings for the Hindi speech prompt, asked of the model while it is idle
+        # (after the preload, and when a document becomes READY), not as a voice session opens (polish round, item 5).
+        warmer = None
+        if (vocabulary := app.state.voice_sessions.vocabulary) is not None:
+            warmer = VocabularyWarmer(vocabulary, canvas.store.projects_with_documents, app.state.preloader.wait)
+            app.state.document_pipeline.listeners.append(warmer)
+            if preload_models:
+                warmer.warm_all()
         app.state.summarizer = ChatSummarizer.from_container(container)
         titles = app.state.titles = TitleService.from_container(container)
         # Titles follow the first saved agent answer (text or voice) as a background job, not as part of the turn.
@@ -98,6 +107,8 @@ def create_app(
             yield
         finally:
             await app.state.voice_sessions.close_all()
+            if warmer is not None:
+                await warmer.close()
             with contextlib.suppress(TimeoutError):  # saves of stopped answers, voice session clean-ups
                 await asyncio.wait_for(wait_for_background(), SHUTDOWN_SAVE_WAIT_S)
             if unhook is not None:

@@ -563,7 +563,7 @@ class VoiceSession:
                         "language": language,
                     }
                 )
-                self._refresh_hints()
+                self._refresh_hints(use_model=False)  # names the model hasn't spelled yet: after the first turn
                 await self._resend_state()
             case BargeInStart():
                 await self._on_barge_in_start(message)
@@ -685,15 +685,16 @@ class VoiceSession:
             transcript = replace(transcript, text=text)
         return transcript
 
-    def _refresh_hints(self) -> None:
-        """Bring the chat's speech hints up to date in the background (rebuilt only when its documents changed)."""
+    def _refresh_hints(self, *, use_model: bool = True) -> None:
+        """Bring the chat's speech hints up to date in the background (rebuilt only when its documents changed).
+        ``use_model`` off as the session starts: no LLM call that the first question would queue behind."""
         vocabulary = self._vocabulary
         if vocabulary is None or (self._hints_task is not None and not self._hints_task.done()):
             return
 
         async def refresh() -> None:
             try:
-                self._hints = await vocabulary.hints(self.chat)
+                self._hints = await vocabulary.hints(self.chat, use_model=use_model)
             except Exception as e:  # transcription goes on with the hints it has (or none)
                 log.warning("voice session %s: speech vocabulary unavailable: %s", self.id, _describe(e))
 
@@ -1688,6 +1689,8 @@ class VoiceSessions:
         self.vocabulary = speech_vocabulary(container)  # shared: a chat's hints outlive a reconnect
         self._sessions: dict[str, VoiceSession] = {}
         self._lock = asyncio.Lock()
+        self._rewarmed_at: float | None = None
+        self._rewarm_task: asyncio.Task[None] | None = None
 
     def get(self, chat_id: str) -> VoiceSession | None:
         return self._sessions.get(chat_id)
@@ -1707,13 +1710,38 @@ class VoiceSessions:
         if previous is not None:
             previous.close(CLOSE_REPLACED, "another voice session was opened for this chat")
             await previous.wait_closed()
+        self._rewarm()
         return session
+
+    def _rewarm(self) -> None:
+        """Warm the conversation models again as a session opens, in the background (``preload.rewarm``, polish round
+        item 5: the first spoken question of a new chat waited for models the OS had paged out, or for an LLM Ollama
+        had unloaded), at most once a minute."""
+        from ..preload import REWARM_EVERY_S, rewarm  # (the preload module imports this package)
+
+        now = time.monotonic()
+        if self._rewarm_task is not None and not self._rewarm_task.done():
+            return
+        if self._rewarmed_at is not None and now - self._rewarmed_at < REWARM_EVERY_S:
+            return
+        self._rewarmed_at = now
+
+        async def run() -> None:
+            t0 = time.perf_counter()
+            done = await rewarm(self.container)
+            log.info("voice: models warmed as a session opened (%.0f ms): %s", (time.perf_counter() - t0) * 1000, done)
+
+        self._rewarm_task = asyncio.ensure_future(run())
 
     def release(self, session: VoiceSession) -> None:
         if self._sessions.get(session.chat.id) is session:
             del self._sessions[session.chat.id]
 
     async def close_all(self) -> None:
+        if self._rewarm_task is not None and not self._rewarm_task.done():
+            self._rewarm_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._rewarm_task
         sessions = list(self._sessions.values())
         for session in sessions:
             session.close(CLOSE_GOING_AWAY, "server shutting down")

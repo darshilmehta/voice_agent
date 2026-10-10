@@ -13,6 +13,11 @@ Once the LLM is loaded, its first prompts are warmed (``warm_prompts``): the rou
 system prompt in every configured language and the visual planner's system prompt are read once, so Ollama's prompt
 cache holds them before the first turn. Without it the first routed turns after startup read the router prompt cold
 and hit the router timeout (§3.4, §9.5).
+
+When a voice session opens (``rewarm``, polish round item 5): the local models run their tiny warm-up inference again
+(weights the OS paged out while they sat idle come back before the first question needs them; ~0.1 s when warm), and
+when Ollama has unloaded the chat model (idle past ``keep_alive``), it is loaded and the router's and the answer's
+prompts are read again, while the user is still speaking.
 """
 
 from __future__ import annotations
@@ -149,6 +154,55 @@ class ModelPreloader:
             time.perf_counter() - started,
             ", ".join(f"{m.capability} {m.state} {m.seconds}s" for m in self._loads),
         )
+
+
+REWARM_EVERY_S = 60.0  # a voice session opened within this of the last re-warm doesn't warm again
+REWARM_ORDER = ("stt", "embeddings", "reranker", "tts")  # in the order a spoken question needs them
+
+
+async def rewarm(container: Container, language: str | None = None) -> dict[str, object]:
+    """Warm the conversation models again as a voice session opens (module docstring): the local ones' tiny inference
+    (never loading one that isn't loaded) and, beside them, the LLM if Ollama has unloaded it (loaded, then the
+    router's and the answer's prompts read). What was done, for the log. Never raises."""
+    done: dict[str, object] = {}
+    settings = container.settings
+
+    async def llm_part() -> None:
+        llm = container.providers.get("llm")
+        if not isinstance(llm, LLMClient) or isinstance(llm, PlaceholderProvider):
+            return
+        loaded = await llm.loaded()
+        done["llm_loaded"] = loaded
+        if loaded is not False:
+            return
+        t0 = time.perf_counter()
+        await llm.preload()
+        await llm.warm_up(
+            [router_messages(RouteRequest("Hello, can you hear me?", "en"))], model=settings.llm.router_model
+        )
+        lang = language if language in settings.client.languages else settings.client.default_language
+        system = answer_system_prompt(lang, "short")  # type: ignore[arg-type]
+        await llm.warm_up([[LLMMessage("system", system), LLMMessage("user", "Hello")]], model=settings.llm.chat_model)
+        done["llm_reloaded_s"] = round(time.perf_counter() - t0, 2)
+
+    async def local_part() -> None:
+        for capability in REWARM_ORDER:
+            provider = container.providers.get(capability)
+            touch = getattr(provider, "touch", None)
+            if touch is None:
+                continue
+            t0 = time.perf_counter()
+            if await touch():
+                done[capability] = round(time.perf_counter() - t0, 3)
+
+    results = await asyncio.gather(llm_part(), local_part(), return_exceptions=True)
+    errors = [f"{type(r).__name__}: {r}" for r in results if isinstance(r, Exception)]
+    for r in results:
+        if isinstance(r, BaseException) and not isinstance(r, Exception):
+            raise r  # cancelled: the session closed
+    if errors:
+        done["errors"] = errors
+    return done
 
 
 async def warm_prompts(llm: LLMClient, settings: Settings) -> None:

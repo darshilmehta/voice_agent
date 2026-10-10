@@ -32,7 +32,7 @@ import re
 import time
 import unicodedata
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import zip_longest
 from pathlib import Path
@@ -584,6 +584,11 @@ async def transliterate(llm: LLMClient, names: Sequence[str]) -> dict[str, str]:
     return {n: _TRANSLITERATIONS[n] for n in names if n in _TRANSLITERATIONS}
 
 
+def known_transliterations(names: Sequence[str]) -> dict[str, str]:
+    """The Devanagari spellings already known (no model call)."""
+    return {n: _TRANSLITERATIONS[n] for n in names if n in _TRANSLITERATIONS}
+
+
 def document_spelling(spelled: str, terms_hi: Sequence[str]) -> str:
     """The documents' own Devanagari spelling of a transliterated name when they have a near one ("सुर्योदय" from the
     model, "सूर्योदय" in the scheme's title), else the model's."""
@@ -618,6 +623,7 @@ class _Entry:
     key: tuple[Any, ...]
     hints: SpeechHints
     checked_at: float
+    complete: bool = True  # its names were spelled in Devanagari (False: built without the model, done later)
 
 
 @dataclass(slots=True)
@@ -638,21 +644,29 @@ class SpeechVocabulary:
         entry = self._cache.get(chat_id)
         return entry.hints if entry is not None else None
 
-    async def hints(self, chat: Chat) -> SpeechHints:
+    async def hints(self, chat: Chat, *, use_model: bool = True) -> SpeechHints:
+        """The chat's hints. ``use_model`` off: names not yet spelled in Devanagari are left out rather than asked of
+        the LLM now (a voice session opening: that call competed with the first question for the model and the GPU,
+        polish round item 5); a later call with it on completes them."""
         entry = self._cache.get(chat.id)
-        if entry is not None and time.monotonic() - entry.checked_at < REFRESH_S:
+        if entry is not None and time.monotonic() - entry.checked_at < REFRESH_S and (entry.complete or not use_model):
             return entry.hints
         async with self._locks.setdefault(chat.id, asyncio.Lock()):
             ready = await self.documents.ready_documents(chat.project_id, chat.document_scope)
             key = (chat.project_id, tuple(sorted(ready.items())))
             entry = self._cache.get(chat.id)
-            if entry is not None and entry.key == key:
+            if entry is not None and entry.key == key and (entry.complete or not use_model):
                 entry.checked_at = time.monotonic()
                 return entry.hints
             t0 = time.perf_counter()
             vocabulary = build_vocabulary(await self._words(chat.project_id, ready), self.count)
+            complete = True
             if self.llm is not None and "hi" in self.languages and vocabulary.keywords:
-                spelled = await transliterate(self.llm, vocabulary.keywords)
+                if use_model:
+                    spelled = await transliterate(self.llm, vocabulary.keywords)
+                else:
+                    spelled = known_transliterations(vocabulary.keywords)
+                    complete = len(spelled) >= min(len(vocabulary.keywords), MAX_TRANSLITERATED)
                 keywords_hi = tuple(
                     document_spelling(spelled[k], vocabulary.terms_hi) for k in vocabulary.keywords if k in spelled
                 )
@@ -663,7 +677,7 @@ class SpeechVocabulary:
                 self.count,
                 vocabulary.lexicon_hi,
             )
-            self._remember(chat.id, _Entry(key, hints, time.monotonic()))
+            self._remember(chat.id, _Entry(key, hints, time.monotonic(), complete))
             log.info(
                 "speech vocabulary of chat %s (%d documents, %.0f ms): prompts %s; lexicon %s",
                 chat.id,
@@ -673,6 +687,21 @@ class SpeechVocabulary:
                 hints.lexicon,
             )
             return hints
+
+    async def warm(self, project_id: str) -> None:
+        """Spell a project's document names in Devanagari now (startup, a document READY: the model is idle then), so
+        a voice session opening later needs no model call for them. Never raises."""
+        if self.llm is None or "hi" not in self.languages:
+            return
+        try:
+            ready = await self.documents.ready_documents(project_id, None)
+            if not ready:
+                return
+            vocabulary = build_vocabulary(await self._words(project_id, ready), self.count)
+            if vocabulary.keywords:
+                await transliterate(self.llm, vocabulary.keywords)
+        except Exception as e:  # a session builds them itself then
+            log.info("speech vocabulary: names of project %s not spelled ahead: %s", project_id, e)
 
     def _remember(self, chat_id: str, entry: _Entry) -> None:
         self._cache.pop(chat_id, None)
@@ -700,3 +729,52 @@ class SpeechVocabulary:
             hindi = [t for t in texts.get(doc_id, []) if len(_DEVANAGARI.findall(t)) * 2 > len(t.replace(" ", ""))]
             out.append(DocumentWords(filename, labels.get(doc_id, ""), tables, hindi))
         return out
+
+
+class VocabularyWarmer:
+    """Spells the document names of a project in Devanagari ahead of its voice sessions (``SpeechVocabulary.warm``):
+    for every project with READY documents once the startup preload is over (``warm_all``), and for a project whenever
+    one of its documents becomes READY (a pipeline listener). In the background: never in a document's way."""
+
+    MAX_PROJECTS = 20  # at startup, at most this many projects (the model call is a second or two each)
+
+    def __init__(
+        self,
+        vocabulary: SpeechVocabulary,
+        projects: Callable[[], Awaitable[list[str]]],
+        wait: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        self.vocabulary = vocabulary
+        self.projects = projects
+        self.wait = wait
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    def _spawn(self, coro: Awaitable[None]) -> None:
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def warm_all(self) -> None:
+        async def run() -> None:
+            if self.wait is not None:
+                await self.wait()
+            try:
+                projects = (await self.projects())[: self.MAX_PROJECTS]
+            except Exception as e:
+                log.info("speech vocabulary: projects not listed: %s", e)
+                return
+            for project_id in projects:
+                await self.vocabulary.warm(project_id)
+
+        self._spawn(run())
+
+    async def document_ready(self, project_id: str, document_id: str, version: int, **_: Any) -> None:
+        self._spawn(self.vocabulary.warm(project_id))
+
+    async def document_deleted(self, project_id: str, document_id: str) -> None:
+        return None
+
+    async def close(self) -> None:
+        for task in list(self._tasks):
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)

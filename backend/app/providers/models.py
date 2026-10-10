@@ -233,6 +233,21 @@ class LazyModelProvider(LocalModelProvider):
     async def preload(self) -> None:
         await self._run(self._preload_sync)
 
+    async def touch(self) -> bool:
+        """The tiny inference of a preload again, if the model is loaded (never loads it): brings weights that the OS
+        paged out while it was idle (an ingestion, other apps) back before a real request needs them. False when not
+        loaded."""
+        if self._model is None:
+            return False
+        return await self._run(self._touch_sync)
+
+    def _touch_sync(self) -> bool:
+        with self._lock:
+            if self._model is None:
+                return False
+            self._warm(self._model)
+            return True
+
     def _preload_sync(self) -> None:
         with self._lock:
             fresh = self._model is None
