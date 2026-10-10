@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Start everything poc_gibberlink needs on a Mac, in order, with one command.
+"""Start everything Docent needs on a Mac, in order, with one command.
+
+Docent ("Talk to your documents") is the product; poc_gibberlink is the repo folder and stays the internal name.
 
     python3 start.py            # start (or reuse) Ollama, Docker + Qdrant, backend, frontend; open Chrome
     python3 start.py status     # what is running
@@ -572,6 +574,7 @@ def cmd_start(args) -> int:
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
 
+    say(_c("1;36", "Docent: talk to your documents"))
     cfg = load_config()
     ollama_child = start_ollama(args, cfg)
     start_qdrant()
@@ -580,7 +583,7 @@ def cmd_start(args) -> int:
     start_backend(children, cfg)
     start_frontend(children)
 
-    step(f"Ready: {APP_URL}")
+    step(f"Docent is ready: {APP_URL}")
     print("    Open it in Chrome and allow the microphone. Demo script: docs/DEMO.md.", flush=True)
     print("    Ctrl+C here (or `python3 start.py stop` anywhere) stops the backend and frontend.", flush=True)
     if not args.no_browser:
@@ -599,7 +602,7 @@ def cmd_start(args) -> int:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Start poc_gibberlink and everything it needs (macOS).")
+    p = argparse.ArgumentParser(description="Start Docent (talk to your documents) and everything it needs (macOS).")
     p.add_argument("command", nargs="?", default="start", choices=["start", "status", "stop"])
     p.add_argument("-y", "--yes", action="store_true", help="answer yes to downloads (model weights, Ollama model)")
     p.add_argument("--no-browser", action="store_true", help="don't open Chrome")

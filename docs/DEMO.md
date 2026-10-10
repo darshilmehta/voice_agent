@@ -1,6 +1,6 @@
-# Demo script
+# Docent demo script
 
-A 15-minute walk through the MVP: a voice conversation with your documents in English and Hindi, interruptions, live charts, revisiting the chat, a noisy room, and (optionally) live web search. Expected answers are given so you can check them; the documents are fictional and generated (`scripts/eval/build_corpus.py`). Wording varies a little between runs (a local 4B model); the figures don't. Every row was last checked on the real stack over the voice connection on 2026-10-10 (synthetic voices, DESIGN §9).
+A 15-minute walk through the MVP of Docent ("Talk to your documents"): a voice conversation with your documents in English and Hindi, interruptions, live charts, revisiting the chat, a noisy room, and (optionally) live web search. Expected answers are given so you can check them; the documents are fictional and generated (`scripts/eval/build_corpus.py`). Wording varies a little between runs (a local 4B model); the figures don't. Every row was last checked on the real stack over the voice connection on 2026-10-10 (synthetic voices, DESIGN §9).
 
 ## 1. Start
 
@@ -44,6 +44,7 @@ From Home press **Start a conversation** (or open a chat in the project) and tap
 | "What is Valmora's corporate identification number?" | L24119GJ1994PLC023871 (say it in full: a spoken "CIN" is often heard as "sin" and gets "The documents do not cover…") |
 | "What's the hotel limit for an L3 employee in a Tier-1 city?" | ₹7,500 (chip: § 5.1 Hotel limits per night) |
 | "What's the group health policy number?" | GHI/2024/00418377 (from the scanned PDF) |
+| "Who are you?" (also "आप कौन हैं?") | A one-line answer that names itself: "I'm Docent …" (the Latin-script name, also in Hindi) |
 | "What is EBITDA?" | a short general explanation; on screen "General knowledge, not from your documents" |
 | "What is Valmora's FY25 revenue?" | "The documents don't cover Valmora's FY25 revenue." — labelled "Not in your documents", and listed later in the summary as not answered |
 | "What's the USD to INR rate today?" (web search off) | "I can't look up live data such as today's rates, prices or news, so I won't guess a figure." |

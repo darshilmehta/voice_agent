@@ -54,7 +54,7 @@ def live_reply(messages: list[LLMMessage]) -> str:
     if "can look up live data on the web" in system:
         cite_s = " The report says revenue grew 34% [S1]." if "[S1]" in last else ""
         return f"Today the stock is up 2%, according to news.example.com [W1].{cite_s}"
-    if system.startswith("You answer questions about the user's documents"):
+    if system.startswith("You are Docent, a voice and text assistant that answers questions"):
         return "From the documents, revenue grew 34% [S1]."
     return "From general knowledge: no live data."
 

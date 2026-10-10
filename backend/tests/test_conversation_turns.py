@@ -56,7 +56,7 @@ def scripted_reply(messages: list[LLMMessage]) -> str:
     hindi = "in Hindi" in messages[-1].content
     if system.startswith("You keep the memory"):
         return MEMORY
-    if system.startswith("You answer questions about the user's documents"):
+    if system.startswith("You are Docent, a voice and text assistant that answers questions"):
         prompt = messages[-1].content
         question = RERANKED[-1] if RERANKED else prompt.split("Question: ", 1)[1].split("\n", 1)[0]
         sources = re.findall(r"\[(S\d+)\][^\n]*\n([^\n]+)", prompt)
@@ -64,7 +64,7 @@ def scripted_reply(messages: list[LLMMessage]) -> str:
         return f"{'दस्तावेज़ के अनुसार: ' if hindi else ''}{text} [{sid}]"
     if "Ask exactly one short question" in system:
         return "आप किस वर्ष की बात कर रहे हैं?" if hindi else "Which year do you mean?"
-    if system.startswith("You are a friendly voice assistant"):
+    if system.startswith("You are Docent, a friendly voice assistant"):
         return "नमस्ते!" if hindi else "Happy to help."
     return "सामान्य जानकारी: नई दिल्ली।" if hindi else "From general knowledge: Paris."
 

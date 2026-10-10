@@ -11,8 +11,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 
 import { createApi, errorMessage, isAbort, type Api, type PublicConfig } from "./api";
+import { PRODUCT_NAME, TAGLINE } from "./brand";
 
-export const DEFAULT_TITLE = "Document Voice Agent";
+export const DEFAULT_TITLE = PRODUCT_NAME;
 
 type ConfigState =
   | { kind: "loading" }
@@ -76,12 +77,13 @@ export function useBackend(): BackendContextValue {
 }
 
 /**
- * Sets the browser tab title to "<page> · <app title>" while the calling page is shown. Next re-applies the root
- * layout's static metadata title after client navigations, so the title is re-asserted whenever <head> changes.
+ * Sets the browser tab title to "<page> · <app title>" while the calling page is shown ("<app title> · <tagline>"
+ * on the home page, which passes ``home``). Next re-applies the root layout's static metadata title after client
+ * navigations, so the title is re-asserted whenever <head> changes.
  */
-export function useDocumentTitle(page: string | null | undefined) {
+export function useDocumentTitle(page: string | null | undefined, home = false) {
   const { appTitle } = useBackend();
-  const wanted = page ? `${page} · ${appTitle}` : appTitle;
+  const wanted = page ? `${page} · ${appTitle}` : home ? `${appTitle} · ${TAGLINE}` : appTitle;
   useEffect(() => {
     const apply = () => {
       if (document.title !== wanted) document.title = wanted;

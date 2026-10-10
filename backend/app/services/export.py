@@ -30,6 +30,7 @@ from urllib.parse import quote
 
 from pydantic import BaseModel, SerializerFunctionWrapHandler, model_serializer
 
+from ..branding import PRODUCT_NAME
 from ..domain.projects import Chat, Message
 from ..domain.summaries import SourceRef, SummaryData, UnansweredQuestion, UserSummary
 from .base import Service
@@ -46,7 +47,7 @@ ExportFormat = Literal["md", "json"]
 
 MEDIA_TYPES: dict[ExportFormat, str] = {"md": "text/markdown; charset=utf-8", "json": "application/json"}
 LANGUAGE_NAMES = {"en": "English", "hi": "Hindi"}
-SPEAKERS = {"user": "You", "agent": "Assistant", "event": "Event"}
+SPEAKERS = {"user": "You", "agent": PRODUCT_NAME, "event": "Event"}
 SLUG_MAX = 60
 
 
@@ -363,7 +364,7 @@ def render_markdown(doc: TranscriptExport, summary_markdown: str | None = None) 
         ("Created", _utc(chat.created_at)),
         ("Languages", languages),
         ("Messages", f"{len(doc.messages)} ({voice} voice, {len(doc.messages) - voice} text)"),
-        ("Exported", _utc(doc.exported_at)),
+        ("Exported", f"{_utc(doc.exported_at)} from {PRODUCT_NAME}"),
     ]
     out = [f"# {_SPACE.sub(' ', chat.title).strip()}", ""]
     out += [f"- **{name}:** {value}" for name, value in facts]

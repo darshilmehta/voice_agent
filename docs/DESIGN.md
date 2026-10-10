@@ -1,4 +1,6 @@
-# poc_gibberlink — Design
+# Docent — Design
+
+> **Product name:** Docent, tagline "Talk to your documents" (Hindi: "अपने दस्तावेज़ों से बात करें"), decided 2026-10-10. The repo (`voice_agent`), the folder (`poc_gibberlink`), package, container, collection and config-key names are internal identifiers and keep their old names. The assistant introduces itself as Docent (`backend/app/branding.py`, `frontend/lib/brand.ts`).
 
 > **Status:** Phase −1 **complete** (smoke tests incl. network-off run) · Phase 0 **complete** (skeleton, health, frontend shell, Docker, CI) · Phase 1 **in progress** (2026-10-08).
 > **Last updated:** 2026-10-10 (polish round before the retest: one panel per chart §12.1, corrupted numbers and misheard words §3.4, Hindi heard wrong in noise §3.4, the first question of a new chat §3.10, the prompt-cache warning §8)
@@ -8,7 +10,7 @@
 
 ## 1. What we are building
 
-A fully local, ChatGPT "voice mode"-style agent that talks with you about your uploaded documents.
+**Docent** is a fully local, ChatGPT "voice mode"-style assistant that talks with you about your uploaded documents.
 
 **Voice-first (product principle, confirmed by the user 2026-10-09).** The primary way to use the product is a spoken conversation. Text is secondary: transcripts, summaries and search exist to *revisit* conversations, and typing is a fallback when speaking isn't possible. Every screen and default follows from this:
 

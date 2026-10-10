@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 
 import { AppProviders } from "@/components/AppProviders";
 import { backendUrl } from "@/lib/backend-url";
+import { PRODUCT_NAME, TAGLINE } from "@/lib/brand";
 
 import "./globals.css";
 import "./styles/shell.css";
@@ -19,8 +20,16 @@ import "./styles/canvas.css";
 export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
-  title: "Document Voice Agent",
-  description: "Talk with your documents, fully on this machine.",
+  applicationName: PRODUCT_NAME,
+  title: { default: `${PRODUCT_NAME} · ${TAGLINE}`, template: `%s · ${PRODUCT_NAME}` },
+  description: `${TAGLINE}: ask about your PDFs, Word and PowerPoint files out loud, in English or Hindi, fully on this machine.`,
+  openGraph: {
+    type: "website",
+    siteName: PRODUCT_NAME,
+    title: `${PRODUCT_NAME} · ${TAGLINE}`,
+    description: TAGLINE,
+  },
+  twitter: { card: "summary", title: `${PRODUCT_NAME} · ${TAGLINE}`, description: TAGLINE },
 };
 
 export const viewport: Viewport = {

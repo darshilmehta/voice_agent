@@ -1,6 +1,6 @@
-# Frontend
+# Docent: frontend
 
-Next.js (App Router) + TypeScript. Voice conversation is the product (docs/DESIGN.md §1): the chat page opens in **voice mode**, with the voice presence field (§3.8), a large mic control, live captions and the answer's sources; the transcript is a panel beside it and typing is a fallback ("Type instead"). Around it: projects, chats and transcripts (§3.9): a sidebar with search, pinned items and each project's chats; project and chat pages; a paginated transcript view; document upload with live ingestion status; text chat with streamed, cited answers; and the system-status panel at `/status`.
+Next.js (App Router) + TypeScript: the web app of Docent ("Talk to your documents"). Voice conversation is the product (docs/DESIGN.md §1): the chat page opens in **voice mode**, with the voice presence field (§3.8), a large mic control, live captions and the answer's sources; the transcript is a panel beside it and typing is a fallback ("Type instead"). Around it: projects, chats and transcripts (§3.9): a sidebar with search, pinned items and each project's chats; project and chat pages; a paginated transcript view; document upload with live ingestion status; text chat with streamed, cited answers; and the system-status panel at `/status`.
 
 ## Run
 

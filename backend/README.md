@@ -1,6 +1,6 @@
-# Backend
+# Docent: backend
 
-FastAPI service: configuration, provider registry, health, projects/chats/transcripts persistence, document upload and ingestion, text chat answered from the documents with citations, and the voice loop (a WebSocket per live voice session: VAD, STT, the same answer pipeline, TTS, barge-in). Architecture: [`../docs/DESIGN.md`](../docs/DESIGN.md).
+FastAPI service behind Docent ("Talk to your documents"): configuration, provider registry, health, projects/chats/transcripts persistence, document upload and ingestion, text chat answered from the documents with citations, and the voice loop (a WebSocket per live voice session: VAD, STT, the same answer pipeline, TTS, barge-in). Architecture: [`../docs/DESIGN.md`](../docs/DESIGN.md).
 
 ## Run
 

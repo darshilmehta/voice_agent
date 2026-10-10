@@ -2,7 +2,7 @@
   "name": "voice-agent-frontend",
   "version": "0.1.0",
   "private": true,
-  "description": "Local document voice agent: frontend",
+  "description": "Docent (talk to your documents): frontend",
   "scripts": {
     "vad-assets": "node scripts/copy-vad-assets.mjs",
     "predev": "npm run vad-assets",

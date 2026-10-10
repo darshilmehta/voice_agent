@@ -1,6 +1,8 @@
-# voice_agent (poc_gibberlink)
+# Docent — talk to your documents
 
-A fully local, ChatGPT voice-mode–style agent for talking with your documents. Upload PDFs, Word or PowerPoint files and ask about them out loud, in English or Hindi. Interrupt the agent, correct yourself or change topic, and it adapts. Answers cite the page they came from.
+> **Docent** is the product name (decided 2026-10-10). The repository is `voice_agent` and the folder `poc_gibberlink`; internal identifiers (packages, containers, config keys) keep those names.
+
+Talk to your documents: a fully local, ChatGPT voice-mode–style assistant for your files. Upload PDFs, Word or PowerPoint files and ask about them out loud, in English or Hindi. Interrupt Docent, correct yourself or change topic, and it adapts. Answers cite the page they came from.
 
 Everything runs on this machine: local LLM (Ollama), local vector search (Qdrant), local speech recognition and synthesis. The code is structured so each piece can later be swapped for a hosted service through configuration.
 
