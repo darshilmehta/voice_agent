@@ -18,6 +18,8 @@ text through once it has been checked:
 - **Identifiers** (item 3): a long code (CIN, ISIN, GSTIN, account numbers) that is in no source but within two
   characters of one that is, is replaced by the source's; one near nothing is recorded as unverified.
 - **Names** (item 10): a name the user was misheard as ("Wall Mora") is written as the documents spell it.
+- **Numbers** (polish round): a sign or separator wedged into a number ("20.-4%") is taken out, and a minus on a figure
+  that the model's input (sources, history, question) states only without one ("a margin of -21.0%") is dropped.
 - **Length** (item 7): a short answer stops at the end of the sentence that reaches ``max_words``, or at
   ``max_sentences``, never inside a sentence.
 
@@ -31,7 +33,8 @@ clause's final auxiliary (है, हैं, था, थे, होगा…; ``
 seen before any of its clause is out, and a clause with its auxiliary and no negation goes out at once. Later
 sentences are held whole: the voice session synthesises whole sentences after its first chunk anyway, so speech pays
 only the first chunk's wait (~3 words, or a document subject's verb). A live-figure check holds whole sentences (such
-answers are rare). Without either, only a word that may still be an identifier or a misheard name is held.
+answers are rare). Without either, only a word that may still be an identifier, a misheard name or a number
+(the token being written, until whitespace follows it) is held.
 Every change is recorded (``checks``: ``route.checks`` on the saved message).
 """
 
@@ -438,6 +441,112 @@ def unsupported_figures(sentence: str, allowed: set[str]) -> list[str]:
     return out
 
 
+# ------------------------------------------------------------------ malformed and sign-flipped numbers (polish round)
+
+# The 4B model now and then corrupts a figure it copies: "EBITDA rose 20.-4%" in a grounded answer, "a margin of
+# -21.0%" in a conversation reply that reused the history's "21.0%" (2 in ~60 answers of the last real run). Both are
+# token slips, not claims: a sign or separator wedged into a number ("20.-4", "20-.4", "1,,933", "20..4") is taken out,
+# and a minus on a figure that the model's own input (its sources, the history, the question) states only without one,
+# and never as a fall ("fell 21%", "(21.0)", "-21.0"), is dropped, unless the answer's sentence speaks of a fall itself.
+_SIGNS = "-\u2212\u2013"  # hyphen-minus, minus sign, en dash: what the model writes for a minus
+_DIGIT_SIGN_DIGIT = re.compile(rf"(?<=\d)([.,])\s?[{_SIGNS}]\s?(?=\d)|(?<=\d)[{_SIGNS}]([.,])(?=\d)")
+_DOUBLED_SEPARATOR = re.compile(r"(?<=\d)([.,])\1+(?=\d)")
+_SIGNED_FIGURE = re.compile(rf"(?:(?<=^)|(?<=[\s(\[:\u20b9$]))([{_SIGNS}])(?=\d)")
+_FIGURE_AT = re.compile(r"\d+(?:[.,]\d+)*")
+_FALL = re.compile(
+    r"\b(?:declin\w*|decreas\w*|fell|falls?|falling|drop\w*|down|lower\w*|loss\w*|negative|contract\w*|shr[ai]nk\w*|"
+    r"reduc\w*|minus|deficit\w*|below|less|deficit|outflow\w*|adverse\w*|deteriorat\w*)\b"
+    r"|कमी|गिरावट|घट|नुकसान|घाटा|ऋणात्मक|नकारात्मक",
+    re.IGNORECASE,
+)
+_FALL_BEFORE, _FALL_AFTER = 40, 25  # characters around a figure where a fall word makes it a fall
+
+
+@dataclass(frozen=True, slots=True)
+class NumberFacts:
+    """How the model's input states its figures (``number_key``): ``unsigned``, as a plain amount; ``signed``, with a
+    minus, in accounting brackets or next to a fall word (so a minus may be right)."""
+
+    unsigned: frozenset[str]
+    signed: frozenset[str]
+
+
+def number_facts(texts: Iterable[str]) -> NumberFacts:
+    unsigned: set[str] = set()
+    signed: set[str] = set()
+    for text in texts:
+        plain = _MARKERS.sub(" ", text)
+        for m in _FIGURE_AT.finditer(plain):
+            key = number_key(m.group(0))
+            if key is None:
+                continue
+            before = plain[max(0, m.start() - _FALL_BEFORE) : m.start()]
+            after = plain[m.end() : m.end() + _FALL_AFTER]
+            minus = before[-1:] != "" and before[-1:] in _SIGNS and not before[-2:-1].isalnum()
+            bracketed = before[-1:] == "(" and after[:1] == ")"
+            if minus or bracketed or _FALL.search(before) or _FALL.search(after):
+                signed.add(key)
+            else:
+                unsigned.add(key)
+    return NumberFacts(frozenset(unsigned), frozenset(signed))
+
+
+def repair_numerals(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """``text`` with signs and doubled separators wedged into numbers taken out ("20.-4%" → "20.4%"), and the
+    repairs as ``(before, after)``."""
+    fixes: list[tuple[str, str]] = []
+
+    def fix(m: re.Match[str]) -> str:
+        sep = m.group(1) or m.group(2) or ""
+        start, end = m.start(), m.end()
+        left = re.search(r"[\d.,]*$", text[:start])
+        right = re.match(r"[\d.,]*", text[end:])
+        whole = text[start - (len(left.group(0)) if left else 0) : end + (len(right.group(0)) if right else 0)]
+        fixes.append((whole, whole.replace(m.group(0), sep, 1)))
+        return sep
+
+    text = _DIGIT_SIGN_DIGIT.sub(fix, text)
+
+    def undouble(m: re.Match[str]) -> str:
+        fixes.append((m.group(0), m.group(1)))
+        return m.group(1)
+
+    return _DOUBLED_SEPARATOR.sub(undouble, text), fixes
+
+
+def unflip_signs(text: str, context: str, facts: NumberFacts) -> tuple[str, list[str]]:
+    """``text`` (the end of ``context``, the sentence so far) without a minus on a figure the input states only
+    unsigned; the figures changed. A figure next to a fall word in the answer's own sentence keeps its sign."""
+    offset = len(context) - len(text)
+    changed: list[str] = []
+
+    def drop(m: re.Match[str]) -> str:
+        figure = _FIGURE_AT.match(text, m.end())
+        key = number_key(figure.group(0)) if figure else None
+        if key is None or key not in facts.unsigned or key in facts.signed:
+            return m.group(0)
+        at = offset + m.start()
+        if _FALL.search(context[max(0, at - _FALL_BEFORE) : at]):
+            return m.group(0)
+        changed.append(m.group(0) + figure.group(0))  # type: ignore[union-attr]
+        return ""
+
+    return _SIGNED_FIGURE.sub(drop, text), changed
+
+
+def number_may_grow(text: str) -> int:
+    """Where the trailing token of ``text`` starts when it may be a number still being written ("-21", "20.", "₹7,",
+    "-"), else ``len(text)``: such a token is released whole, so a sign or separator the model is about to wedge into it
+    can still be taken out."""
+    m = re.search(r"\S+$", text)
+    if m is None:
+        return len(text)
+    token = m.group(0)
+    if any(ch.isdigit() for ch in token) or token[-1] in _SIGNS + "(\u20b9$":
+        return m.start()
+    return len(text)
+
+
 # ------------------------------------------------------------------ a general answer's own disclaimer (item 1)
 
 # What the model writes when it says the answer isn't from the documents, at its start, after the app has said so
@@ -538,6 +647,8 @@ class AnswerGuard:
     # A short reply (conversation, clarification): never released mid-word, and when the model's token cap cuts it,
     # it ends at its last whole sentence (last round, item 5: Hindi clarifications ended "… किसी विशिष्ट विषय").
     whole_sentences: bool = False
+    # What the model's input says about its figures (sources, history, question): numbers it corrupts are repaired
+    numbers: NumberFacts | None = None
     checks: list[dict[str, Any]] = field(default_factory=list)
     attempt: int = 1
 
@@ -569,6 +680,7 @@ class AnswerGuard:
             self.sentence_hold
             or self.token_hold
             or self.whole_sentences
+            or self.numbers is not None
             or self.max_words is not None
             or self.max_sentences is not None
         )
@@ -637,7 +749,7 @@ class AnswerGuard:
                 full = unreleased = bare
                 if not bare.strip():  # the disclaimer was the whole sentence
                     return Released()
-        out = self._fix_tokens(unreleased)
+        out = self._fix_tokens(unreleased, context=full)
         replaced = False
         stop = False
         if self.coverage is not None and self.coverage.contradicted_by(full):
@@ -758,6 +870,10 @@ class AnswerGuard:
                 return ""
         else:
             cut = len(self.buffer)
+        if self.numbers is not None and not (cut < len(self.buffer) and self.buffer[cut].isspace()):
+            cut = min(cut, number_may_grow(self.buffer[:cut]))  # a number still being written goes out whole
+            if cut <= 0:
+                return ""
         text, self.buffer = self.buffer[:cut], self.buffer[cut:]
         text = self._first(self._fix_tokens(text))
         if text.strip():
@@ -773,7 +889,11 @@ class AnswerGuard:
             self._record("name", "respelled", text, to=fixed)
         return fixed
 
-    def _fix_tokens(self, text: str) -> str:
+    def _fix_tokens(self, text: str, *, context: str | None = None) -> str:
+        """``text`` with its codes, names and numbers fixed; ``context``: the sentence it ends (default: what was
+        released of it, then ``text``)."""
+        if self.numbers is not None:
+            text = self._fix_numbers(text, self.current + text if context is None else context)
         if self.renames:
             text = self._respell(text)
         if self.identifiers:
@@ -790,6 +910,19 @@ class AnswerGuard:
                 return near
 
             text = _IDENTIFIER.sub(swap, text)
+        return text
+
+    def _fix_numbers(self, text: str, context: str) -> str:
+        """Malformed numerals repaired, a minus the input never gives a figure dropped (``number_facts``)."""
+        assert self.numbers is not None
+        before_repair = len(text)
+        text, repairs = repair_numerals(text)
+        for before, after in repairs:
+            self._record("number", "repaired", before, to=after)
+        context = context[: max(0, len(context) - before_repair)] + text  # the sentence, ending with ``text``
+        text, flipped = unflip_signs(text, context, self.numbers)
+        for figure in flipped:
+            self._record("number", "sign_dropped", figure, to=figure[1:])
         return text
 
     def _record(self, check: str, action: str, text: str, **extra: str) -> None:

@@ -87,7 +87,16 @@ from ..providers.registry import Container
 from ..providers.storage import MetadataDB
 from ..providers.web_search import WebSearch
 from ..settings import Language, Settings
-from .answer_guard import AnswerGuard, Coverage, Unit, evidence_units, figures_in, identifiers_in, terms
+from .answer_guard import (
+    AnswerGuard,
+    Coverage,
+    Unit,
+    evidence_units,
+    figures_in,
+    identifiers_in,
+    number_facts,
+    terms,
+)
 from .base import InvalidInput
 from .canvas.conversation import (
     CanvasEdit,
@@ -993,7 +1002,7 @@ class ChatTurnService:
         prompt = self._prompt(turn, plan, history, p.sources, p.memory, p)
         short = plan.mode in ("conversation", "clarification")
         max_tokens = SHORT_REPLY_TOKENS[plan.language] if short else ANSWER_LENGTHS[turn.length].max_tokens
-        guard = self._guard(turn, p)
+        guard = self._guard(turn, p, prompt)
         guard.whole_sentences = short  # (a reply cut by the cap ends at its last whole sentence, never mid-word)
         stream = self._guarded_stream(prompt, plan.language, max_tokens, p, guard)
         model_parts: list[str] = []
@@ -1198,9 +1207,11 @@ class ChatTurnService:
             guard.restart()
             prompt = with_note(prompt, coverage_note(guard.coverage.retry_note))
 
-    def _guard(self, turn: Turn, p: _Progress) -> AnswerGuard:
+    def _guard(self, turn: Turn, p: _Progress, prompt: Sequence[LLMMessage] = ()) -> AnswerGuard:
         """The checks of this answer: coverage (a draft on screen, strong passages), live figures (a live question
-        answered without live data), codes in the sources, misheard names, the length of a short answer."""
+        answered without live data), codes in the sources, misheard names, numbers the model corrupts (against what
+        its ``prompt`` says: sources, history, question; every mode, conversation replies too), the length of a
+        short answer."""
         plan = p.plan
         documents = plan.mode in ("grounded", "mixed") and not p.web_sources
         figures = None
@@ -1227,6 +1238,7 @@ class ChatTurnService:
             max_sentences=SHORT_ANSWER_SENTENCES if short else None,
             lower_first=p.prefix is not None and plan.language == "en",
             after_disclaimer=p.prefix is not None,
+            numbers=number_facts(m.content for m in prompt),
         )
 
     @staticmethod

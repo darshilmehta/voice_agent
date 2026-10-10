@@ -388,3 +388,31 @@ async def test_a_short_answer_ends_at_the_sentence_that_reaches_the_word_limit(w
     assert words == 56 >= SHORT_ANSWER_WORDS and text.endswith("[S1].")  # two whole sentences, not three
     assert fakes.llm.closed  # generation stopped there
     assert saved(events).route["checks"][-1]["check"] == "length"
+
+
+# ------------------------------------------------------------------ polish round: numbers the model corrupts
+
+
+async def test_a_corrupted_number_is_repaired_in_a_grounded_answer(world, fakes):
+    service, chat_id = world
+    fakes.llm.route = {"intent": "document_qa", "query": "What was Valmora's revenue in FY24?"}
+    fakes.llm.reply = "Revenue was ₹ 7,-365 crore in FY24 [S1]."
+    events = await turn(service, chat_id, "What was Valmora's revenue in FY24?", modality="voice")
+    assert spoken(events) == "Revenue was ₹ 7,365 crore in FY24 [S1]."
+    assert saved(events).route["checks"] == [{"check": "number", "action": "repaired", "text": "7,-365", "to": "7,365"}]
+
+
+async def test_a_conversation_reply_keeps_the_historys_figure_unsigned(world, fakes):
+    """The last real run: "margin of -21.0%" in a reply that reused the history's figure (no sources)."""
+    service, chat_id = world
+    fakes.llm.route = {"intent": "document_qa", "query": "What was Valmora's revenue in FY24?"}
+    fakes.llm.reply = "Revenue was ₹ 7,365 crore in FY24 [S1]."
+    await turn(service, chat_id, "What was Valmora's revenue in FY24?", modality="voice")
+    fakes.llm.route = {"intent": "conversation", "query": None}
+    fakes.llm.reply = "Yes, revenue of ₹-7,365 crore is a strong result."
+    events = await turn(service, chat_id, "Wow, that sounds good", modality="voice")
+    assert saved(events).route["answer"] == "conversation"
+    assert spoken(events) == "Yes, revenue of ₹7,365 crore is a strong result."
+    assert saved(events).route["checks"] == [
+        {"check": "number", "action": "sign_dropped", "text": "-7,365", "to": "7,365"}
+    ]
