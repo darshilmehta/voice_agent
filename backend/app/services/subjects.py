@@ -266,6 +266,10 @@ _HINDI_FUNCTION_WORDS = wordset(
 )
 
 
+HINDI_FUNCTION_WORDS = _HINDI_FUNCTION_WORDS  # (question words, postpositions, auxiliaries, common verbs)
+DEVANAGARI_WORD = _DEVANAGARI_WORD
+
+
 def hindi_sound_key(word: str) -> str:
     """A Devanagari word's consonants as they sound, repeats merged: "टूलकिट" → "tlkt", "बैंक" and "बेख" → "pk", "ऋण"
     and "रिन" → "rn"."""

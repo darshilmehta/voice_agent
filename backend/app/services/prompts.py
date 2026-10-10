@@ -643,6 +643,19 @@ def names_note(renames: Mapping[str, str]) -> str:
     return f"(Speech recognition misheard: {pairs}. Always write them as the documents spell them.)"
 
 
+def heard_note(understood: str | None = None) -> str:
+    """A spoken question: speech recognition may have misheard its names and terms, and the answer repeated them
+    (polish round, item 3: "the Mora's", "Morris Revenue", "वाल्मोरा का एट्वाई चाँबीस में रेवेन योग"). ``understood``:
+    the router's reading of it in English, when the question shown is the transcript itself."""
+    lead = "(The question was transcribed from speech, so some of its words may be misheard"
+    if understood:
+        lead += f'; it was understood as: "{understood}"'
+    return (
+        f"{lead}. In the answer, call companies, documents, metrics and periods by the names the sources use, and "
+        "never repeat a word of the question that looks misheard.)"
+    )
+
+
 def coverage_note(evidence: str) -> str:
     """Told when the model's answer said the documents don't cover what its sources (or the chart on screen) give
     (quality round, item 1)."""

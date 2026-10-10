@@ -56,7 +56,7 @@ From Home press **Start a conversation** (or open a chat in the project) and tap
 |---|---|
 | "सूर्योदय योजना में आवेदन की अंतिम तिथि क्या है?" | "…अंतिम तिथि 30 नवंबर 2024 है।" |
 | "कुल कितनी सीटें हैं?" | "कुल 18,000 सीटें हैं।" |
-| "वालमोरा का एफवाई चौबीस में रेवेन्यू कितना था?" | ₹7,365 करोड़, in Hindi. Whisper often mishears the name and "FY24" here ("वाल्मुरा का एट्वाई चावीज…"); the figure stays right, but the answer may repeat the misheard words |
+| "वालमोरा का एफवाई चौबीस में रेवेन्यू कितना था?" | ₹7,365 करोड़, in Hindi. Whisper often mishears the name and "FY24" here ("वाल्मुरा का एट्वाई चावीज…"); the answer is told to name things as the documents do, so it should say "FY24" and "राजस्व"/"रेवेन्यू" rather than the misheard words (a 4B model still slips now and then) |
 | "answer in English please" | re-answers the last question in English, and stays English, also for Hindi questions |
 | "हिंदी में बताइए" | re-answers the previous question in Hindi, and stays Hindi, also for English questions |
 | "answer in English please" | back to English for the rest of the demo |

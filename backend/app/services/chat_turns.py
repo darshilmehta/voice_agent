@@ -153,6 +153,7 @@ from .prompts import (
     fiscal_year_end_note,
     general_system_prompt,
     general_user_prompt,
+    heard_note,
     insist_on_language,
     language_request_note,
     latest_period_note,
@@ -189,6 +190,7 @@ from .router import (
     asks_for_figure,
     fast_route,
     heard,
+    same_text,
 )
 from .sources import (
     Source,
@@ -200,7 +202,15 @@ from .sources import (
     strip_markers,
     trim_open_marker,
 )
-from .subjects import label_words, misheard_names, misheard_words, respell, subject_names
+from .subjects import (
+    DEVANAGARI_WORD,
+    HINDI_FUNCTION_WORDS,
+    label_words,
+    misheard_names,
+    misheard_words,
+    respell,
+    subject_names,
+)
 from .web_search import ToolEvent, WebSearchRun, WebSource
 
 if TYPE_CHECKING:
@@ -1765,6 +1775,9 @@ class ChatTurnService:
         web = p.web_sources if p is not None else []
         renames = p.renames if p is not None else {}
         query = respell(plan.query, renames)  # the documents' spelling of a misheard name (item 10)
+        reading = self._english_reading(turn, plan, sources, renames) if p is not None else None
+        if reading is not None:  # a garbled Hindi transcript: asked in the router's reading (polish round, item 3)
+            query = f'{reading} (asked in Hindi by voice; speech recognition heard: "{turn.text}")'
         if web and p is not None and p.web is not None:  # live data (§3.7): documents [S#] and web results [W#]
             # Page texts are long (prefill ~3 ms per token): the first answer has the snippets, a continuation the
             # pages, unless no continuation will come.
@@ -1822,9 +1835,47 @@ class ChatTurnService:
             system, question = clarification_system_prompt(language), turn.text
         else:
             system, question = conversation_system_prompt(language), turn.text
+        if turn.modality == "voice" and plan.mode in ("grounded", "mixed", "general"):
+            # Answers repeated misheard words ("Morris Revenue", "एट्वाई चाँबीस"); a question shown as transcribed
+            # gets the router's reading of it too (polish round, item 3)
+            understood = None if reading is not None else self._understood_as(turn, plan, renames)
+            question = f"{question}\n\n{heard_note(understood)}"
         if plan.language_request:
             question = f"{question}\n\n{language_request_note(language)}"
         return [*self._context(system, history, memory), LLMMessage("user", question)]
+
+    @classmethod
+    def _english_reading(
+        cls, turn: Turn, plan: TurnPlan, sources: Sequence[Source], renames: Mapping[str, str]
+    ) -> str | None:
+        """For a spoken Devanagari question most of whose words are in no source (Whisper's Hindi for English terms
+        and names: "वाल्मोरा का एट्वाई चाँबीस में रेवेन योग कितना था?"; the answer copied "एट्वाई चाँबीस में रेवेन योग"
+        even with the router's reading beside it), the router's English reading, to be asked instead; else None (a
+        Hindi question the Hindi sources spell out keeps its own words)."""
+        understood = cls._understood_as(turn, plan, renames)
+        if understood is None or turn.modality != "voice":
+            return None
+        words = [
+            w
+            for w in DEVANAGARI_WORD.findall(respell(turn.text, renames))
+            if len(w) >= 3 and w not in HINDI_FUNCTION_WORDS
+        ]
+        if not words:
+            return None
+        written = {w for s in sources for w in DEVANAGARI_WORD.findall(s.chunk.text)}
+        unknown = sum(1 for w in words if w not in written)
+        return understood if unknown * 2 >= len(words) else None
+
+    @staticmethod
+    def _understood_as(turn: Turn, plan: TurnPlan, renames: Mapping[str, str]) -> str | None:
+        """The router's English reading of a spoken question, when the answer is shown the transcript itself (a Hindi
+        or Hinglish question keeps its own words; "Valmora Kar FY-24 May Revenue Kitna Tha?" was answered "The
+        documents do not cover the revenue for Valmora Kar FY24 May" with "What was the revenue for Valmora in FY24?"
+        in hand). None when the question shown is already the router's (a rewrite) or there is no reading."""
+        english = plan.query_en
+        if not english or not same_text(plan.query, turn.text) or same_text(english, turn.text):
+            return None
+        return respell(english, renames)
 
     @staticmethod
     def _own_subject(turn: Turn, plan: TurnPlan, p: _Progress | None) -> list[str] | None:
