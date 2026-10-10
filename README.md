@@ -63,7 +63,7 @@ It starts what is missing, in order, and skips what is already running:
 - **Frontend:** started next.
 - **Browser:** Chrome opens at http://localhost:3000.
 
-The backend's and frontend's output is shown in that terminal and saved in `data/logs/`. **Ctrl+C** stops both, while Qdrant and Ollama keep running. The other commands:
+The backend's and frontend's output is shown in that terminal and saved in `data/logs/`. **Ctrl+C**, or closing that terminal, stops both, while Qdrant, SearXNG and Ollama keep running. The other commands:
 
 ```bash
 python3 start.py status
@@ -73,7 +73,7 @@ python3 start.py status
 python3 start.py stop
 ```
 
-`stop` stops Qdrant and SearXNG. The start options are `--stop-qdrant` (Ctrl+C also stops Qdrant and SearXNG), `--no-browser`, `-y` (accept downloads) and `--no-ollama-cap`. The steps below do the same by hand.
+`stop` works from any terminal and stops everything except Ollama: the backend and frontend (also ones left running by a `start.py` that is gone), then SearXNG and Qdrant. When Docker isn't running, it says so. The start options are `--stop-qdrant` (Ctrl+C also stops Qdrant and SearXNG), `--no-browser`, `-y` (accept downloads) and `--no-ollama-cap`. The steps below do the same by hand.
 
 ## Run (natively, recommended on a Mac)
 
