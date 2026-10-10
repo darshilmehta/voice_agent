@@ -11,6 +11,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type Re
 
 import { useBackend } from "@/lib/backend-context";
 
+import { HostNotices } from "./HostNotices";
 import { Icon } from "./Icon";
 import { Sidebar } from "./Sidebar";
 
@@ -115,6 +116,7 @@ export function AppFrame({ children }: { children: ReactNode }) {
             {appTitle}
           </Link>
         </header>
+        <HostNotices />
         <main id="main" className="main" tabIndex={-1}>
           {children}
         </main>

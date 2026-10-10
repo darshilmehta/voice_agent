@@ -49,12 +49,23 @@ export interface ProviderHealth {
   latency_ms: number | null;
 }
 
+/** Something about this machine the user should fix themselves (docs/DESIGN.md §8); the app never changes it. */
+export interface HostWarning {
+  code: string;
+  message: string;
+  /** The command that fixes it. */
+  fix: string;
+  docs: string;
+}
+
 export interface HealthReport {
   status: "ok" | "degraded";
   version: string;
   profile: string;
   strict_offline: boolean;
   providers: ProviderHealth[];
+  /** Additive: host warnings (Ollama's prompt cache uncapped). */
+  warnings?: HostWarning[];
 }
 
 // ------------------------------------------------------------------ projects, documents, chats, messages (§3.9)

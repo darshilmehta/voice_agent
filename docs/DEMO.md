@@ -6,7 +6,7 @@ A 15-minute walk through the MVP: a voice conversation with your documents in En
 
 Prerequisites (once): `scripts/setup/download_models.sh all`, Docker running, Ollama with `qwen3:4b-instruct`.
 
-**On a 16 GB Mac, cap Ollama's prompt cache first.** Without it, llama-server keeps every prompt's state in RAM (up to 8 GB): in the last check its footprint reached 8.3 GB and swap grew from 2.3 to 12.6 GB in about an hour of conversation, slowing everything (DESIGN §8). Lasts until reboot; DESIGN §9 shows how to make it permanent:
+**On a 16 GB Mac, cap Ollama's prompt cache first.** Without it, llama-server keeps every prompt's state in RAM (up to 8 GB): in the last check its footprint reached 8.3 GB and swap grew from 2.3 to 12.6 GB in about an hour of conversation, slowing everything (DESIGN §8). Lasts until reboot; DESIGN §9 shows how to make it permanent. If it isn't set, the backend logs a warning and the app shows a notice with this command:
 
 ```bash
 launchctl setenv LLAMA_ARG_CACHE_RAM 1024 && brew services restart ollama

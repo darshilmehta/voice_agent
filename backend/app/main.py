@@ -26,6 +26,7 @@ from .services.canvas.service import CanvasService
 from .services.chat_summary import ChatSummarizer
 from .services.chat_turns import wait_for_background
 from .services.document_pipeline import DocumentPipeline
+from .services.host_checks import HostChecks
 from .services.messages import add_agent_message_hook
 from .services.preload import ModelPreloader
 from .services.titles import TitleService
@@ -43,6 +44,7 @@ def create_app(
     *,
     preload_models: bool = True,
     auto_titles: bool = True,
+    host_checks: HostChecks | None = None,
 ) -> FastAPI:
     """Build the app. Configuration problems raise ConfigError here, before the server accepts traffic.
 
@@ -50,7 +52,9 @@ def create_app(
     startup, reported in ``/health``. Tests that build the real providers without models turn it off.
 
     ``auto_titles=False`` leaves chats with their placeholder title: no background LLM call follows the first answer
-    (tests that count LLM calls turn it off)."""
+    (tests that count LLM calls turn it off).
+
+    ``host_checks``: the read-only checks of this machine reported in ``/health`` (default: the real ones, §8)."""
     settings = settings or load_settings()
     configure_logging(settings)
     container = container or build_container(settings)
@@ -61,6 +65,9 @@ def create_app(
         await container.start()
         app.state.container = container
         app.state.preloader = ModelPreloader(container)
+        # Read-only checks of this machine (§8: Ollama's prompt cache), logged now and reported in /health.
+        app.state.host_checks = host_checks or HostChecks(settings)
+        await app.state.host_checks.warnings(log_them=True)
         if preload_models:
             app.state.preloader.start()
         app.state.document_pipeline = DocumentPipeline.from_container(container)

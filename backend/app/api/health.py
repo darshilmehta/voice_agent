@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from .. import __version__
 from ..providers.base import HealthStatus, ProviderHealth
+from ..services.host_checks import HostWarning
 from ..services.preload import PreloadReport
 
 router = APIRouter(tags=["health"])
@@ -23,6 +24,8 @@ class HealthReport(BaseModel):
     strict_offline: bool
     providers: list[ProviderHealth]
     preload: PreloadReport  # the conversation models loading in the background since startup
+    # Things about this machine the user should fix themselves (§8: Ollama's prompt cache uncapped); the app only looks
+    warnings: list[HostWarning] = []
 
 
 @router.get("/health", response_model=HealthReport)
@@ -36,4 +39,5 @@ async def health(request: Request) -> HealthReport:
         strict_offline=container.settings.strict_offline,
         providers=providers,
         preload=request.app.state.preloader.report(),
+        warnings=await checks.warnings() if (checks := getattr(request.app.state, "host_checks", None)) else [],
     )
