@@ -3,7 +3,7 @@
 
     python3 start.py            # start (or reuse) Ollama, Docker + Qdrant, backend, frontend; open Chrome
     python3 start.py status     # what is running
-    python3 start.py stop       # stop Qdrant (the backend and frontend stop with Ctrl+C in the start terminal)
+    python3 start.py stop       # stop everything it started: backend, frontend, SearXNG, Qdrant (Ollama keeps running)
 
 Steps (each one is skipped when it is already done):
   1. Ollama: start it if needed, with its prompt cache capped (LLAMA_ARG_CACHE_RAM, docs/DESIGN.md §8) so a 16 GB
@@ -16,7 +16,8 @@ Steps (each one is skipped when it is already done):
   6. Opens http://localhost:3000 in Chrome.
 
 The backend and frontend run as children of this script: their output is shown here (and written to data/logs/),
-and Ctrl+C stops both. Qdrant, SearXNG and Ollama keep running (`python3 start.py stop` stops Qdrant and SearXNG).
+and Ctrl+C (or closing the terminal) stops both. Qdrant, SearXNG and Ollama keep running; `python3 start.py stop` stops
+everything but Ollama, from any terminal, including a backend or frontend left running by a start.py that is gone.
 The config read is the backend's: $APP_CONFIG_FILE, else config/local.config.json. Standard library only.
 """
 
@@ -43,6 +44,7 @@ BACKEND_DIR = ROOT / "backend"
 FRONTEND_DIR = ROOT / "frontend"
 COMPOSE = ["docker", "compose", "-f", str(ROOT / "infra" / "docker-compose.yml")]
 LOG_DIR = ROOT / "data" / "logs"
+PID_FILE = ROOT / "data" / "run" / "start.pid"
 
 OLLAMA_URL = "http://127.0.0.1:11434"
 QDRANT_URL = "http://127.0.0.1:6333"
@@ -68,20 +70,26 @@ def _c(code: str, text: str) -> str:
     return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
 
 
+def say(text: str, end: str = "\n") -> None:
+    """print, but never fail: after the terminal closes (SIGHUP) stdout is gone and the shutdown must still run."""
+    with contextlib.suppress(OSError, ValueError):
+        print(text, end=end, flush=True)
+
+
 def step(text: str) -> None:
-    print(_c("1;36", f"==> {text}"), flush=True)
+    say(_c("1;36", f"==> {text}"))
 
 
 def ok(text: str) -> None:
-    print(_c("32", f"    ✓ {text}"), flush=True)
+    say(_c("32", f"    ✓ {text}"))
 
 
 def warn(text: str) -> None:
-    print(_c("33", f"    ! {text}"), flush=True)
+    say(_c("33", f"    ! {text}"))
 
 
 def fail(text: str) -> None:
-    print(_c("31", f"    ✗ {text}"), flush=True)
+    say(_c("31", f"    ✗ {text}"))
     sys.exit(1)
 
 
@@ -283,10 +291,26 @@ def start_searxng(cfg: dict) -> None:
         warn("SearXNG didn't become ready (docker logs gibberlink-searxng); answers needing live data will say so")
 
 
+def docker_running() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    try:
+        return subprocess.run(["docker", "info"], capture_output=True, timeout=10, check=False).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def stop_qdrant() -> None:
     step("Stopping Qdrant and SearXNG")
+    if not docker_running():
+        ok("Docker isn't running, so Qdrant and SearXNG are already stopped")
+        return
     # `stop`, never `down`: down acts on the whole compose project (infra/docker-compose.yml header).
-    run([*COMPOSE, "--profile", "websearch", "stop", "qdrant", "searxng"], check=False)
+    done = run([*COMPOSE, "--profile", "websearch", "stop", "qdrant", "searxng"], check=False, quiet=True)
+    if done.returncode == 0:
+        ok("Qdrant and SearXNG stopped")
+    else:
+        warn(f"docker compose stop failed: {(done.stderr or done.stdout).strip()}")
 
 
 # ---------------------------------------------------------------- model weights
@@ -337,7 +361,7 @@ class Child:
         for line in self.proc.stdout:
             self.log.write(line)
             self.log.flush()
-            print(f"{self.prefix} {line}", end="", flush=True)
+            say(f"{self.prefix} {line}", end="")  # keep draining the pipe even if the terminal is gone
 
     def alive(self) -> bool:
         return self.proc.poll() is None
@@ -358,6 +382,74 @@ def port_owner(port: int) -> str:
         return "another process"
     out = run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"], check=False, quiet=True).stdout.splitlines()
     return " ".join(out[1].split()[:2]) if len(out) > 1 else "another process"
+
+
+def listener_pid(port: int) -> int | None:
+    if shutil.which("lsof") is None:
+        return None
+    out = run(["lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"], check=False, quiet=True).stdout.split()
+    return int(out[0]) if out else None
+
+
+def process_cwd(pid: int) -> Path | None:
+    out = run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], check=False, quiet=True).stdout.splitlines()
+    return next((Path(line[1:]) for line in out if line.startswith("n")), None)
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def stop_group(pid: int, name: str) -> None:
+    """Stop ``pid``'s process group (uv + python, or npm + next), gently first."""
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return
+    target = pgid if pgid != os.getpgid(0) else None  # never signal our own group
+    for sig, wait_s in ((signal.SIGINT, 10), (signal.SIGTERM, 5), (signal.SIGKILL, 2)):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(target, sig) if target else os.kill(pid, sig)
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline and pid_alive(pid):
+            time.sleep(0.2)
+        if not pid_alive(pid):
+            ok(f"{name} stopped")
+            return
+    warn(f"couldn't stop the {name} (pid {pid})")
+
+
+def stop_apps() -> None:
+    """Stop the backend and frontend: through the start.py that runs them when it is alive, else directly (a start.py
+    that was killed or lost its terminal can leave them running). Only processes running from this repo are touched."""
+    step("Stopping the backend and frontend")
+    try:
+        owner = int(PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        owner = None
+    if owner and owner != os.getpid() and pid_alive(owner):
+        os.kill(owner, signal.SIGTERM)  # its shutdown stops its children in order
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and pid_alive(owner):
+            time.sleep(0.2)
+        if not pid_alive(owner):
+            ok(f"the running start.py (pid {owner}) stopped them")
+    for port, name, folder in ((3000, "frontend", FRONTEND_DIR), (8000, "backend", BACKEND_DIR)):
+        pid = listener_pid(port)
+        if pid is None:
+            ok(f"{name} not running")
+            continue
+        cwd = process_cwd(pid)
+        if cwd is None or not str(cwd).startswith(str(folder)):
+            warn(f"port {port} is used by {port_owner(port)}, not this project's {name}; left alone")
+            continue
+        stop_group(pid, name)
 
 
 def backend_health() -> dict:
@@ -435,6 +527,8 @@ def cmd_status() -> int:
         print(f"  {mark} {name:<9} {detail}")
 
     line("Ollama", http_up(f"{OLLAMA_URL}/api/tags"), f"prompt cache cap: {'set' if cache_cap_set() else 'NOT set'}")
+    docker = docker_running()
+    line("Docker", docker, "" if docker else "Docker Desktop isn't running (start.py opens it)")
     line("Qdrant", http_up(f"{QDRANT_URL}/readyz"), QDRANT_URL)
     url = searxng_url(load_config())
     if url:
@@ -455,19 +549,28 @@ def cmd_start(args) -> int:
     ollama_child = None
 
     def shutdown(*_):
-        print(_c("1;36", "\n==> Stopping backend and frontend…"), flush=True)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)  # one shutdown, even if Ctrl+C is pressed again
+        say(_c("1;36", "\n==> Stopping backend and frontend…"))
         for c in reversed(children):
             c.stop()
         if ollama_child is not None and ollama_child.poll() is None:
-            os.killpg(ollama_child.pid, signal.SIGTERM)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(ollama_child.pid, signal.SIGTERM)
         if args.stop_qdrant:
             stop_qdrant()
+        with contextlib.suppress(OSError):
+            if PID_FILE.read_text().strip() == str(os.getpid()):
+                PID_FILE.unlink()
         kept = "Ollama keeps" if args.stop_qdrant else "Qdrant, SearXNG and Ollama keep"
-        print(f"    stopped. {kept} running (python3 start.py stop stops Qdrant and SearXNG).", flush=True)
-        sys.exit(0)
+        say(f"    stopped. {kept} running (python3 start.py stop stops everything but Ollama).")
+        os._exit(0)  # don't wait for the output threads
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGHUP, shutdown)  # the terminal was closed: don't leave the backend and frontend orphaned
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
 
     cfg = load_config()
     ollama_child = start_ollama(args, cfg)
@@ -479,11 +582,13 @@ def cmd_start(args) -> int:
 
     step(f"Ready: {APP_URL}")
     print("    Open it in Chrome and allow the microphone. Demo script: docs/DEMO.md.", flush=True)
-    print("    Ctrl+C here stops the backend and frontend.", flush=True)
+    print("    Ctrl+C here (or `python3 start.py stop` anywhere) stops the backend and frontend.", flush=True)
     if not args.no_browser:
         open_browser()
 
     if not children:  # everything was already running
+        with contextlib.suppress(OSError):
+            PID_FILE.unlink()
         return 0
     while all(c.alive() for c in children):
         time.sleep(1)
@@ -508,7 +613,9 @@ def main() -> int:
     if args.command == "status":
         return cmd_status()
     if args.command == "stop":
+        stop_apps()
         stop_qdrant()
+        say("    Ollama keeps running (it is shared; `brew services stop ollama` stops it).")
         return 0
     return cmd_start(args)
 
