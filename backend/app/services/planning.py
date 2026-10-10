@@ -176,6 +176,19 @@ def _corrected_mode(history: Sequence[Message]) -> AnswerMode:
     return "grounded"
 
 
+def said_again(req: RouteRequest) -> bool:
+    """The previous reply was the "say it again" line and was heard in full: another garbled transcript gets nothing
+    (a TV keeps talking). Cut short, it is said again (last round, item 6: the reversed Hindi clip went on over it, so
+    the user heard none of it, and the next part got only a silent "Not understood")."""
+    last = req.last_answer
+    if last is None:
+        return False
+    route = last.route or {}
+    if route.get("answer") != "ack" or route.get("intent") != "clarification" or route.get("stopped"):
+        return False
+    return last.heard_text is None or last.heard_text.strip() == last.text.strip()
+
+
 _MODES: dict[Intent, tuple[AnswerMode, bool]] = {
     "document_qa": ("grounded", True),
     "mixed": ("mixed", True),
@@ -214,11 +227,7 @@ def policy(
     mode, search = _MODES[intent]
     ack: AckKind | None = None
     if decision.reply == "repeat":  # a garbled transcript: "Sorry, I didn't catch that…", once (then nothing)
-        last = (req.last_answer.route or {}) if req.last_answer is not None else {}
-        mode, ack = (
-            ("silent" if last.get("answer") == "ack" and last.get("intent") == "clarification" else "ack"),
-            "repeat",
-        )
+        mode, ack = ("silent" if said_again(req) else "ack"), "repeat"
     elif intent == "backchannel":
         last = req.last_answer
         if last is not None and (last.route or {}).get("answer") == "ack":

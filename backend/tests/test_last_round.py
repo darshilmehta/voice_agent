@@ -5,17 +5,20 @@ question (item 1), a rewrite that names another document's subject (item 4), Hin
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
+from app.domain.projects import Message
 from app.providers.retrieval import IndexedChunk
 from app.services.chat_turns import AgentMessageEvent, ChatTurnService, DeltaEvent, wait_for_background
 from app.services.chats import ChatService
+from app.services.planning import policy, said_again
 from app.services.projects import ProjectService
 from app.services.prompts import ACK_TEXTS, abstention
 from app.services.retrieval import RetrievalService
-from app.services.router import RouteRequest, RouterProposal, heuristic_topic, rewrite_loses, validate
+from app.services.router import RouteRequest, RouterProposal, fast_route, heuristic_topic, rewrite_loses, validate
 
 from .conftest import add_document
 from .fakes import make_chunk, vector_for
@@ -382,3 +385,35 @@ async def test_a_hindi_clarification_gets_three_times_the_tokens_and_ends_at_a_w
     events = await turn(service, chat_id, "tell me more about that", modality="voice", language="en")
     assert fakes.llm.calls[-1]["max_tokens"] == 96
     assert saved(events).text == "Do you mean the eligibility rules?"
+
+
+# ------------------------------------------------------------------ item 6: the say-again line after garbled speech
+
+SAY_AGAIN = ACK_TEXTS["repeat"]["hi"]
+
+
+def message(role: str, text: str, *, heard: str | None = None, seq: int, **route: Any) -> Message:
+    return Message(
+        id=f"msg_{seq}", chat_id="cht_1", seq=seq, role=role, modality="voice", text=text, heard_text=heard,
+        language="hi", citations=[], route=route or None, latency=None, created_at=datetime(2026, 10, 10, tzinfo=UTC),
+    )  # fmt: skip
+
+
+def garbled_after(last: Message) -> RouteRequest:
+    history = [message("user", "आब आब आब आब आब", seq=1), last]
+    return RouteRequest("ससस बवबवबवब", "hi", history, garbled=True)  # type: ignore[arg-type]
+
+
+def test_garbled_speech_after_a_say_again_that_was_cut_is_asked_again():
+    """The last real run: reversed Hindi speech left the agent silent ("Not understood", no audio): its first part got
+    the say-again line, the rest went on over it and cut it, and the rest got nothing because "that was just said"."""
+    heard = message("agent", SAY_AGAIN, seq=2, answer="ack", intent="clarification")
+    cut = message("agent", SAY_AGAIN, heard="माफ़ कीजिए,", seq=2, answer="ack", intent="clarification", stopped=True)
+    unheard = message("agent", SAY_AGAIN, heard="", seq=2, answer="ack", intent="clarification")
+    assert said_again(garbled_after(heard))  # heard in full: nothing more (a TV keeps talking)
+    for last in (cut, unheard):
+        assert not said_again(garbled_after(last))
+        decision = fast_route(garbled_after(last))
+        assert decision is not None and decision.reply == "repeat"
+        p = policy(decision, garbled_after(last), has_documents=True, retrieval_enabled=True)
+        assert (p.mode, p.ack) == ("ack", "repeat")

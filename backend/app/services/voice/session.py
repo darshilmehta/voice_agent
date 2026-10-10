@@ -85,6 +85,7 @@ from ..chat_turns import (
 from ..chats import ChatService
 from ..language import script_language
 from ..messages import MessageService
+from ..router import STOP_PHRASES, normalize
 from .fillers import VISUAL_TAILS, filler_audio
 from .protocol import (
     CLOSE_CHAT_NOT_FOUND,
@@ -222,6 +223,11 @@ class AgentTurn:
     visual_released: bool = False  # the answer's first audio is out: its visual's events go out as they come
 
 
+def is_stop_phrase(text: str) -> bool:
+    """A transcript that only asks the agent to stop ("Stop.", "stop it", "bas karo", "रुको")."""
+    return normalize(text) in STOP_PHRASES
+
+
 @dataclass(eq=False)
 class PendingBargeIn:
     agent: AgentTurn
@@ -231,6 +237,7 @@ class PendingBargeIn:
     transcript: str | None = None
     backchannel: bool | None = None
     real_words: int = 0
+    stop_words: bool = False  # the transcript is a stop phrase
     deadline_passed: bool = False
     cap_passed: bool = False
     transcribing: int = 0  # transcriptions of the interrupting speech still running
@@ -1325,6 +1332,7 @@ class VoiceSession:
         pending.transcript = text
         pending.backchannel = is_backchannel(text, self.barge_in.backchannel_max_words)
         pending.real_words = real_words(text)
+        pending.stop_words = is_stop_phrase(text)
 
     async def _evaluate(self, pending: PendingBargeIn) -> None:
         if self._pending is not pending:
@@ -1339,6 +1347,7 @@ class VoiceSession:
             real_words=pending.real_words,
             cap_passed=pending.cap_passed,
             transcribing=pending.transcribing > 0,
+            stop_words=pending.stop_words,
         )
         verdict = barge_in_verdict(
             evidence, min_speech_ms=self.vad_settings.min_speech_ms, is_backchannel=pending.backchannel
@@ -1397,7 +1406,8 @@ class VoiceSession:
                 await self._evaluate(pending)
             return
         text = transcript.text
-        if is_backchannel(text, self.barge_in.backchannel_max_words) or real_words(text) < 2:
+        stop = is_stop_phrase(text)  # "Stop." over the answer: stopped now, not when the utterance ends
+        if not stop and (is_backchannel(text, self.barge_in.backchannel_max_words) or real_words(text) < 2):
             return
         if self._answer_heard(agent, None):  # complete and heard: the end of the utterance ends the turn (§3.7)
             return
