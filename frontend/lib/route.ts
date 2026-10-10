@@ -204,6 +204,29 @@ export function visualIdOf(m: Routed): string | null {
   return typeof id === "string" && id ? id : null;
 }
 
+/** How an answer's visual took the place of a panel showing the same data (`route.visual_reuse`, docs/DESIGN.md
+ * §12.1 "A visual already on the canvas"): "same" / "covered" (it was on screen already: nothing was added) or
+ * "extends" (the panel now shows more). Null for a visual that was added. */
+export type VisualReuse = "same" | "covered" | "extends";
+
+export interface VisualPlacement {
+  replaces: string;
+  reuse: VisualReuse;
+}
+
+export function visualReuseOf(m: Routed): VisualReuse | null {
+  const reuse = m.route?.visual_reuse;
+  return reuse === "same" || reuse === "covered" || reuse === "extends" ? reuse : null;
+}
+
+/** The placement a `visual {phase: "ready"}` event carries (`replaces`, `reuse`), or null for a visual that was added. */
+export function placementIn(data: unknown): VisualPlacement | null {
+  if (!data || typeof data !== "object") return null;
+  const { replaces, reuse } = data as { replaces?: unknown; reuse?: unknown };
+  if (typeof replaces !== "string" || (reuse !== "same" && reuse !== "covered" && reuse !== "extends")) return null;
+  return { replaces, reuse };
+}
+
 /** The canvas edit a reply applied (`route.canvas_edit`: "make it a bar chart", "put FY23 next to it"), or null. */
 export interface CanvasEditNote {
   op: string;
@@ -234,9 +257,14 @@ export function visualUpdatedOf(m: Routed): boolean {
  * added a visual has one: a canvas edit's reply gets the `visual` events of the panel it rebuilt in place, which isn't
  * a new chart, so it is returned as it is.
  */
-export function withVisual(m: Message, visualId: string): Message {
+export function withVisual(m: Message, visualId: string, placement: VisualPlacement | null = null): Message {
   if (canvasEditOf(m) !== null) return m;
-  return { ...m, route: { ...(m.route ?? {}), visual_id: visualId, visual_status: "ready" } };
+  const route: Record<string, unknown> = { ...(m.route ?? {}), visual_id: visualId, visual_status: "ready" };
+  if (placement) {
+    route.visual_replaces = placement.replaces;
+    route.visual_reuse = placement.reuse;
+  }
+  return { ...m, route };
 }
 
 /** The answer's visual was withdrawn after it was shown (a draft the planner found no table for, §12.1): no "Chart

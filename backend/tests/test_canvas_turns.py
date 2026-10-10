@@ -108,6 +108,23 @@ def test_a_requested_visuals_draft_arrives_with_the_answers_first_delta(app_with
     assert 'You may begin with "The chart shows' in prompt and VISUAL_NOTE not in prompt
 
 
+def test_the_same_chart_asked_again_is_on_the_canvas_once(app_with_report):
+    """§12.1 "A visual already on the canvas" (polish round): the demo's fact questions left six identical KPI
+    panels; a turn whose visual shows what a panel already shows takes its place, and its message says so."""
+    api, chat_id, _, fakes = app_with_report
+    Script(planner=choose("line", "Revenue")).install(fakes.llm)
+    fakes.llm.reply = "Revenue rose every quarter, to 1,933 in Q4 FY24 [S4]."
+    first = next(d for e, d in ask(api, chat_id, SHOW) if e == "visual" and d["phase"] == "ready")
+    events = ask(api, chat_id, SHOW)
+    again = next(d for e, d in events if e == "visual" and d["phase"] == "ready")
+    assert again["replaces"] == first["visual_id"] and again["reuse"] == "same"
+    assert [v["id"] for v in canvas(api, chat_id)] == [again["visual_id"]]
+    route = messages(api, chat_id)[-1]["route"]
+    assert route["visual_id"] == again["visual_id"]
+    assert route["visual_replaces"] == first["visual_id"] and route["visual_reuse"] == "same"
+    assert "visual_replaces" not in messages(api, chat_id)[1]["route"]  # the first one was added
+
+
 async def timed_turn(api, text: str, chat_id: str) -> tuple[list[tuple[float, Any]], float]:
     """A turn's events with when each came (s from the start), and when the planner was called."""
     service = ChatTurnService.from_container(api.app.state.container, canvas=api.app.state.canvas)

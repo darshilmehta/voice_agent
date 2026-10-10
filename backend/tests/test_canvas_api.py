@@ -388,7 +388,103 @@ def test_prepare_visual_yields_contract_events(app, fakes):
     assert refined.visual_id == draft.visual_id and refined.visual.kind == "line"
     assert "D1" in labels["prompt"] and "Spoken answer: Revenue rose." in labels["prompt"]
     panels = app.get(f"/api/chats/{c}/canvas").json()["panels"]
-    assert [v["kind"] for v in panels] == ["line", "line"]  # the first question's and this one: one panel each
+    # The planner drew the first question's chart again: that older copy goes, the chart is on the canvas once
+    first = ready.visual.id
+    assert refined.replaces == first and refined.reuse == "same"
+    assert [(v["id"], v["kind"]) for v in panels] == [(refined.visual_id, "line")]
+
+
+# ------------------------------------------------------------------ one panel per figure (§12.1, polish round)
+
+
+def _ready(events) -> VisualEvent:
+    return next(e for e in reversed(events) if isinstance(e, VisualEvent) and e.phase == "ready")
+
+
+def test_the_same_chart_asked_again_takes_the_old_panels_place(app, fakes):
+    p, _, _ = ready_report(app)
+    c = chat(app, p)
+
+    async def ask(question):
+        return [e async for e in canvas(app).prepare_visual(c, question, language="en")]
+
+    first = _ready(run(app, ask, "Show me the financial highlights"))
+    assert first.visual is not None and first.visual.kind == "kpi" and first.replaces is None
+    other = _ready(run(app, ask, "Show me revenue by quarter"))  # another chart: added
+    calls = len(fakes.llm.json_calls)
+    again = _ready(run(app, ask, "What are the headline numbers?"))  # the highlights again (the demo's KPI panels)
+    assert again.replaces == first.visual_id and again.reuse == "same"
+    panels = app.get(f"/api/chats/{c}/canvas").json()["panels"]
+    assert [(v["id"], v["kind"]) for v in panels] == [(again.visual_id, "kpi"), (other.visual_id, "line")]
+    assert len(fakes.llm.json_calls) == calls  # on the canvas already, as the user saw it: no planner
+
+
+def test_a_figure_already_on_screen_adds_no_kpi_panel(app):
+    p, _, _ = ready_report(app)
+    c = chat(app, p)
+
+    async def ask(question):
+        return [e async for e in canvas(app).prepare_visual(c, question, language="en")]
+
+    whole = _ready(run(app, ask, "Show me the financial highlights"))
+    one = _ready(run(app, ask, "Show me the headline revenue"))  # one tile, already among the highlights
+    assert one.reuse == "covered" and one.replaces == whole.visual_id
+    assert one.visual is not None and len(one.visual.tiles) == len(whole.visual.tiles)  # the panel as it was
+    panels = app.get(f"/api/chats/{c}/canvas").json()["panels"]
+    assert [v["id"] for v in panels] == [one.visual_id]
+
+
+def test_a_chart_that_shows_more_replaces_the_one_it_extends(app):
+    p, _, _ = ready_report(app)
+    c = chat(app, p)
+
+    async def ask(question):
+        return [e async for e in canvas(app).prepare_visual(c, question, language="en")]
+
+    one = _ready(run(app, ask, "Show me the headline revenue"))
+    whole = _ready(run(app, ask, "Show me the financial highlights"))
+    assert whole.reuse == "extends" and whole.replaces == one.visual_id
+    assert whole.visual is not None and len(whole.visual.tiles) > len(one.visual.tiles)
+    assert [v["id"] for v in app.get(f"/api/chats/{c}/canvas").json()["panels"]] == [whole.visual_id]
+
+
+def test_kpi_tiles_of_the_same_table_go_on_one_panel(app):
+    """The real run: the highlights' revenue, EBITDA and margin, then revenue, EBITDA and net profit, made two
+    "Financial highlights" panels; now one panel holds the tiles of both."""
+    p, _, _ = ready_report(app)
+    c = chat(app, p)
+
+    async def ask(question):
+        return [e async for e in canvas(app).prepare_visual(c, question, language="en")]
+
+    first = _ready(run(app, ask, "Show me the headline revenue and EBITDA"))
+    second = _ready(run(app, ask, "Show me the headline EBITDA margin and number of employees"))
+    assert first.visual is not None and second.visual is not None
+    assert len(first.visual.tiles) == 2
+    assert second.replaces == first.visual_id and second.reuse == "extends"
+    labels = [t.label for t in second.visual.tiles]
+    assert len(labels) == 4 and labels[:2] == [t.label for t in first.visual.tiles]  # the older tiles first
+    assert [v["id"] for v in app.get(f"/api/chats/{c}/canvas").json()["panels"]] == [second.visual_id]
+
+
+def test_pinned_panels_stay_and_a_withdrawn_visual_gives_its_place_back(app):
+    p, _, _ = ready_report(app)
+    c = chat(app, p)
+
+    async def ask(question):
+        return [e async for e in canvas(app).prepare_visual(c, question, language="en")]
+
+    first = _ready(run(app, ask, "Show me the financial highlights"))
+    app.post(f"/api/chats/{c}/canvas/ops", json={"op": "pin", "visual_id": first.visual_id})
+    second = _ready(run(app, ask, "What are the headline numbers?"))
+    assert second.replaces is None  # a pinned panel is the user's: the new one is added beside it
+    assert len(app.get(f"/api/chats/{c}/canvas").json()["panels"]) == 2
+
+    third = _ready(run(app, ask, "Show me the financial highlights"))
+    assert third.replaces == second.visual_id
+    run(app, canvas(app).remove_visual, c, third.visual_id)  # its answer abstained: withdrawn
+    panels = app.get(f"/api/chats/{c}/canvas").json()["panels"]
+    assert [v["id"] for v in panels] == [first.visual_id, second.visual_id]  # the panel it replaced is back
 
 
 def test_prepare_visual_stays_quiet_for_plain_questions(app, fakes):

@@ -74,7 +74,7 @@ From Home press **Start a conversation** (or open a chat in the project) and tap
 | "Show Zephyra's revenue by segment" | a donut: Freight Services ₹2,609 cr, Contract Logistics ₹1,896 cr, Digital Services ₹481 cr |
 | "remove it" / "हटा दो" | "Done." — the newest chart goes |
 
-Every number on a chart comes from a cell of a document table (or a labelled calculation); "View as table" shows the figures. Fact answers with a headline figure also add a small KPI panel each (the English table above leaves several "Financial highlights" panels); "remove it" clears the newest.
+Every number on a chart comes from a cell of a document table (or a labelled calculation); "View as table" shows the figures. Fact answers with a headline figure may add a small KPI panel, once: a chart whose figures are already on the canvas isn't added again (the transcript says "Already on the canvas" instead of "Chart added"); "remove it" clears the newest.
 
 ## 5. Revisit
 

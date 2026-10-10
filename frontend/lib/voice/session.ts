@@ -27,7 +27,7 @@
 
 import type { Language, Message, PublicVoiceInput, SourcesPayload } from "../api";
 import { publishRawCanvasEvent } from "../canvas/events";
-import { withVisual, withoutVisual } from "../route";
+import { placementIn, withVisual, withoutVisual, type VisualPlacement } from "../route";
 import { applyTool, endSearch, NO_WEB, parseTool, type WebSearchState, type WebTurn } from "../web-search";
 import { MIC_ERROR_TEXT, MicError, openMic, voiceSupport, type MicCapture, type MicErrorKind } from "./capture";
 import { DENOISE_SAMPLE_RATE } from "./denoise";
@@ -227,7 +227,7 @@ export class VoiceSession {
   /** Turns that were cut off (stop, barge-in, replaced): whatever else arrives for them is ignored. */
   private cutTurns = new Set<number>();
   /** Turns whose visual is ready (§12.1), by turn id: their answers say "Chart added". */
-  private visualOfTurn = new Map<number, string>();
+  private visualOfTurn = new Map<number, { id: string; placement: VisualPlacement | null }>();
   /** Stop was pressed while the answer had no id yet (or before the question was saved): it cancels the turn that arrives. */
   private stopPending = false;
   /** The socket dropped: the next `ready` is a new server session. */
@@ -793,8 +793,8 @@ export class VoiceSession {
         this.stopPending = false;
         const turn = this.snap.turn ?? freshTurn(null);
         // Its visual may have become ready first (§12.1): the saved message didn't know yet ("Chart added").
-        const visualId = turn.id !== null ? this.visualOfTurn.get(turn.id) : undefined;
-        const m = visualId ? withVisual(msg.message, visualId) : msg.message;
+        const visual = turn.id !== null ? this.visualOfTurn.get(turn.id) : undefined;
+        const m = visual ? withVisual(msg.message, visual.id, visual.placement) : msg.message;
         // The server sends an answer again, with the same id, when a complete answer is cut during playback (it now
         // has `heard_text`): that updates the turn's message and the transcript in place.
         const resent = turn.message !== null && turn.message.id === m.id;
@@ -836,7 +836,7 @@ export class VoiceSession {
         // that was cut; a visual that is ready only marks its answer in the transcript ("Chart added").
         publishRawCanvasEvent(this.opts.chatId, msg.type, msg);
         if (msg.type === "visual" && msg.phase === "ready" && typeof msg.turn_id === "number") {
-          this.noteVisual(msg.turn_id, msg.visual_id);
+          this.noteVisual(msg.turn_id, msg.visual_id, placementIn(msg));
         } else if (msg.type === "visual" && msg.phase === "failed" && typeof msg.turn_id === "number") {
           this.forgetVisual(msg.turn_id, msg.visual_id); // a draft shown, then withdrawn
         }
@@ -851,19 +851,19 @@ export class VoiceSession {
   }
 
   /** A turn's visual became ready: remember it, and mark the turn's saved answer if it is there already. */
-  private noteVisual(turnId: number, visualId: string): void {
-    this.visualOfTurn.set(turnId, visualId);
+  private noteVisual(turnId: number, visualId: string, placement: VisualPlacement | null): void {
+    this.visualOfTurn.set(turnId, { id: visualId, placement });
     const turn = this.snap.turn;
     const answer = turn && turn.id === turnId ? turn.message : null;
     if (turn && answer) {
-      const marked = withVisual(answer, visualId);
+      const marked = withVisual(answer, visualId, placement);
       this.set({ messages: this.withMessage(marked), turn: { ...turn, message: marked } });
     }
   }
 
   /** A turn's visual was withdrawn after it was shown (§12.1): its answer no longer says "Chart added". */
   private forgetVisual(turnId: number, visualId: string): void {
-    if (this.visualOfTurn.get(turnId) !== visualId) return;
+    if (this.visualOfTurn.get(turnId)?.id !== visualId) return;
     this.visualOfTurn.delete(turnId);
     const messages = this.snap.messages.map((m) => withoutVisual(m, visualId));
     const turn = this.snap.turn;

@@ -309,6 +309,65 @@ class CanvasStore(Service):
             await s.flush()
             return _visual(row)
 
+    _ROW_FIELDS = (
+        "id",
+        "project_id",
+        "chat_id",
+        "position",
+        "pinned",
+        "kind",
+        "document_ids",
+        "spec",
+        "visual",
+        "created_at",
+        "updated_at",
+    )
+
+    async def take_over(
+        self, chat_id: str, old_id: str, visual: Visual, spec: dict[str, Any], document_ids: Sequence[str]
+    ) -> tuple[Visual, dict[str, Any]] | None:
+        """A turn's visual in the place of an unpinned panel that shows the same data (``reuse.py``): the old row goes
+        and ``visual`` (its own id) takes its position. Returns the stored visual and a snapshot of the old row
+        (``restore`` puts it back if the turn's visual is withdrawn), or None when the old panel is gone or was pinned
+        meanwhile (the caller then adds the visual)."""
+        async with self.db.session() as s:
+            old = await s.get(orm.CanvasVisual, old_id)
+            if old is None or old.chat_id != chat_id or old.pinned:
+                return None
+            snapshot = {name: getattr(old, name) for name in self._ROW_FIELDS}
+            now = self.now()
+            row = orm.CanvasVisual(
+                id=visual.id,
+                project_id=old.project_id,
+                chat_id=chat_id,
+                position=old.position,
+                pinned=False,
+                kind=visual.kind,
+                document_ids=list(document_ids),
+                spec=spec,
+                visual=visual.model_dump(mode="json"),
+                created_at=now,
+                updated_at=now,
+            )
+            await s.delete(old)
+            await s.flush()
+            s.add(row)
+            await s.flush()
+            return _visual(row), snapshot
+
+    async def restore(self, chat_id: str, snapshot: dict[str, Any]) -> None:
+        """Put back a panel ``take_over`` replaced (at its old position, or the end); nothing if its chat is gone or
+        it is there already."""
+        async with self.db.session() as s:
+            if await s.get(orm.Chat, chat_id) is None or await s.get(orm.CanvasVisual, snapshot["id"]) is not None:
+                return
+            rows = await self._chat_rows(s, chat_id)
+            row = orm.CanvasVisual(**snapshot)
+            s.add(row)
+            rows.insert(min(int(snapshot["position"]), len(rows)), row)
+            self._renumber(rows)
+            await s.flush()
+
     async def remove_unpinned(self, chat_id: str) -> list[Visual]:
         """Clear a chat's canvas except its pinned panels; returns what is left."""
         async with self.db.session() as s:

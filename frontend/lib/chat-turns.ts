@@ -21,7 +21,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { errorMessage, isAbort, type Api, type Language, type Message, type SourcesPayload, type StreamFailure } from "./api";
 import { publishRawCanvasEvent } from "./canvas/events";
 import { splitCitations } from "./citations";
-import { withVisual, withoutVisual } from "./route";
+import { placementIn, withVisual, withoutVisual } from "./route";
 import { applyTool, endSearch, NO_WEB, type WebTurn } from "./web-search";
 
 export type TurnPhase = "sending" | "searching" | "answering" | "done" | "failed" | "stopped";
@@ -121,7 +121,8 @@ export function useChatTurns(api: Api, chatId: string, onSettled?: () => void, o
           if (ev.type === "canvas") {
             publishRawCanvasEvent(chatId, ev.name, ev.data); // the canvas follows visuals as they are prepared (lib/canvas)
             const visualId = readyVisualId(ev.name, ev.data);
-            if (visualId) update(key, (t) => (t.agent ? { ...t, agent: withVisual(t.agent, visualId) } : t)); // "Chart added"
+            const placement = visualId ? placementIn(ev.data) : null;
+            if (visualId) update(key, (t) => (t.agent ? { ...t, agent: withVisual(t.agent, visualId, placement) } : t)); // "Chart added"
             // a draft shown, then withdrawn (the planner found no table for it): no "Chart added" any more
             const gone = failedVisualId(ev.name, ev.data);
             if (gone) update(key, (t) => (t.agent ? { ...t, agent: withoutVisual(t.agent, gone) } : t));

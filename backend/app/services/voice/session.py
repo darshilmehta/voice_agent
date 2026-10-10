@@ -1111,6 +1111,8 @@ class VoiceSession:
             visual = agent.stop.visual
             if visual is not None and visual.status != "ready":
                 return  # withdrawn meanwhile: nothing to announce
+            if event.reuse in ("same", "covered"):
+                return  # it was on screen already (§12.1): "It's on screen now." would announce nothing new
             if visual is not None and visual.trace.draft == "refine" and not visual.done:
                 # A draft the planner is still to check (it may withdraw it): the tail waits for its verdict, so it
                 # never announces a visual that goes. (Until the visual is done, not only until the planner has
