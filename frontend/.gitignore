@@ -3,5 +3,6 @@ next-env.d.ts
 *.tsbuildinfo
 AGENTS.md
 
-# Voice: the browser VAD and ONNX runtime, copied from node_modules by scripts/copy-vad-assets.mjs
+# Voice: the browser VAD and ONNX runtime, and the denoiser, copied from node_modules by scripts/copy-vad-assets.mjs
 /public/vad/
+/public/denoise/

@@ -10,7 +10,9 @@
  *           over it on narrow screens); the stage keeps its mic either way
  *
  * Keys: Space or Enter on the focused mic button starts and ends the conversation; Esc steps back one level (closes
- * the transcript when it covers the stage, else stops the answer in progress, else ends the conversation).
+ * the transcript when it covers the stage, else stops the answer in progress, else ends the conversation). With
+ * "Hold to talk" on (§3.10, for noisy rooms; remembered in this browser), holding Space (outside a text field) or the
+ * talk button is the user's turn, and pressing it stops the agent.
  */
 
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -20,6 +22,7 @@ import { useBackend } from "@/lib/backend-context";
 import { citedIds, toSourceRefs, type SourceRef } from "@/lib/citations";
 import { LIVE_NOTE_TEXT, answerKindOf, basisOf, isFixedReply, liveNoteOf, showsSources, sourcesToShow } from "@/lib/route";
 import { consumeAutoStart } from "@/lib/voice/autostart";
+import { saveInputMode } from "@/lib/voice/input-mode";
 import { MIC_ERROR_TEXT, voiceSupport, type MicErrorKind } from "@/lib/voice/capture";
 import { searchingNow, type VoiceSession, type VoiceSnapshot } from "@/lib/voice/session";
 
@@ -45,13 +48,14 @@ function stateText(s: VoiceSnapshot, unavailable: boolean): string {
       if (s.needsGesture) return "Tap the microphone to start";
       return s.turn || s.messages.length > 0 ? "Paused · tap the microphone to talk" : "Tap the microphone to talk";
     case "live":
+      if (s.pttDown) return "Listening · release to send";
       if (s.ducked && s.audible) return "Interrupted · listening";
       // The server stays in `speaking` through the silent search after the filler: the label follows the search then.
       if (!s.audible && searchingNow(s)) return "Searching the web…";
       if (s.audible || s.serverState === "speaking") return "Speaking";
       if (s.serverState === "thinking") return "Thinking…";
       if (s.serverState === "interrupted") return "Interrupted · listening";
-      return "Listening…";
+      return s.inputMode === "ptt" ? "Hold Space or the talk button to speak" : "Listening…";
   }
 }
 
@@ -257,6 +261,44 @@ export function VoiceChat({
   }, [panelOpen]);
 
   const agentBusy = live && (snapshot.audible || snapshot.serverState === "thinking" || snapshot.serverState === "speaking");
+
+  // Hold-to-talk (§3.10): Space held anywhere but a text field is the talk button. Its keyup would also click a
+  // focused button (the mic would end the conversation), so both are consumed while the conversation is live.
+  const ptt = snapshot.inputMode === "ptt";
+  const phaseLive = snapshot.phase === "live";
+  useEffect(() => {
+    if (!ptt || !phaseLive) return;
+    const isSpace = (e: KeyboardEvent) => e.code === "Space" || e.key === " ";
+    const inText = (e: KeyboardEvent) => {
+      const target = e.target instanceof Element ? e.target : null;
+      return !!target?.closest("textarea, input, select, [contenteditable=true]");
+    };
+    const down = (e: KeyboardEvent) => {
+      if (!isSpace(e) || inText(e) || e.ctrlKey || e.metaKey || e.altKey) return;
+      e.preventDefault();
+      if (!e.repeat) session.pttDown();
+    };
+    const up = (e: KeyboardEvent) => {
+      if (!isSpace(e) || inText(e)) return;
+      e.preventDefault();
+      session.pttUp();
+    };
+    const release = () => session.pttUp(); // the window lost focus with Space held: its keyup never comes
+    document.addEventListener("keydown", down, true);
+    document.addEventListener("keyup", up, true);
+    window.addEventListener("blur", release);
+    return () => {
+      document.removeEventListener("keydown", down, true);
+      document.removeEventListener("keyup", up, true);
+      window.removeEventListener("blur", release);
+      session.pttUp();
+    };
+  }, [ptt, phaseLive, session]);
+  const toggleHoldToTalk = () => {
+    const mode = ptt ? "vad" : "ptt";
+    session.setInputMode(mode);
+    saveInputMode(mode);
+  };
 
   // Esc steps back one level.
   useEffect(() => {
@@ -476,9 +518,39 @@ export function VoiceChat({
               <Icon name="keyboard" size={18} />
             </button>
           </div>
+          {ptt && live && (
+            <button
+              type="button"
+              className="vc-ptt"
+              data-down={snapshot.pttDown || undefined}
+              aria-pressed={snapshot.pttDown}
+              aria-disabled={!phaseLive || undefined}
+              onPointerDown={(e) => {
+                if (e.button !== 0) return;
+                e.currentTarget.setPointerCapture(e.pointerId); // the release counts even off the button
+                session.pttDown();
+              }}
+              onPointerUp={() => session.pttUp()}
+              onPointerCancel={() => session.pttUp()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.repeat) session.pttDown();
+              }}
+              onKeyUp={(e) => {
+                if (e.key === "Enter") session.pttUp();
+              }}
+              onContextMenu={(e) => e.preventDefault()}
+            >
+              <Icon name="mic" size={16} />
+              {snapshot.pttDown ? "Release to send" : "Hold to talk"}
+            </button>
+          )}
           <p className="vc-hint" aria-hidden="true">
-            {live ? "Tap to end · Esc stops" : "Tap to talk"}
+            {live ? (ptt ? "Hold Space to talk · Tap the mic to end" : "Tap to end · Esc stops") : "Tap to talk"}
           </p>
+          <label className="vc-ptt-toggle" title="For noisy places: only what you say while holding Space or the talk button is heard">
+            <input type="checkbox" role="switch" checked={ptt} onChange={toggleHoldToTalk} />
+            Hold to talk
+          </label>
 
           <div id={typeId} className="vc-type" hidden={!typeOpen}>
             {typeOpen && (

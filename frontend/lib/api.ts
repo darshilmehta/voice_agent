@@ -15,6 +15,26 @@ export interface PublicConfig {
   auth: { provider: string; issuer_url: string | null; client_id: string | null; audience: string | null };
   features: { voice: boolean; web_search: boolean; debug_panel: boolean };
   limits: { max_upload_mb: number; allowed_extensions: string[] };
+  /** The browser's side of noisy rooms (docs/DESIGN.md §3.10): its denoiser and noise-floor gate. Absent on older backends. */
+  voice_input?: PublicVoiceInput;
+}
+
+/** Mirrors backend/app/api/public_config.py `PublicVoiceInput` (from `vad` and `voice.noise`). */
+export interface PublicVoiceInput {
+  denoise: "rnnoise" | "off";
+  adaptive_gating: boolean;
+  threshold: number;
+  min_speech_ms: number;
+  floor_window_ms: number;
+  floor_percentile: number;
+  start_snr_db: number;
+  quiet_floor_dbfs: number;
+  loud_floor_dbfs: number;
+  noisy_threshold: number;
+  noisy_min_speech_ms: number;
+  assumed_user_dbfs: number;
+  assumed_margin_db: number;
+  far_field_hard_db: number;
 }
 
 export type HealthStatus = "ok" | "degraded" | "down" | "disabled" | "not_implemented";
