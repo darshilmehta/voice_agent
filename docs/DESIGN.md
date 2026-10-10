@@ -1,7 +1,7 @@
 # poc_gibberlink — Design
 
 > **Status:** Phase −1 **complete** (smoke tests incl. network-off run) · Phase 0 **complete** (skeleton, health, frontend shell, Docker, CI) · Phase 1 **in progress** (2026-10-08).
-> **Last updated:** 2026-10-08 (config moved to JSON: local + cloud template)
+> **Last updated:** 2026-10-10 (noisy rooms: denoiser, noise gate, background speech, hold-to-talk; §3.10, §9.7)
 > **Origin:** derived from [`blueprint.md`](blueprint.md). This document records what we actually decided; where the two disagree, this one wins.
 
 ---
@@ -447,7 +447,7 @@ One WebSocket per live voice session on a chat. The backend and the voice-first 
 
 | Direction | Format |
 |---|---|
-| Client → server | Raw **PCM16 little-endian, mono, 16 kHz**, 20–64 ms per frame (512 samples = 1,024 bytes is typical). Captured with `getUserMedia({echoCancellation, noiseSuppression, autoGainControl})` and downsampled in an AudioWorklet. Sent continuously while the mic is on. |
+| Client → server | Raw **PCM16 little-endian, mono, 16 kHz**, 20–64 ms per frame (512 samples = 1,024 bytes is typical). Captured with `getUserMedia({echoCancellation, noiseSuppression, autoGainControl})`, cleaned by RNNoise (`voice.noise.denoise`, below) and downsampled in an AudioWorklet. Sent continuously while the mic is on (in hold-to-talk mode too). |
 | Server → client | **12-byte header + PCM16 LE mono 24 kHz** (Kokoro's rate). Header: `uint32 turn_id`, `uint32 chunk_index`, `uint32 seq` (all little-endian; `seq` counts frames within the chunk). The client plays only frames whose `turn_id` is the current agent turn and drops the rest (stale audio after an interruption). |
 
 **Control messages (JSON text frames, one object each, field `type`).**
@@ -456,7 +456,9 @@ Client → server:
 
 | `type` | Fields | Meaning |
 |---|---|---|
-| `start` | `language: "en" \| "hi" \| null` | Begin the session after mic permission. `null` = detect per utterance. |
+| `start` | `language: "en" \| "hi" \| null`, (`input_mode: "vad" \| "ptt"`, default `"vad"`) | Begin the session after mic permission. `null` = detect per utterance. `input_mode: "ptt"`: hold-to-talk from the start (below). |
+| `input_mode` | `mode: "vad" \| "ptt"` | Switch between speaking opening turns (`vad`) and hold-to-talk (`ptt`) during the session. Whatever was being heard in the other mode is dropped (`user_speech end` + the state, as an ignored utterance). |
+| `ptt` | `state: "down" \| "up"` | Hold-to-talk (§3.10 "Noisy rooms"): the talk button (or Space) went down / came up. `down` also switches to `ptt` mode. |
 | `barge_in_start` | `turn_id`, `played_ms` | The browser's VAD heard speech while the agent was speaking; the client has already ducked playback locally. `played_ms` = agent audio of that turn actually played so far. |
 | `playback` | `turn_id`, `played_ms` | Optional progress report (~every 250 ms while playing), so the server knows what was heard even if the socket drops. |
 | `playback_done` | `turn_id` | The last audio chunk of that turn finished playing. |
@@ -469,7 +471,7 @@ Server → client:
 |---|---|---|
 | `ready` | `session_id`, `input_sample_rate: 16000`, `output_sample_rate: 24000`, `language` | Session accepted; start sending audio. |
 | `state` | `state: "listening" \| "thinking" \| "speaking" \| "interrupted"` | Drives the presence field and the state label. |
-| `user_speech` | `phase: "start" \| "end"` | Server VAD saw speech start / end of turn (end after `vad.end_of_turn_ms` silence). |
+| `user_speech` | `phase: "start" \| "end"` | Server VAD saw speech start / end of turn (end after `vad.end_of_turn_ms` silence). With the noise gate (`voice.noise.adaptive_gating`) `start` comes once the speech is confirmed (its minimum speech length, near the user's level), ~250 ms after it began; speech that never is (the TV, babble, a cough) sends neither. In hold-to-talk mode: `start` on `ptt down`, `end` on `ptt up`. |
 | `transcript_partial` | `text` | Optional live partial transcript of the current user utterance. |
 | `user_message` | `message: Message` | Final transcript saved (`modality: "voice"`, detected `language`). Begins a turn; `turn_id` = the agent turn that will answer it. |
 | `turn` | `turn_id` | The agent turn id for the answer that follows (sent with or right after `user_message`). |
@@ -495,7 +497,12 @@ Server → client:
    - **Speech after a `resume`** (quality round, B3): "No (pause) wait, I meant…" got `resume` at the deadline (the pause) and the agent talked over the user for 4.6 s, until the sentence ended. Speech that goes on while the agent answers with no decision pending (after a `resume`, or without any `barge_in_start`) is transcribed again every 400 ms of new speech (the first time at `decision_timeout_ms` of speech, or right after the `resume`); real words that aren't an acknowledgement send `barge_in: stop` at once, while the user is still talking. The client re-ducks on its own VAD's next speech onset (a new `barge_in_start`); the protocol has no server-to-client "duck" message.
 4. **Stop**: `stop` cancels like a confirmed barge-in; `route.stopped = true` as in text chat. A `stop` during a pending barge-in decision is answered with `barge_in: stop`. A `stop` while the utterance is still being transcribed covers it too: the client gets `state: interrupted`, `user_message`, `turn`, an empty stopped `agent_message`, then `state: listening`, and nothing is answered.
 5. **Ignored utterances** (too short, an acknowledgement or hum, noise, a failed transcription): every `user_speech start` is still closed by `user_speech end`, followed by `barge_in: resume` if a decision was pending and the current `state` again (or `error {stage: "stt"}` first), so the client can clear its captions.
-6. Everything said is persisted as messages in the chat (§3.9): the transcript view and the text endpoint see the same history. An interrupted answer records why in `route.interrupted`: `"barge_in"`, `"stop"`, or `"disconnect"` (client dropped, replaced by another tab, server shutdown).
+6. **Noisy rooms** (2026-10-10, from the user's test in a noisy place). Four layers, each configurable under `voice.noise` (same keys in every config file; the browser gets its share as `voice_input` in `/api/config/public`):
+   - **Denoiser** (`denoise: "rnnoise" | "off"`): RNNoise (xiph, via `@sapphi-red/web-noise-suppressor` 0.4.1, pinned, served by the app from `public/denoise/`) in an AudioWorklet on the microphone, after the browser's own echo cancellation / noise suppression / gain control, before the uplink, the browser VAD and the presence field. The voice page's AudioContext runs at 48 kHz for it (RNNoise's rate); if it can't run, the microphone is used as it is. Cost: ~16 µs of CPU per 128-sample render quantum in V8 (real-time factor 0.006, §9.7), 10.7 ms of added delay.
+   - **Noise-floor gate** (`adaptive_gating`, both VADs, `services/voice/noise.py` and `frontend/lib/voice/noise.ts`, the same algorithm): the floor is the `floor_percentile`-th percentile of the last `floor_window_ms` of 32 ms frame levels (10·log10 mean square, dBFS; assumed −70 for the first second). Speech opens a turn only on a frame `start_snr_db` above the floor; the VAD threshold and the minimum speech rise with the floor from `vad.threshold` / `vad.min_speech_ms` at `quiet_floor_dbfs` to `noisy_threshold` / `noisy_min_speech_ms` at `loud_floor_dbfs`; frames within `end_snr_db` of the floor, or more than 6 dB under the near-field minimum below, count as silence (babble, or the TV after the user stopped, can't hold a turn open: after the denoiser the TV's words stand far above the floor). A turn is announced (`user_speech start`; the browser's duck and `barge_in_start`) only once it is **near field**: its level (the 80th percentile of its speech frames' levels) within `far_field_hard_db` of the user's own level, learnt from their answered turns (rises fast, falls slowly) or, before the first one, `assumed_user_dbfs` with `assumed_margin_db` more room.
+   - **Background speech dropped silently** (`drop_background_speech`, `noise.addressed`): every transcribed utterance is answered, asked again, or dropped without a reply. Dropped: more than `far_field_hard_db` below the user's level; more than `far_field_db` below it and unsure (Whisper `avg_logprob` < `unsure_avg_logprob`, `no_speech_prob` > `unsure_no_speech_prob`, or garbled), a fragment (≤ `short_fragment_words` words, no content word: "and then he", "Thank you.", "है ना"; a stop cue is never one) or weak against the floor (< `min_snr_db`); weak, not within `close_db` of a learnt user level, and unsure or a fragment. "Sorry, I didn't catch that" (§3.4) stays for near-field speech that was garbled. A dropped utterance gets `user_speech end` + the state, never a `user_message`; its partial transcripts aren't sent; over an answer it neither stops it (`barge_in: resume`) nor counts for the speech watch.
+   - **Hold-to-talk** (`input_mode: "ptt"`, a "Hold to talk" switch on the voice page, remembered per browser in localStorage): the VAD opens no turn and doesn't duck or interrupt; a turn is the audio from `ptt down` (with the 192 ms pre-roll) to `ptt up` (Space held outside a text field, or the talk button; capped at 30 s), never dropped as background (garbled → said again); less than `vad.min_speech_ms` of speech in it is ignored. `ptt down` while the agent answers stops it at once (`barge_in: stop`, `route.interrupted: "barge_in"`); the client cuts its playback locally first. `barge_in_start` in this mode is answered `resume`.
+7. Everything said is persisted as messages in the chat (§3.9): the transcript view and the text endpoint see the same history. An interrupted answer records why in `route.interrupted`: `"barge_in"`, `"stop"`, or `"disconnect"` (client dropped, replaced by another tab, server shutdown).
 
 **Ordering guarantees** (the client relies on these and still guards against stale messages):
 
@@ -970,6 +977,45 @@ Also: onnxruntime threads abort during Python shutdown on macOS (`libc++abi … 
 
 Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first audio (2 of 3 runs favour MPS). Config stays `cpu` to keep GPU memory for the LLM; revisited in the voice loop (§9.5, 2026-10-10): MPS is slower there, sharing the GPU with Ollama and the reranker.
 
+### 9.7 Noise robustness (2026-10-10)
+
+From the user's test: "When I use this in a noisy place, it picks a lot of background noise." Measured with `scripts/eval/noise_robustness.py` (`cd backend && uv run --group ml python ../scripts/eval/noise_robustness.py`; ~2 h; nothing downloaded, nothing played, audio only in git-ignored `data/eval/noise/`). Clean questions (10 English, 4 Hindi) and background chatter (20 lines written for the test) spoken by macOS `say`; the user's questions at an active level of −26 dBFS; generated white, pink and brown noise, babble (six chatter talkers in a reverberant room), café (babble + dish clatter) and a TV (two voices, band-limited, reverberant room), mixed at 20 / 10 / 5 / 0 dB below the user. **Before** = main: no denoiser, the plain Silero endpointer, every transcript answered (garbled ones asked again). **After** = RNNoise run offline with the page's own worklet and WASM (`scripts/eval/denoise.mjs`, 48 kHz), then the gate and the background check (§3.10 "Noisy rooms") with the committed config. The server's decisions are simulated on audio time with the session's own parts (Silero, `Endpointer`, mlx-whisper small, `addressed`, `barge_in_verdict`; transcription time as measured); while the agent "speaks", every announced speech start is a `barge_in_start`. "User's level known": after one answered question (learnt −23.8 dBFS, the 80th percentile of their speech frames); "first turn": before any.
+
+Noise-only audio, per minute, before → after first turn (after, user's level known). False barge-ins can only happen once the agent has answered something, so the known-level column is the one that applies to them:
+
+| noise | level vs the user | false turn starts | background replies | false barge-ins |
+|---|---|---|---|---|
+| white / pink / brown | 20, 10, 5 dB below | 0 → 0 (0) | 0 → 0 (0) | 0 → 0 (0) |
+| babble | 20 dB below | 3 → 0 (0) | 1 → 0 (0) | 1 → 0 (0) |
+| babble | 10 dB below | 5 → 6 (0) | 0 → 0 (0) | 1 → 0 (0) |
+| babble | 5 dB below | 4 → 10 (7) | 1 → 6 (0) | 2 → 5 (0) |
+| café | 20 dB below | 0 → 0 (0) | 0 → 0 (0) | 0 → 0 (0) |
+| café | 10 dB below | 1 → 1 (0) | 1 → 0 (0) | 1 → 0 (0) |
+| café | 5 dB below | 1 → 8 (3) | 1 → 1 (0) | 1 → 1 (0) |
+| TV | 20 dB below | 6 → 0 (0) | 4 → 0 (0) | 36 → 0 (0) |
+| TV | 10 dB below | 5 → 10 (8) | 4 → 8 (1) | 36 → 31 (1) |
+| TV | 5 dB below | 5 → 9 (9) | 4 → 8 (8) | 38 → 31 (36) |
+
+Questions in noise (14 questions × 6 noises per SNR): answered / asked again / dropped / missed (no end of turn within 2.5 s of the question: the noise kept the turn open), and word error rate:
+
+| SNR | before | after, first turn | after, user's level known |
+|---|---|---|---|
+| clean | 93% / 7% / 0% / 0%, WER 0.15 | 93% / 7% / 0% / 0%, WER 0.15 | 93% / 7% / 0% / 0%, WER 0.16 |
+| 20 dB | 98% / 2% / 0% / 0%, WER 0.17 | 98% / 2% / 0% / 0%, WER 0.17 | 98% / 2% / 0% / 0%, WER 0.17 |
+| 10 dB | 80% / 2% / 0% / 18%, WER 0.38 | 93% / 4% / 0% / 4%, WER 0.35 | 95% / 1% / 0% / 4%, WER 0.31 |
+| 5 dB | 68% / 1% / 0% / 31%, WER 0.52 | 82% / 10% / 0% / 8%, WER 0.46 | 82% / 10% / 0% / 8%, WER 0.45 |
+| 0 dB | 49% / 2% / 0% / 49%, WER 0.69 | 68% / 8% / 0% / 24%, WER 0.67 | 68% / 8% / 0% / 24%, WER 0.66 |
+
+WER at 10–0 dB by noise, before → after: babble 0.75 → 0.43, café 0.58 → 0.56, TV 1.11 → 1.06, brown 0.16 → 0.15, pink 0.27 → 0.33, white 0.32 → 0.42. (The clean 7% "asked again" is Hindi: Whisper small garbles one of the four `say` Hindi questions, before and after alike.)
+
+- **Steady noise was never the problem**: Silero doesn't take white, pink or brown noise for speech at any level here (as §9.4 found), before or after. Babble, café talk and above all a TV were: main answered the TV 4–6 times a minute and **let it stop the agent's answer 36 times a minute**; the user's own questions went unanswered because the background kept their turn open (18–49% at 10–0 dB).
+- **After**: no clear near-field question was dropped at any SNR (0% dropped in every cell); answered questions at 10 / 5 / 0 dB went 80 / 68 / 49% → 93–95 / 82 / 68%. A TV 20 dB below the user, or babble and café talk 10 dB below, is never answered and never interrupts. A TV 10 dB below the user: 8 replies a minute before the user's first question (its level can't be told from a user's yet), 1 after it; false barge-ins 36 → 1 a minute.
+- **What is left**: speech as loud as the user's (a TV or a talker within ~5 dB of them) can't be told apart by level, and Whisper transcribes it confidently: 8 replies and 31–36 false barge-ins a minute for a TV 5 dB below the user. Before the user's first answered turn (their level only assumed), very loud babble (5 dB below them) gets 6 replies a minute where main had 1: RNNoise makes background talk cleaner, so Silero hears more of it as speech. **Hold-to-talk** is the answer for both; the voice page offers it as a switch. More false turn starts in the loudest babble and café (4 → 10, 1 → 8 a minute, before the first turn) don't reach a reply, but each ducks the agent briefly in the browser.
+- **RNNoise and Whisper**: it helps babble (WER 0.75 → 0.43) and hurts broadband noise at low SNR (white 0.32 → 0.42: its artifacts, where Whisper copes with the hiss itself). Kept on: the café, babble and TV cases are what the user met; `voice.noise.denoise: "off"` switches it off.
+- **CPU and latency**: RNNoise costs 16.4 µs per 128-sample render quantum in V8 (Node, the page's own worklet and WASM; real-time factor 0.006, ~0.6% of one core) and delays the audio by 10.7 ms; in Chromium (OfflineAudioContext, the same assets served by the app) it removed 6 dB of white noise in its first second while keeping speech within 0.2 dB. A turn is announced (`user_speech start`) ~250 ms after it began (it needs its minimum speech, near the user's level); the end of turn and the speculative STT are unchanged, so the first audio is not later.
+- **Checked in the browser** (Chromium in the Browser pane, the app on an isolated backend and data directory, a synthetic microphone, every output through a zero-gain node): RNNoise and the VAD start (`denoise: on`, `vad: on`, AudioContext at 48 kHz); the "Hold to talk" switch persists across reloads; holding to talk → `ptt down`, the spoken question, `ptt up` → transcript "What was the company's revenue last year?" and an answer; pressing during the answer stops it at once (`route.interrupted: "barge_in"`, `heard_text` saved).
+- **Not measured here**: a real microphone in a real room, with the browser's echo cancellation and auto gain control in front (AGC raises a quiet room, including the TV, when nobody speaks); the user's retest decides the thresholds (`voice.noise`).
+
 ### Setup notes
 
 - Ollama runs as a brew service (`brew services start ollama`), bound to `127.0.0.1:11434`.
@@ -992,6 +1038,7 @@ Kokoro device: offline run measured MPS 0.31 s vs CPU 0.50 s full-sentence first
 | 2 Retrieval quality | ✅ done | eval set #22; tuning: R@1 71.8 → 85.6 %, R@5 87.8 → 96.8 %, MRR 0.797 → 0.920, page citations 74.4 → 88.5 %, end-to-end correct answers 79.5 → 92.9 %, unanswerable answered 4/38 → 3/38, retrieve p50 707 → 445 ms (document labels, fiscal-year veto, Hindi-aware reranking, small rerank batches, re-index on a chunking-version change) |
 | 3 + 7 Router, state, revisit features | ✅ done | #23 automatic titles, user summaries, transcript export; #24 router + conversation state + memory summary + drift and EN/HI/Hinglish switching: 43/43 intents on the labelled set with `qwen3:4b-instruct` (prompt tuned on that set), router p50 ≈ 0.65 s / p95 ≈ 1 s on routed turns, 0 on fast-path turns; #25 summary/export/title UI and routed-answer labels; #29 title job lane |
 | 10 Live visual canvas | ✅ done | **part of the MVP** (user decision 2026-10-09); §12.1, contract v1. #34 backend (typed datasets, chartability, `VisualSpec` + validator + calculator, planner, overview, canvas API), #32 canvas panel, then the conversation: visuals planned after the answer and streamed on both transports, `route.visual`, spoken and typed edits (EN / HI / Hinglish), the canvas as context, the spoken tail. Grounding 100% (every visual of every run). Then the instant draft (§12.1 "Instant draft, then refine"): a chart built by code when the retrieval returns, on screen with the answer's first audio (2–4 ms after it, 9 of 9 visuals in the real voice run), the planner only to refine an unsure draft after the answer (skipped for 61–80% of the labelled questions); company-aware candidates; a wider gate. Draft + planner: tuning 30/30, hold-out v1 24/27, hold-out v2 27/32 (the planner alone 24/32) |
+| Noisy rooms | ✅ done | from the user's test in a noisy place (§3.10 "Noisy rooms", §9.7): RNNoise on the microphone, the noise-floor gate on both VADs (turns announced only near the user's learnt level), background speech dropped silently (say-again only for near-field garbled speech), hold-to-talk (`ptt` messages, a switch on the voice page), `voice.noise` config; a generated noise test set with before/after measurements: TV 20 dB below the user 36 → 0 false barge-ins a minute, answered questions at 5 dB SNR 68 → 82%, no clear question dropped |
 
 Design-only PRs so far: #4 and #6 (voice presence UI, §3.8), #7 (projects, chats, transcripts, §3.9).
 
