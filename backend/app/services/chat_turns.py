@@ -72,6 +72,7 @@ import functools
 import logging
 import re
 import time
+import unicodedata
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
@@ -259,6 +260,15 @@ SHORT_ANSWER_SENTENCES = 3
 # A passage whose reranker score is at least this "covers" the question for the answer's checks: an answer saying the
 # documents don't have what it states is asked again (quality round, item 1).
 STRONG_PASSAGE = 0.5
+# A spoken Hindi question heard wrong is asked again rather than answered (polish round, item 4; ``_heard_wrong``).
+# In café noise "सूर्योदय योजना में आवेदन की अंतिम तिथि क्या है?" came out "…आबेदन की अंटिम सिथी क्या है?", "…आवेदन की
+# जाति ख्या है" and the like, with Whisper sure of them (average log probability -0.26 to -0.67: the garble check wants
+# below -1.2, "unsure" below -0.7) and nothing impossible in the Devanagari. The router model itself said
+# "clarification"; the B1 check turned that into a document question because the notice matched (0.02-0.28, or 0.82
+# on "सूर्योदय योजना में आवेदन" for the "जाति ख्या" one), and the answers denied the deadline or repeated the question.
+# Weak: under this best score (the noisy transcripts: 0.02-0.28; the clean toolkit question heard "तूल्कित…", also
+# called unclear by the router, 0.50 and answered).
+WEAK_MATCH = 0.3
 DRAFT_WAIT_S = 0.3  # how long the sources wait for the visual's draft (built in ~20 ms) to add its tables
 # The end of a continuation's first sentence: a full stop before a capitalised word or a Devanagari one ("Rs. 997"
 # and "U.S. dollar" don't end it).
@@ -536,6 +546,19 @@ _NAMES_A_PERIOD = re.compile(
     re.IGNORECASE,
 )
 _FIGURE_IN_LINE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+_DEVANAGARI_TEXT = re.compile("[\u0900-\u097f]")
+_HINDI_QUESTION_WORDS = frozenset(
+    ["क्या", "क्यों", "कितना", "कितनी", "कितने", "कब", "कौन", "कौनसा", "कौनसी", "कहाँ", "कहां", "कैसे", "कैसा", "कैसी"]
+)
+_DEVANAGARI_CONSONANT = re.compile("[\u0915-\u0939\u0958-\u095f]")
+
+
+def _consonants(word: str) -> str:
+    """A Devanagari word's consonant letters (nuktas folded): "सीटें" and "सीटों" are the same word inflected,
+    "आबेदन" and "आवेदन" are not."""
+    return "".join(_DEVANAGARI_CONSONANT.findall(unicodedata.normalize("NFD", word).replace("\u093c", "")))
+
+
 _CITED = re.compile(r"\[\s*[SW]\d+", re.IGNORECASE)
 _NOTICES = tuple(text for texts in LIVE_NOTICES.values() for text in texts.values())
 
@@ -961,6 +984,10 @@ class ChatTurnService:
                 async for event in self._abstain(turn, p, clock, confidence, reason):
                     yield event
                 return
+        elif covered and (misheard := self._heard_wrong(turn, p, confidence)) is not None:
+            async for event in self._abstain(turn, p, clock, confidence, "not_covered", misheard=misheard):
+                yield event
+            return
         elif covered:
             await self._start_draft(turn, p)  # the visual's draft, built while the answer is written (§12.1)
             await self._draft_evidence(turn, p)  # its tables among the answer's sources (quality round, item 1)
@@ -1082,7 +1109,14 @@ class ChatTurnService:
             yield event
 
     async def _abstain(
-        self, turn: Turn, p: _Progress, clock: _Clock, confidence: Confidence | None, reason: AbstainReason
+        self,
+        turn: Turn,
+        p: _Progress,
+        clock: _Clock,
+        confidence: Confidence | None,
+        reason: AbstainReason,
+        *,
+        misheard: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[ChatEvent, None]:
         """The documents don't answer it: a fixed answer, no model. Spoken, a question that speech recognition wasn't
         sure of (``Turn.unsure``), or with a word the turn's passages have in another spelling that sounds the same
@@ -1093,14 +1127,18 @@ class ChatTurnService:
         p.notice = plan.live_note
         notice = live_notice(plan.live_note, plan.language) + " " if plan.live_note else ""
         spoken = reason == "not_covered" and turn.modality == "voice"
-        misheard = self._misheard_words(turn, p) if spoken else {}
-        say_again = spoken and (turn.unsure or bool(misheard))
+        heard_wrong = misheard is not None  # the gate let it through, but it was heard wrong (``_heard_wrong``)
+        if misheard is None:
+            misheard = self._misheard_words(turn, p) if spoken else {}
+        say_again = spoken and (turn.unsure or bool(misheard) or heard_wrong)
         answer = notice + (ack_text("repeat", plan.language) if say_again else abstention(plan.language, reason))
         p.parts.append(answer)
         yield DeltaEvent(answer)
         route = self._route(turn, p, abstained=True, reason=reason, model_used=False)
         if say_again:
-            route["say_again"] = {"unsure": turn.unsure, "misheard": misheard}
+            route["say_again"] = {"unsure": turn.unsure, "misheard": dict(misheard)}
+            if heard_wrong and confidence is not None:  # the documents matched it (that well): heard wrong anyway
+                route["say_again"]["heard_wrong"] = round(confidence.top_score, 3)
         latency = self._latency(clock, p, first_delta_ms=clock.ms(), llm_ms=None)
         async for event in self._save_answer(turn, answer, [], route, latency, p):
             yield event
@@ -1134,6 +1172,43 @@ class ChatTurnService:
         if plan.live_hint or plan.live_note is not None or (plan.decision is not None and plan.decision.live):
             return False
         return self._figure_question(turn, p)
+
+    @staticmethod
+    def _heard_wrong(turn: Turn, p: _Progress, confidence: Confidence | None) -> dict[str, str] | None:
+        """A spoken Hindi (Devanagari) question heard wrong: the words that show it (they sound like a passage's word,
+        or like a Hindi question word, "ख्या" for "क्या", with other consonants: not an inflection, "सीटें" for
+        "सीटों"; possibly none), or None for a question to answer. Heard wrong: the router model found it unclear
+        ("clarification", turned into a document question by the B1 check) and either the passages match it only
+        weakly (under ``WEAK_MATCH``) or its question word was misheard; or the router timed out, a word was misheard
+        and the match is weak. The router never calls a clear question unclear (the
+        deadline, seats, age, toolkit and loan questions: document_qa or general_qa), so a clear question is never
+        asked again for this."""
+        if turn.modality != "voice" or confidence is None or p.screen_visual is not None:
+            return None
+        if not _DEVANAGARI_TEXT.search(turn.text):
+            return None
+        decision = p.plan.decision
+        if decision is None:
+            return None
+        unclear = any(o.startswith("clarification→") for o in decision.overrides)
+        timed_out = decision.source == "fallback"
+        if not (unclear or timed_out):
+            return None
+        passages = [r.chunk.text for r in (p.result.chunks if p.result is not None else [])]
+        misheard = {
+            said: written
+            for said, written in misheard_words(turn.text, passages, common=True).items()
+            if _consonants(said) != _consonants(written)
+        }
+        weak = confidence.top_score < WEAK_MATCH
+        # Matched strongly, a misheard word of the question's subject is respelled for the model (item 10, last round
+        # item 1) and answered; a misheard question word ("ख्या") leaves no question to answer.
+        asks = any(written in _HINDI_QUESTION_WORDS for written in misheard.values())
+        if unclear and (weak or asks):
+            return misheard
+        if timed_out and misheard and confidence.top_score < WEAK_MATCH:
+            return misheard
+        return None
 
     @staticmethod
     def _misheard_words(turn: Turn, p: _Progress) -> dict[str, str]:

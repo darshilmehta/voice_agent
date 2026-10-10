@@ -82,7 +82,7 @@ Open the transcript panel. **Summary** (English or हिंदी, 15–40 s on
 
 ## 6. A noisy room
 
-In a café or with a TV on, the microphone is cleaned (RNNoise) and only speech near your own level opens a turn: background talk is dropped silently, and nothing is said in reply to it. Café chatter 10 dB below your voice got no reply in the last check, and a question asked over it was answered (₹15.00 for "What is the dividend per share?"), though Whisper mishears more in noise (a misheard name gets an honest "The documents do not cover…").
+In a café or with a TV on, the microphone is cleaned (RNNoise) and only speech near your own level opens a turn: background talk is dropped silently, and nothing is said in reply to it. Café chatter 10 dB below your voice got no reply in the last check, and a question asked over it was answered (₹15.00 for "What is the dividend per share?"), though Whisper mishears more in noise (a misheard name gets an honest "The documents do not cover…", and a Hindi question it heard wrong gets "माफ़ कीजिए, मैं ठीक से सुन नहीं पाया…": say it again).
 
 When the room is louder than that (a TV or a talker about as loud as you), switch on **Hold to talk** under the microphone (remembered in this browser): only what you say while holding **Space** (outside a text field) or the talk button is heard, and pressing it while the agent answers stops the answer at once. If voices sound distorted in steady hiss (a fan, an air conditioner), set `voice.noise.denoise: "off"` in `config/local.config.json` and restart the backend.
 
