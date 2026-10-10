@@ -72,6 +72,7 @@ import functools
 import logging
 import re
 import time
+import unicodedata
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
@@ -87,7 +88,16 @@ from ..providers.registry import Container
 from ..providers.storage import MetadataDB
 from ..providers.web_search import WebSearch
 from ..settings import Language, Settings
-from .answer_guard import AnswerGuard, Coverage, Unit, evidence_units, figures_in, identifiers_in, terms
+from .answer_guard import (
+    AnswerGuard,
+    Coverage,
+    Unit,
+    evidence_units,
+    figures_in,
+    identifiers_in,
+    number_facts,
+    terms,
+)
 from .base import InvalidInput
 from .canvas.conversation import (
     CanvasEdit,
@@ -144,6 +154,7 @@ from .prompts import (
     fiscal_year_end_note,
     general_system_prompt,
     general_user_prompt,
+    heard_note,
     insist_on_language,
     language_request_note,
     latest_period_note,
@@ -180,6 +191,7 @@ from .router import (
     asks_for_figure,
     fast_route,
     heard,
+    same_text,
 )
 from .sources import (
     Source,
@@ -191,7 +203,15 @@ from .sources import (
     strip_markers,
     trim_open_marker,
 )
-from .subjects import label_words, misheard_names, misheard_words, respell, subject_names
+from .subjects import (
+    DEVANAGARI_WORD,
+    HINDI_FUNCTION_WORDS,
+    label_words,
+    misheard_names,
+    misheard_words,
+    respell,
+    subject_names,
+)
 from .web_search import ToolEvent, WebSearchRun, WebSource
 
 if TYPE_CHECKING:
@@ -240,6 +260,15 @@ SHORT_ANSWER_SENTENCES = 3
 # A passage whose reranker score is at least this "covers" the question for the answer's checks: an answer saying the
 # documents don't have what it states is asked again (quality round, item 1).
 STRONG_PASSAGE = 0.5
+# A spoken Hindi question heard wrong is asked again rather than answered (polish round, item 4; ``_heard_wrong``).
+# In café noise "सूर्योदय योजना में आवेदन की अंतिम तिथि क्या है?" came out "…आबेदन की अंटिम सिथी क्या है?", "…आवेदन की
+# जाति ख्या है" and the like, with Whisper sure of them (average log probability -0.26 to -0.67: the garble check wants
+# below -1.2, "unsure" below -0.7) and nothing impossible in the Devanagari. The router model itself said
+# "clarification"; the B1 check turned that into a document question because the notice matched (0.02-0.28, or 0.82
+# on "सूर्योदय योजना में आवेदन" for the "जाति ख्या" one), and the answers denied the deadline or repeated the question.
+# Weak: under this best score (the noisy transcripts: 0.02-0.28; the clean toolkit question heard "तूल्कित…", also
+# called unclear by the router, 0.50 and answered).
+WEAK_MATCH = 0.3
 DRAFT_WAIT_S = 0.3  # how long the sources wait for the visual's draft (built in ~20 ms) to add its tables
 # The end of a continuation's first sentence: a full stop before a capitalised word or a Devanagari one ("Rs. 997"
 # and "U.S. dollar" don't end it).
@@ -517,6 +546,19 @@ _NAMES_A_PERIOD = re.compile(
     re.IGNORECASE,
 )
 _FIGURE_IN_LINE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+_DEVANAGARI_TEXT = re.compile("[\u0900-\u097f]")
+_HINDI_QUESTION_WORDS = frozenset(
+    ["क्या", "क्यों", "कितना", "कितनी", "कितने", "कब", "कौन", "कौनसा", "कौनसी", "कहाँ", "कहां", "कैसे", "कैसा", "कैसी"]
+)
+_DEVANAGARI_CONSONANT = re.compile("[\u0915-\u0939\u0958-\u095f]")
+
+
+def _consonants(word: str) -> str:
+    """A Devanagari word's consonant letters (nuktas folded): "सीटें" and "सीटों" are the same word inflected,
+    "आबेदन" and "आवेदन" are not."""
+    return "".join(_DEVANAGARI_CONSONANT.findall(unicodedata.normalize("NFD", word).replace("\u093c", "")))
+
+
 _CITED = re.compile(r"\[\s*[SW]\d+", re.IGNORECASE)
 _NOTICES = tuple(text for texts in LIVE_NOTICES.values() for text in texts.values())
 
@@ -942,6 +984,10 @@ class ChatTurnService:
                 async for event in self._abstain(turn, p, clock, confidence, reason):
                     yield event
                 return
+        elif covered and (misheard := self._heard_wrong(turn, p, confidence)) is not None:
+            async for event in self._abstain(turn, p, clock, confidence, "not_covered", misheard=misheard):
+                yield event
+            return
         elif covered:
             await self._start_draft(turn, p)  # the visual's draft, built while the answer is written (§12.1)
             await self._draft_evidence(turn, p)  # its tables among the answer's sources (quality round, item 1)
@@ -993,7 +1039,7 @@ class ChatTurnService:
         prompt = self._prompt(turn, plan, history, p.sources, p.memory, p)
         short = plan.mode in ("conversation", "clarification")
         max_tokens = SHORT_REPLY_TOKENS[plan.language] if short else ANSWER_LENGTHS[turn.length].max_tokens
-        guard = self._guard(turn, p)
+        guard = self._guard(turn, p, prompt)
         guard.whole_sentences = short  # (a reply cut by the cap ends at its last whole sentence, never mid-word)
         stream = self._guarded_stream(prompt, plan.language, max_tokens, p, guard)
         model_parts: list[str] = []
@@ -1063,7 +1109,14 @@ class ChatTurnService:
             yield event
 
     async def _abstain(
-        self, turn: Turn, p: _Progress, clock: _Clock, confidence: Confidence | None, reason: AbstainReason
+        self,
+        turn: Turn,
+        p: _Progress,
+        clock: _Clock,
+        confidence: Confidence | None,
+        reason: AbstainReason,
+        *,
+        misheard: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[ChatEvent, None]:
         """The documents don't answer it: a fixed answer, no model. Spoken, a question that speech recognition wasn't
         sure of (``Turn.unsure``), or with a word the turn's passages have in another spelling that sounds the same
@@ -1074,14 +1127,18 @@ class ChatTurnService:
         p.notice = plan.live_note
         notice = live_notice(plan.live_note, plan.language) + " " if plan.live_note else ""
         spoken = reason == "not_covered" and turn.modality == "voice"
-        misheard = self._misheard_words(turn, p) if spoken else {}
-        say_again = spoken and (turn.unsure or bool(misheard))
+        heard_wrong = misheard is not None  # the gate let it through, but it was heard wrong (``_heard_wrong``)
+        if misheard is None:
+            misheard = self._misheard_words(turn, p) if spoken else {}
+        say_again = spoken and (turn.unsure or bool(misheard) or heard_wrong)
         answer = notice + (ack_text("repeat", plan.language) if say_again else abstention(plan.language, reason))
         p.parts.append(answer)
         yield DeltaEvent(answer)
         route = self._route(turn, p, abstained=True, reason=reason, model_used=False)
         if say_again:
-            route["say_again"] = {"unsure": turn.unsure, "misheard": misheard}
+            route["say_again"] = {"unsure": turn.unsure, "misheard": dict(misheard)}
+            if heard_wrong and confidence is not None:  # the documents matched it (that well): heard wrong anyway
+                route["say_again"]["heard_wrong"] = round(confidence.top_score, 3)
         latency = self._latency(clock, p, first_delta_ms=clock.ms(), llm_ms=None)
         async for event in self._save_answer(turn, answer, [], route, latency, p):
             yield event
@@ -1115,6 +1172,43 @@ class ChatTurnService:
         if plan.live_hint or plan.live_note is not None or (plan.decision is not None and plan.decision.live):
             return False
         return self._figure_question(turn, p)
+
+    @staticmethod
+    def _heard_wrong(turn: Turn, p: _Progress, confidence: Confidence | None) -> dict[str, str] | None:
+        """A spoken Hindi (Devanagari) question heard wrong: the words that show it (they sound like a passage's word,
+        or like a Hindi question word, "ख्या" for "क्या", with other consonants: not an inflection, "सीटें" for
+        "सीटों"; possibly none), or None for a question to answer. Heard wrong: the router model found it unclear
+        ("clarification", turned into a document question by the B1 check) and either the passages match it only
+        weakly (under ``WEAK_MATCH``) or its question word was misheard; or the router timed out, a word was misheard
+        and the match is weak. The router never calls a clear question unclear (the
+        deadline, seats, age, toolkit and loan questions: document_qa or general_qa), so a clear question is never
+        asked again for this."""
+        if turn.modality != "voice" or confidence is None or p.screen_visual is not None:
+            return None
+        if not _DEVANAGARI_TEXT.search(turn.text):
+            return None
+        decision = p.plan.decision
+        if decision is None:
+            return None
+        unclear = any(o.startswith("clarification→") for o in decision.overrides)
+        timed_out = decision.source == "fallback"
+        if not (unclear or timed_out):
+            return None
+        passages = [r.chunk.text for r in (p.result.chunks if p.result is not None else [])]
+        misheard = {
+            said: written
+            for said, written in misheard_words(turn.text, passages, common=True).items()
+            if _consonants(said) != _consonants(written)
+        }
+        weak = confidence.top_score < WEAK_MATCH
+        # Matched strongly, a misheard word of the question's subject is respelled for the model (item 10, last round
+        # item 1) and answered; a misheard question word ("ख्या") leaves no question to answer.
+        asks = any(written in _HINDI_QUESTION_WORDS for written in misheard.values())
+        if unclear and (weak or asks):
+            return misheard
+        if timed_out and misheard and confidence.top_score < WEAK_MATCH:
+            return misheard
+        return None
 
     @staticmethod
     def _misheard_words(turn: Turn, p: _Progress) -> dict[str, str]:
@@ -1198,9 +1292,11 @@ class ChatTurnService:
             guard.restart()
             prompt = with_note(prompt, coverage_note(guard.coverage.retry_note))
 
-    def _guard(self, turn: Turn, p: _Progress) -> AnswerGuard:
+    def _guard(self, turn: Turn, p: _Progress, prompt: Sequence[LLMMessage] = ()) -> AnswerGuard:
         """The checks of this answer: coverage (a draft on screen, strong passages), live figures (a live question
-        answered without live data), codes in the sources, misheard names, the length of a short answer."""
+        answered without live data), codes in the sources, misheard names, numbers the model corrupts (against what
+        its ``prompt`` says: sources, history, question; every mode, conversation replies too), the length of a
+        short answer."""
         plan = p.plan
         documents = plan.mode in ("grounded", "mixed") and not p.web_sources
         figures = None
@@ -1227,6 +1323,7 @@ class ChatTurnService:
             max_sentences=SHORT_ANSWER_SENTENCES if short else None,
             lower_first=p.prefix is not None and plan.language == "en",
             after_disclaimer=p.prefix is not None,
+            numbers=number_facts(m.content for m in prompt),
         )
 
     @staticmethod
@@ -1753,6 +1850,9 @@ class ChatTurnService:
         web = p.web_sources if p is not None else []
         renames = p.renames if p is not None else {}
         query = respell(plan.query, renames)  # the documents' spelling of a misheard name (item 10)
+        reading = self._english_reading(turn, plan, sources, renames) if p is not None else None
+        if reading is not None:  # a garbled Hindi transcript: asked in the router's reading (polish round, item 3)
+            query = f'{reading} (asked in Hindi by voice; speech recognition heard: "{turn.text}")'
         if web and p is not None and p.web is not None:  # live data (§3.7): documents [S#] and web results [W#]
             # Page texts are long (prefill ~3 ms per token): the first answer has the snippets, a continuation the
             # pages, unless no continuation will come.
@@ -1810,9 +1910,47 @@ class ChatTurnService:
             system, question = clarification_system_prompt(language), turn.text
         else:
             system, question = conversation_system_prompt(language), turn.text
+        if turn.modality == "voice" and plan.mode in ("grounded", "mixed", "general"):
+            # Answers repeated misheard words ("Morris Revenue", "एट्वाई चाँबीस"); a question shown as transcribed
+            # gets the router's reading of it too (polish round, item 3)
+            understood = None if reading is not None else self._understood_as(turn, plan, renames)
+            question = f"{question}\n\n{heard_note(understood)}"
         if plan.language_request:
             question = f"{question}\n\n{language_request_note(language)}"
         return [*self._context(system, history, memory), LLMMessage("user", question)]
+
+    @classmethod
+    def _english_reading(
+        cls, turn: Turn, plan: TurnPlan, sources: Sequence[Source], renames: Mapping[str, str]
+    ) -> str | None:
+        """For a spoken Devanagari question most of whose words are in no source (Whisper's Hindi for English terms
+        and names: "वाल्मोरा का एट्वाई चाँबीस में रेवेन योग कितना था?"; the answer copied "एट्वाई चाँबीस में रेवेन योग"
+        even with the router's reading beside it), the router's English reading, to be asked instead; else None (a
+        Hindi question the Hindi sources spell out keeps its own words)."""
+        understood = cls._understood_as(turn, plan, renames)
+        if understood is None or turn.modality != "voice":
+            return None
+        words = [
+            w
+            for w in DEVANAGARI_WORD.findall(respell(turn.text, renames))
+            if len(w) >= 3 and w not in HINDI_FUNCTION_WORDS
+        ]
+        if not words:
+            return None
+        written = {w for s in sources for w in DEVANAGARI_WORD.findall(s.chunk.text)}
+        unknown = sum(1 for w in words if w not in written)
+        return understood if unknown * 2 >= len(words) else None
+
+    @staticmethod
+    def _understood_as(turn: Turn, plan: TurnPlan, renames: Mapping[str, str]) -> str | None:
+        """The router's English reading of a spoken question, when the answer is shown the transcript itself (a Hindi
+        or Hinglish question keeps its own words; "Valmora Kar FY-24 May Revenue Kitna Tha?" was answered "The
+        documents do not cover the revenue for Valmora Kar FY24 May" with "What was the revenue for Valmora in FY24?"
+        in hand). None when the question shown is already the router's (a rewrite) or there is no reading."""
+        english = plan.query_en
+        if not english or not same_text(plan.query, turn.text) or same_text(english, turn.text):
+            return None
+        return respell(english, renames)
 
     @staticmethod
     def _own_subject(turn: Turn, plan: TurnPlan, p: _Progress | None) -> list[str] | None:

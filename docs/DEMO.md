@@ -6,7 +6,7 @@ A 15-minute walk through the MVP: a voice conversation with your documents in En
 
 Prerequisites (once): `scripts/setup/download_models.sh all`, Docker running, Ollama with `qwen3:4b-instruct`.
 
-**On a 16 GB Mac, cap Ollama's prompt cache first.** Without it, llama-server keeps every prompt's state in RAM (up to 8 GB): in the last check its footprint reached 8.3 GB and swap grew from 2.3 to 12.6 GB in about an hour of conversation, slowing everything (DESIGN §8). Lasts until reboot; DESIGN §9 shows how to make it permanent:
+**On a 16 GB Mac, cap Ollama's prompt cache first.** Without it, llama-server keeps every prompt's state in RAM (up to 8 GB): in the last check its footprint reached 8.3 GB and swap grew from 2.3 to 12.6 GB in about an hour of conversation, slowing everything (DESIGN §8). Lasts until reboot; DESIGN §9 shows how to make it permanent. If it isn't set, the backend logs a warning and the app shows a notice with this command:
 
 ```bash
 launchctl setenv LLAMA_ARG_CACHE_RAM 1024 && brew services restart ollama
@@ -56,7 +56,7 @@ From Home press **Start a conversation** (or open a chat in the project) and tap
 |---|---|
 | "सूर्योदय योजना में आवेदन की अंतिम तिथि क्या है?" | "…अंतिम तिथि 30 नवंबर 2024 है।" |
 | "कुल कितनी सीटें हैं?" | "कुल 18,000 सीटें हैं।" |
-| "वालमोरा का एफवाई चौबीस में रेवेन्यू कितना था?" | ₹7,365 करोड़, in Hindi. Whisper often mishears the name and "FY24" here ("वाल्मुरा का एट्वाई चावीज…"); the figure stays right, but the answer may repeat the misheard words |
+| "वालमोरा का एफवाई चौबीस में रेवेन्यू कितना था?" | ₹7,365 करोड़, in Hindi. Whisper often mishears the name and "FY24" here ("वाल्मुरा का एट्वाई चावीज…"); the answer is told to name things as the documents do, so it should say "FY24" and "राजस्व"/"रेवेन्यू" rather than the misheard words (a 4B model still slips now and then) |
 | "answer in English please" | re-answers the last question in English, and stays English, also for Hindi questions |
 | "हिंदी में बताइए" | re-answers the previous question in Hindi, and stays Hindi, also for English questions |
 | "answer in English please" | back to English for the rest of the demo |
@@ -74,7 +74,7 @@ From Home press **Start a conversation** (or open a chat in the project) and tap
 | "Show Zephyra's revenue by segment" | a donut: Freight Services ₹2,609 cr, Contract Logistics ₹1,896 cr, Digital Services ₹481 cr |
 | "remove it" / "हटा दो" | "Done." — the newest chart goes |
 
-Every number on a chart comes from a cell of a document table (or a labelled calculation); "View as table" shows the figures. Fact answers with a headline figure also add a small KPI panel each (the English table above leaves several "Financial highlights" panels); "remove it" clears the newest.
+Every number on a chart comes from a cell of a document table (or a labelled calculation); "View as table" shows the figures. Fact answers with a headline figure may add a small KPI panel, once: a chart whose figures are already on the canvas isn't added again (the transcript says "Already on the canvas" instead of "Chart added"); "remove it" clears the newest.
 
 ## 5. Revisit
 
@@ -82,7 +82,7 @@ Open the transcript panel. **Summary** (English or हिंदी, 15–40 s on
 
 ## 6. A noisy room
 
-In a café or with a TV on, the microphone is cleaned (RNNoise) and only speech near your own level opens a turn: background talk is dropped silently, and nothing is said in reply to it. Café chatter 10 dB below your voice got no reply in the last check, and a question asked over it was answered (₹15.00 for "What is the dividend per share?"), though Whisper mishears more in noise (a misheard name gets an honest "The documents do not cover…").
+In a café or with a TV on, the microphone is cleaned (RNNoise) and only speech near your own level opens a turn: background talk is dropped silently, and nothing is said in reply to it. Café chatter 10 dB below your voice got no reply in the last check, and a question asked over it was answered (₹15.00 for "What is the dividend per share?"), though Whisper mishears more in noise (a misheard name gets an honest "The documents do not cover…", and a Hindi question it heard wrong gets "माफ़ कीजिए, मैं ठीक से सुन नहीं पाया…": say it again).
 
 When the room is louder than that (a TV or a talker about as loud as you), switch on **Hold to talk** under the microphone (remembered in this browser): only what you say while holding **Space** (outside a text field) or the talk button is heard, and pressing it while the agent answers stops the answer at once. If voices sound distorted in steady hiss (a fan, an air conditioner), set `voice.noise.denoise: "off"` in `config/local.config.json` and restart the backend.
 

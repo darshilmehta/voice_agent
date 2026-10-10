@@ -371,6 +371,48 @@ async def test_a_misheard_name_is_asked_and_answered_as_the_documents_spell_it(w
     assert user.text == "What was Wall Mora's revenue in FY24?"  # what was said stays as it was heard
 
 
+async def test_a_spoken_question_shown_as_heard_comes_with_the_routers_reading(world, fakes):
+    """Polish round, item 3: "Valmora Kar FY-24 May Revenue Kitna Tha?" was answered "The documents do not cover the
+    revenue for Valmora Kar FY24 May" while the router had read it as "What was the revenue for Valmora in FY24?"."""
+    service, chat_id = world
+    heard = "Valmora Kar FY-24 May Revenue Kitna Tha?"
+    fakes.llm.route = {"intent": "document_qa", "query": "What was the revenue for Valmora in FY24?"}
+    fakes.llm.reply = "Valmora's revenue in FY24 was ₹7,365 crore [S1]."
+    await turn(service, chat_id, heard, modality="voice")
+    prompt = answer_prompts(fakes.llm)[-1]
+    assert f"Question: {heard}" in prompt  # (the Hinglish question keeps its own words)
+    assert 'it was understood as: "What was the revenue for Valmora in FY24?"' in prompt
+    assert "never repeat a word of the question that looks misheard" in prompt
+    # typed: no such note (what was typed is what was meant)
+    await turn(service, chat_id, heard)
+    assert "transcribed from speech" not in answer_prompts(fakes.llm)[-1]
+
+
+async def test_a_garbled_hindi_question_is_asked_in_the_routers_reading(world, fakes):
+    """The real model copied "एट्वाई चाँबीस में रेवेन योग" into its answer, with the reading in a note beside it."""
+    service, chat_id = world
+    heard = "वाल्मोरा का एट्वाई चाँबीस में रेवेन योग कितना था?"
+    fakes.llm.route = {"intent": "document_qa", "query": "What was Valmora's revenue in FY24?"}
+    fakes.llm.reply = "FY24 में वाल्मोरा का राजस्व ₹7,365 करोड़ था [S1]।"
+    await turn(service, chat_id, heard, modality="voice", language="hi")
+    prompt = answer_prompts(fakes.llm)[-1]
+    assert (
+        f'Question: What was Valmora\'s revenue in FY24? (asked in Hindi by voice; speech recognition heard: "{heard}")'
+        in prompt
+    )
+    assert "(Answer in Hindi" in prompt and "understood as" not in prompt
+
+
+async def test_a_spoken_question_the_router_rewrote_is_asked_in_its_words(world, fakes):
+    service, chat_id = world
+    fakes.llm.route = {"intent": "document_qa", "query": "What was Valmora's revenue in FY24?"}
+    fakes.llm.reply = "Valmora's revenue in FY24 was ₹7,365 crore [S1]."
+    await turn(service, chat_id, "What was Morris Revenue in FY24?", modality="voice")
+    prompt = answer_prompts(fakes.llm)[-1]
+    assert "Question: What was Valmora's revenue in FY24?" in prompt and "Morris" not in prompt
+    assert "transcribed from speech" in prompt and "understood as" not in prompt  # it is shown the reading itself
+
+
 # ------------------------------------------------------------------ item 7: short answers
 
 
@@ -388,3 +430,31 @@ async def test_a_short_answer_ends_at_the_sentence_that_reaches_the_word_limit(w
     assert words == 56 >= SHORT_ANSWER_WORDS and text.endswith("[S1].")  # two whole sentences, not three
     assert fakes.llm.closed  # generation stopped there
     assert saved(events).route["checks"][-1]["check"] == "length"
+
+
+# ------------------------------------------------------------------ polish round: numbers the model corrupts
+
+
+async def test_a_corrupted_number_is_repaired_in_a_grounded_answer(world, fakes):
+    service, chat_id = world
+    fakes.llm.route = {"intent": "document_qa", "query": "What was Valmora's revenue in FY24?"}
+    fakes.llm.reply = "Revenue was ₹ 7,-365 crore in FY24 [S1]."
+    events = await turn(service, chat_id, "What was Valmora's revenue in FY24?", modality="voice")
+    assert spoken(events) == "Revenue was ₹ 7,365 crore in FY24 [S1]."
+    assert saved(events).route["checks"] == [{"check": "number", "action": "repaired", "text": "7,-365", "to": "7,365"}]
+
+
+async def test_a_conversation_reply_keeps_the_historys_figure_unsigned(world, fakes):
+    """The last real run: "margin of -21.0%" in a reply that reused the history's figure (no sources)."""
+    service, chat_id = world
+    fakes.llm.route = {"intent": "document_qa", "query": "What was Valmora's revenue in FY24?"}
+    fakes.llm.reply = "Revenue was ₹ 7,365 crore in FY24 [S1]."
+    await turn(service, chat_id, "What was Valmora's revenue in FY24?", modality="voice")
+    fakes.llm.route = {"intent": "conversation", "query": None}
+    fakes.llm.reply = "Yes, revenue of ₹-7,365 crore is a strong result."
+    events = await turn(service, chat_id, "Wow, that sounds good", modality="voice")
+    assert saved(events).route["answer"] == "conversation"
+    assert spoken(events) == "Yes, revenue of ₹7,365 crore is a strong result."
+    assert saved(events).route["checks"] == [
+        {"check": "number", "action": "sign_dropped", "text": "-7,365", "to": "7,365"}
+    ]

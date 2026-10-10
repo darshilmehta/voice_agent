@@ -196,6 +196,10 @@ class VisualEvent(BaseModel):
     visual_id: str
     visual: Visual | None = None
     detail: str | None = None
+    # Additive (§12.1, "A visual already on the canvas"): a ready visual that took the place of a panel showing the
+    # same data (its id), and how: "same" or "covered" (nothing new on screen), "extends" (more than before).
+    replaces: str | None = None
+    reuse: Literal["same", "covered", "extends"] | None = None
 
     def payload(self) -> dict[str, Any]:
         return self.model_dump(mode="json", exclude_none=True)

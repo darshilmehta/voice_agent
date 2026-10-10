@@ -55,6 +55,7 @@ import {
   sourcesToShow,
   understoodAsByUser,
   visualIdOf,
+  visualReuseOf,
   visualUpdatedOf,
   type Basis,
 } from "@/lib/route";
@@ -797,10 +798,16 @@ const MessageItem = memo(function MessageItem({
         </p>
       )}
 
-      {!isUser && visualIdOf(m) && (
+      {!isUser && visualIdOf(m) && !visualReuseOf(m) && (
         <p className="msg-note">
           <Icon name="chart" size={13} />
           <span>Chart added to the canvas</span>
+        </p>
+      )}
+      {!isUser && visualIdOf(m) && visualReuseOf(m) && (
+        <p className="msg-note msg-note-quiet">
+          <Icon name="chart" size={12} />
+          {visualReuseOf(m) === "extends" ? "Chart updated on the canvas" : "Already on the canvas"}
         </p>
       )}
       {!isUser && !visualIdOf(m) && visualUpdatedOf(m) && (

@@ -99,6 +99,26 @@ def test_the_draft_is_sent_with_the_first_audio_and_the_tail_follows_the_answer(
     assert route["visual_plan"]["draft"] == "confident"
 
 
+def test_the_same_chart_again_takes_the_old_panels_place_without_a_tail(voice):
+    """§12.1 "A visual already on the canvas": nothing new appears, so "It's on screen now." isn't said."""
+    Script(planner=choose("line", "Revenue")).install(voice.fakes.llm)
+    voice.fakes.tts.delay = 0.2
+    with voice.connect() as ws:
+        c = VoiceClient(ws)
+        c.start()
+        c.say(SHOW)
+        first = c.until("agent_message")
+        c.send("playback_done", turn_id=1)
+        c.until(lambda m: m == {"type": "state", "state": "listening"})
+        c.say(SHOW)
+        items = c.until(lambda m: isinstance(m, dict) and m.get("type") == "agent_message" and m["message"]["seq"] > 2)
+        ready = next(m for m in of(items, "visual") if m["phase"] == "ready" and m["turn_id"] == 2)
+        first_id = next(m for m in of(first, "visual") if m["phase"] == "ready")["visual_id"]
+        assert ready["replaces"] == first_id and ready["reuse"] == "same"
+        assert not [m for m in tail_chunks(items) if m["turn_id"] == 2]
+    assert canvas_kinds(voice) == ["line"]
+
+
 def test_a_refined_visual_replaces_the_draft_in_place_after_the_answer(voice):
     script = Script(planner=choose_table("line", "Q1 FY24", "Revenue")).install(voice.fakes.llm)
     script.planner_delay = 0.3

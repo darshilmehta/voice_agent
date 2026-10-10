@@ -577,6 +577,9 @@ class TurnVisual:
     _ended: bool = False
     _withdrawn: bool = False
     _stored: bool = False  # a ready visual is on the canvas
+    # It took the place of a panel showing the same data (``reuse.py``): that panel's id, and how
+    replaces: str | None = None
+    reuse: str | None = None
 
     def start(self, events: AsyncIterator[CanvasEvents]) -> TurnVisual:
         if self._answer is None:
@@ -657,6 +660,8 @@ class TurnVisual:
                         if event.phase == "ready":
                             self._stored = True
                             self._drafted(event.visual)
+                            if event.replaces is not None:
+                                self.replaces, self.reuse = event.replaces, event.reuse
                         elif self.status == "ready":  # a shown draft withdrawn (the planner: no table fits)
                             self._stored = False
                         cancelled = event.phase == "failed" and event.detail == "cancelled"
@@ -768,11 +773,20 @@ class TurnVisual:
 
     def record(self) -> dict[str, object]:
         """``route`` fields of the turn's message, for what the user saw: the visual (``visual_id``, ready, with how it
-        was made: ``visual_plan``), or the failure note of a requested one (``visual_status`` failed / cancelled /
+        was made: ``visual_plan``; ``visual_replaces`` / ``visual_reuse`` when it took the place of a panel showing the
+        same data), or the failure note of a requested one (``visual_status`` failed / cancelled /
         none, ``visual_detail``). Nothing while it is being prepared, nor for a suggested one that didn't work out
         (nothing was shown)."""
         if self.status == "ready":
-            return {"visual_status": "ready", "visual_id": self.visual_id, "visual_plan": self.trace.record()}
+            out: dict[str, object] = {
+                "visual_status": "ready",
+                "visual_id": self.visual_id,
+                "visual_plan": self.trace.record(),
+            }
+            if self.replaces is not None:  # nothing new added: it took the place of a panel showing the same data
+                out["visual_replaces"] = self.replaces
+                out["visual_reuse"] = self.reuse
+            return out
         if self.status == "preparing" or not self.announce:
             return {}
         return {"visual_status": self.status, "visual_detail": self.detail}

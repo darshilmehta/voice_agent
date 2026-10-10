@@ -266,6 +266,10 @@ _HINDI_FUNCTION_WORDS = wordset(
 )
 
 
+HINDI_FUNCTION_WORDS = _HINDI_FUNCTION_WORDS  # (question words, postpositions, auxiliaries, common verbs)
+DEVANAGARI_WORD = _DEVANAGARI_WORD
+
+
 def hindi_sound_key(word: str) -> str:
     """A Devanagari word's consonants as they sound, repeats merged: "टूलकिट" → "tlkt", "बैंक" and "बेख" → "pk", "ऋण"
     and "रिन" → "rn"."""
@@ -274,14 +278,17 @@ def hindi_sound_key(word: str) -> str:
     return "".join(k for i, k in enumerate(keys) if i == 0 or k != keys[i - 1])
 
 
-def misheard_words(question: str, passages: Sequence[str]) -> dict[str, str]:
+def misheard_words(question: str, passages: Sequence[str], *, common: bool = False) -> dict[str, str]:
     """Words of a (spoken) question that the passages have in another spelling that sounds the same: likely misheard
     ({"बेख": "बैंक", "रिन": "ऋण"}). Devanagari words of three letters or more that aren't function words and aren't in
     any passage as written; a sound key of two consonants or more, equal to a passage word's (one that is spelled
     differently, or of four consonants or more and one consonant off: "तूलकेच" for "टूलकिट"). Latin words are left
-    to ``misheard_names``."""
+    to ``misheard_names``. ``common``: Hindi's question words and postpositions count as written too ("ख्या" is
+    "क्या" misheard, polish round, item 4)."""
     norm = lambda w: unicodedata.normalize("NFC", w).replace("़", "")  # noqa: E731  (nukta: "दस्तावेज़" = "दस्तावेज")
     written = {norm(w) for p in passages for w in _DEVANAGARI_WORD.findall(p)}
+    if common:
+        written |= {norm(w) for w in _HINDI_FUNCTION_WORDS}
     by_key: dict[str, str] = {}
     for w in sorted(written, key=len, reverse=True):
         key = hindi_sound_key(w)

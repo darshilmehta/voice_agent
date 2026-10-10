@@ -54,7 +54,8 @@ from .draft import Draft, cues, draft_visual, filename_labels, refinement_loses,
 from .edits import change_kind, edit_language, merge_planned
 from .overview import document_title, main_language, overview_specs, overview_title
 from .planner import NO_VISUAL, PlanResult, VisualPlanner, builds, first_valid, visual_intent
-from .spec import SpecError, VisualSpec, resolve, split_ref
+from .reuse import Reuse, reuse_of
+from .spec import MAX_TILES, SpecError, VisualSpec, resolve, split_ref
 from .store import CanvasStore
 
 log = logging.getLogger(__name__)
@@ -94,6 +95,8 @@ class CanvasService:
         self.wait_before_backfill: Callable[[], Awaitable[None]] | None = None
         self._building: dict[str, int] = {}  # project id → overview builds in progress
         self._locks: dict[str, asyncio.Lock] = {}
+        # A turn's visual id → the panel it took the place of (chat id, row snapshot), put back if it is withdrawn.
+        self._taken: dict[str, tuple[str, dict[str, object]]] = {}
 
     @classmethod
     def from_container(cls, container: Container) -> CanvasService:
@@ -407,6 +410,7 @@ class CanvasService:
         pool = list(datasets.values())
         ctx = turn_context(question, query_en, sources, labels or filename_labels(filenames))
         shown: Visual | None = None
+        reused: tuple[str, Reuse] | None = None
         draft: Draft | None = None
         try:
 
@@ -442,12 +446,8 @@ class CanvasService:
             draft, visual = await asyncio.to_thread(draw)
             trace.reasons = list(draft.reasons)
             if draft.spec is not None and visual is not None:
-                shown = await self.store.add_panel(
-                    chat_id,
-                    visual,
-                    draft.spec.model_dump(mode="json", by_alias=True),
-                    _documents(draft.spec, datasets),
-                    max_panels=self.cfg.max_panels,
+                shown, reused = await self._place(
+                    chat_id, visual, draft.spec, datasets, filenames, project_id=project_id, sources=sources
                 )
         except asyncio.CancelledError:
             raise
@@ -455,14 +455,21 @@ class CanvasService:
             log.warning("canvas: the draft visual for %r failed: %s", question[:80], e)
             shown = None
         trace.draft = "none" if shown is None else "confident" if draft is not None and draft.confident else "refine"
+        if reused is not None:
+            trace.reasons = [*trace.reasons[:3], f"on the canvas already ({reused[1]}): in the place of {reused[0]}"]
         trace.draft_ms = trace.ms()
         log.info("visual draft: %s in %sms (%s)", trace.draft, trace.draft_ms, "; ".join(trace.reasons))
         if shown is not None:
             trace.draft_at = time.perf_counter()
-            yield VisualEvent(phase="ready", visual_id=visual_id, visual=shown)
+            yield self._ready(visual_id, shown, reused)
             with suppress(Exception):
                 yield CanvasEvent(panels=await self.store.panels(chat_id))
             if trace.draft == "confident":
+                trace.planner = "skipped"
+                return
+            if (
+                reused is not None and reused[1] != "extends"
+            ):  # already on screen, as the user saw it: nothing to refine
                 trace.planner = "skipped"
                 return
         if self.planner is None:
@@ -509,6 +516,7 @@ class CanvasService:
             planned = PlanResult(None, "none", "none", f"planner failed: {e}")
         trace.planner_ms = round((time.perf_counter() - started) * 1000, 1)
         spec = planned.spec
+        refined: tuple[str, Reuse] | None = None
         if shown is not None and draft is not None and draft.spec is not None:
             if spec is None:
                 trace.planner = "none" if planned.reason == NO_VISUAL else "failed"
@@ -541,9 +549,10 @@ class CanvasService:
             if shown is not None:  # the draft rebuilt in place: same id, position and pin
                 stored = await self.store.replace_panel(chat_id, visual_id, visual, spec_json, documents)
                 trace.planner = "changed"
+                refined = await self._drop_older_copy(chat_id, stored)
             else:
-                stored = await self.store.add_panel(
-                    chat_id, visual, spec_json, documents, max_panels=self.cfg.max_panels
+                stored, reused = await self._place(
+                    chat_id, visual, spec, datasets, filenames, project_id=project_id, sources=sources
                 )
                 trace.planner = "planned"
         except asyncio.CancelledError:
@@ -555,9 +564,91 @@ class CanvasService:
                 yield VisualEvent(phase="failed", visual_id=visual_id, detail=str(e)[:300])
             return
         trace.refined_at = time.perf_counter()
-        yield VisualEvent(phase="ready", visual_id=visual_id, visual=stored)
+        yield self._ready(visual_id, stored, reused if shown is None else refined)
         with suppress(Exception):
             yield CanvasEvent(panels=await self.store.panels(chat_id))
+
+    async def _place(
+        self,
+        chat_id: str,
+        visual: Visual,
+        spec: VisualSpec,
+        datasets: dict[str, TypedDataset],
+        filenames: dict[str, str],
+        *,
+        project_id: str,
+        sources: Sequence[Citation],
+    ) -> tuple[Visual, tuple[str, Reuse] | None]:
+        """A turn's visual onto the chat's canvas: in the place of an unpinned panel that already shows its data
+        (``reuse.py``: the same chart, one that covers it, one it extends), else added. For "covered" the older panel
+        is what stays, rebuilt from its own spec with this turn's citations and id (its [S#] ids are the answer's).
+        Returns the stored visual and, when it took a panel's place, that panel's id and how."""
+        spec_json = spec.model_dump(mode="json", by_alias=True)
+        documents = _documents(spec, datasets)
+        with suppress(NotFound):
+            match = reuse_of(visual, await self.store.panels(chat_id))
+            if match is not None:
+                old, reuse = match
+                content, content_spec, content_documents = visual, spec_json, documents
+                if reuse in ("covered", "merge"):
+                    try:
+                        old_spec = VisualSpec.model_validate(await self.store.panel_spec(chat_id, old.id))
+                        if reuse == "merge":  # the older tiles, then the new ones
+                            series = list(dict.fromkeys([*old_spec.series, *spec.series]))
+                            if len(series) > MAX_TILES:
+                                raise ValueError(f"{len(series)} tiles don't fit on one panel")
+                            old_spec = spec.model_copy(
+                                update={
+                                    "series": series,
+                                    "datasets": list(dict.fromkeys([*old_spec.datasets, *spec.datasets])),
+                                }
+                            )
+                        content = self._build(
+                            old_spec,
+                            datasets,
+                            filenames,
+                            project_id=project_id,
+                            chat_id=chat_id,
+                            visual_id=visual.id,
+                            sources=sources,
+                        )
+                    except (SpecError, ValueError, NotFound) as e:  # its tables changed: add the new one instead
+                        log.info("canvas: panel %s can't be rebuilt (%s): the new visual is added", old.id, e)
+                        match = None
+                    else:
+                        content_spec = old_spec.model_dump(mode="json", by_alias=True)
+                        content_documents = _documents(old_spec, datasets)
+                if match is not None:
+                    taken = await self.store.take_over(chat_id, old.id, content, content_spec, content_documents)
+                    if taken is not None:
+                        stored, snapshot = taken
+                        self._taken[visual.id] = (chat_id, snapshot)
+                        while len(self._taken) > 256:  # (only a withdrawal soon after needs it)
+                            self._taken.pop(next(iter(self._taken)))
+                        log.info("canvas: visual %s takes the place of %s (%s)", visual.id, old.id, reuse)
+                        return stored, (old.id, "extends" if reuse == "merge" else reuse)
+        stored = await self.store.add_panel(chat_id, visual, spec_json, documents, max_panels=self.cfg.max_panels)
+        return stored, None
+
+    async def _drop_older_copy(self, chat_id: str, visual: Visual) -> tuple[str, Reuse] | None:
+        """The planner rebuilt a turn's draft in place: an older unpinned panel that now shows the same data (or part of
+        it, the same kind) goes, so the chart isn't on the canvas twice (``reuse.py``)."""
+        with suppress(NotFound):
+            match = reuse_of(visual, await self.store.panels(chat_id))
+            if match is not None and match[1] in ("same", "extends"):
+                await self.store.apply(
+                    chat_id, CanvasOp(op="remove", visual_id=match[0].id), max_panels=self.cfg.max_panels
+                )
+                log.info("canvas: the refined visual %s replaces %s (%s)", visual.id, match[0].id, match[1])
+                return match[0].id, match[1]
+        return None
+
+    @staticmethod
+    def _ready(visual_id: str, visual: Visual, reused: tuple[str, Reuse] | None) -> VisualEvent:
+        if reused is None:
+            return VisualEvent(phase="ready", visual_id=visual_id, visual=visual)
+        reuse = "extends" if reused[1] == "merge" else reused[1]
+        return VisualEvent(phase="ready", visual_id=visual_id, visual=visual, replaces=reused[0], reuse=reuse)
 
     async def _withdraw(self, chat_id: str, visual_id: str, detail: str) -> AsyncIterator[VisualEvent | CanvasEvent]:
         """Take a shown draft back: ``visual{failed}`` (a quiet note; none for "cancelled") and the canvas without
@@ -568,9 +659,13 @@ class CanvasService:
             yield CanvasEvent(panels=await self.store.panels(chat_id))
 
     async def remove_visual(self, chat_id: str, visual_id: str) -> None:
-        """Take a turn's visual off the chat's canvas (a draft withdrawn); nothing if it is gone already."""
+        """Take a turn's visual off the chat's canvas (a draft withdrawn); nothing if it is gone already. A visual that
+        took the place of a panel (``_place``) gives it back."""
         with suppress(NotFound):
             await self.store.apply(chat_id, CanvasOp(op="remove", visual_id=visual_id), max_panels=self.cfg.max_panels)
+        taken = self._taken.pop(visual_id, None)
+        if taken is not None:
+            await self.store.restore(*taken)
 
     # -------------------------------------------------------------- the conversation's edits and questions
 

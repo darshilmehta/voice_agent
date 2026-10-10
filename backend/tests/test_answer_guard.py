@@ -19,6 +19,7 @@ from app.services.answer_guard import (
     hindi_hold,
     identifiers_in,
     nearest_identifier,
+    number_facts,
     sentence_end,
     terms,
     unsupported_figures,
@@ -557,3 +558,68 @@ def test_says_not_covered(text, denies):
 )
 def test_an_answer_declines_when_it_denies_what_was_asked(answer, question, declines):
     assert answer_declines(answer, [question]) is declines
+
+
+# ------------------------------------------------------------------ malformed and sign-flipped numbers (polish round)
+
+SOURCES = "| Metric | FY24 | FY23 |\n| EBITDA margin | 21.0% | 19.8% |\n| EBITDA growth | 20.4% | 9.1% |"
+HISTORY = "Valmora's EBITDA margin in FY24 was 21.0% [S1]."
+
+
+@pytest.mark.parametrize(
+    ("said", "fixed"),
+    [
+        ("EBITDA rose 20.-4% [S1].", "EBITDA rose 20.4% [S1]."),  # the last real run
+        ("EBITDA rose 20-.4% in FY24.", "EBITDA rose 20.4% in FY24."),
+        ("Revenue was ₹ 7,-365 crore.", "Revenue was ₹ 7,365 crore."),
+        ("Revenue was ₹ 7,,365 crore.", "Revenue was ₹ 7,365 crore."),
+        ("EBITDA grew 20..4%.", "EBITDA grew 20.4%."),
+    ],
+)
+def test_a_sign_or_separator_wedged_into_a_number_is_taken_out(said, fixed):
+    for size in (1, 3, 6, 50):  # however the model's pieces cut the number
+        guard = AnswerGuard(numbers=number_facts([SOURCES]))
+        out, verdicts, _ = stream(guard, said, size)
+        assert out == fixed and verdicts == []
+        assert [c["check"] for c in guard.checks] == ["number"] and guard.checks[0]["action"] == "repaired"
+
+
+def test_a_minus_on_a_figure_the_input_states_unsigned_is_dropped():
+    """The last real run: a conversation reply reused the history's 21.0% as "-21.0%"."""
+    for size in (1, 4, 50):
+        guard = AnswerGuard(numbers=number_facts([HISTORY, "So is that a good margin?"]), whole_sentences=True)
+        out, _, _ = stream(guard, "Yes, a margin of -21.0% is healthy for the sector.", size)
+        assert out == "Yes, a margin of 21.0% is healthy for the sector."
+        assert guard.checks == [{"check": "number", "action": "sign_dropped", "text": "-21.0", "to": "21.0"}]
+
+
+@pytest.mark.parametrize(
+    ("sources", "said"),
+    [
+        ("Net cash flow was (21.0) crore.", "Net cash flow was -21.0 crore."),  # accounting brackets: negative
+        ("Margin fell 21.0% in FY24.", "The margin change was -21.0%."),  # stated as a fall
+        ("Other income was -3.2 crore.", "Other income was -3.2 crore."),  # signed in the source
+        ("Revenue was 7,365 crore.", "Profit was -412 crore."),  # a figure the input doesn't give: not judged
+        ("Revenue grew 21.0%.", "Margins declined by -21.0%."),  # the answer itself speaks of a fall
+        ("Revenue grew 21.0%.", "Tier-1 cities in 2023-24, and Q4-21.0 aside."),  # hyphens inside words and ranges
+    ],
+)
+def test_signs_that_may_be_right_are_kept(sources, said):
+    guard = AnswerGuard(numbers=number_facts([sources]))
+    out, _, _ = stream(guard, said, 3)
+    assert out == said and guard.checks == []
+
+
+def test_number_facts_reads_signs_brackets_and_falls():
+    facts = number_facts(["Margin 21.0% [S1].", "A loss of 5.2 crore.", "(3.1)", "-4.0", "Revenue 7,365; Tier-1"])
+    assert {"21", "7365", "1"} <= facts.unsigned
+    assert {"5.2", "3.1", "4"} <= facts.signed
+
+
+def test_numbers_hold_only_the_token_being_written():
+    guard = AnswerGuard(numbers=number_facts([SOURCES]))
+    assert guard.active
+    assert guard.feed("EBITDA rose ").text == "EBITDA rose "
+    assert guard.feed("20.").text == ""  # may still grow: "20.-4"
+    assert guard.feed("-4% in").text == "20.4% in"  # whitespace ended it; "in" is no number
+    assert guard.finish().text == ""
