@@ -11,6 +11,7 @@ import pytest
 from app.providers.llm import LLMError
 from app.services.voice import vocabulary as vocab
 from app.services.voice.vocabulary import (
+    HINDI_PROMPT_TOKENS,
     PROMPT_TOKENS,
     DocumentWords,
     SpeechHints,
@@ -21,6 +22,8 @@ from app.services.voice.vocabulary import (
     edit_distance,
     estimate_tokens,
     file_words,
+    hindi_content_words,
+    hindi_lexicon,
     title_phrases,
     transliterate,
 )
@@ -286,3 +289,59 @@ async def test_concurrent_requests_build_once():
     sv = SpeechVocabulary(docs, None, count)  # type: ignore[arg-type]
     a, b = await asyncio.gather(sv.hints(Chat()), sv.hints(Chat()))  # type: ignore[arg-type]
     assert a is b and docs.table_calls == ["doc_v"]
+
+
+# ------------------------------------------------------------------ the Hindi documents' own words (last round, item 4)
+
+NOTICE_TEXTS = [
+    "3. पात्रता\nआवेदक की आयु 18 वर्ष से 35 वर्ष के बीच होनी चाहिए; अधिकतम आयु सीमा 40 वर्ष है।",
+    "3. पात्रता\nआवेदक के परिवार की वार्षिक आय ₹ 2,50,000 से अधिक नहीं होनी चाहिए।",
+    "4. योजना के लाभ\nप्रशिक्षण पूरा करने पर ₹ 10,000 की टूलकिट सहायता मिलेगी।",
+    "6. आवश्यक दस्तावेज़\nआधार कार्ड, निवास प्रमाणपत्र, आय प्रमाणपत्र।",
+]
+
+
+def test_the_hindi_prompt_carries_the_notices_concept_words_within_its_budget():
+    words = hindi_content_words(NOTICE_TEXTS)
+    assert words[:4] == ("पात्रता", "आयु", "आय", "दस्तावेज़")  # eligibility, age, income, documents first
+    assert "प्रशिक्षण" not in words  # (long frequent words bled into others on the clips)
+    v = Vocabulary(keywords=("Suryodaya",), terms_hi=("सूर्योदय ग्रामीण कौशल एवं रोज़गार योजना",), words_hi=words)
+    prompt = v.prompts(["hi"])["hi"]
+    assert prompt.startswith("Suryodaya के बारे में। सूर्योदय ग्रामीण कौशल एवं रोज़गार योजना। पात्रता, आयु, आय")
+    assert estimate_tokens(prompt) <= HINDI_PROMPT_TOKENS
+
+
+@pytest.mark.parametrize(
+    ("heard", "fixed"),
+    [
+        ("आवेदक की आयो कितनी होनी चाहे?", "आवेदक की आयु कितनी होनी चाहे?"),  # every synthetic clip of the question
+        ("अधिकतम आयो सीमा क्या है?", "अधिकतम आयु सीमा क्या है?"),
+        ("वार्षिक आय कितनी है?", "वार्षिक आय कितनी है?"),  # "आय" is a word of the notice: left alone
+        ("कितना मिलता है?", "कितना मिलता है?"),  # function words, words with other letters: left alone
+        ("What was Valmora's revenue?", "What was Valmora's revenue?"),
+    ],
+)
+def test_a_hindi_word_one_vowel_sign_off_the_documents_is_written_as_they_write_it(heard, fixed):
+    hints = SpeechHints(lexicon_hi=hindi_lexicon(NOTICE_TEXTS))
+    assert hints.correct_hindi(heard) == fixed
+
+
+def test_a_vowel_sign_slip_that_fits_two_of_the_documents_words_is_left_alone():
+    hints = SpeechHints(lexicon_hi=frozenset({"मिली", "मिले"}))
+    assert hints.correct_hindi("मिला") == "मिला"
+
+
+async def test_the_hindi_documents_texts_come_from_the_store():
+    class Store:
+        async def document_labels(self, filters):
+            return {}
+
+        async def document_texts(self, filters):
+            return {"doc_s": NOTICE_TEXTS, "doc_v": ["Revenue from operations grew 13.6% in FY24."]}
+
+    docs = Docs()
+    docs.ready = {"doc_s": "suryodaya_yojana_soochna.docx", "doc_v": "valmora_annual_report_fy24.pdf"}
+    sv = SpeechVocabulary(docs, Store(), count)  # type: ignore[arg-type]
+    hints = await sv.hints(Chat())  # type: ignore[arg-type]
+    assert "पात्रता, आयु, आय" in hints.prompts["hi"]
+    assert hints.correct_hindi("आयो") == "आयु" and not any("revenue" in w.casefold() for w in hints.lexicon_hi)

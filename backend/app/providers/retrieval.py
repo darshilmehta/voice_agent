@@ -47,6 +47,7 @@ UPSERT_BATCH = 256
 # Chunks of a document read to find its label (``VectorStore.document_labels``): the longest wins, and only the chunks
 # under the document's title lack the title in theirs.
 LABEL_SAMPLE = 16
+TEXT_SAMPLE = 64  # chunks read per document for the speech vocabulary's words
 
 
 def rerank_batch_size(device: str) -> int:
@@ -268,6 +269,12 @@ class VectorStore(Provider):
         ``filters.document_ids``; documents without chunks, or labels, are left out. The label is the longest one among
         a sample of the document's chunks: chunks under the title omit it from theirs. A store that can't say returns
         nothing, and retrieval then doesn't check which document's passage it found (``services/subjects.py``)."""
+        return {}
+
+    async def document_texts(self, filters: RetrievalFilters, *, limit: int = 0) -> dict[str, list[str]]:
+        """document id → the headings and text of a sample of its chunks (up to ``limit`` each, ``TEXT_SAMPLE`` by
+        default), for the speech vocabulary's words of a Hindi document (§9.3). A store that can't say returns
+        nothing."""
         return {}
 
 
@@ -527,6 +534,35 @@ class QdrantStore(VectorStore):
                 return {}
             raise
         return {d: label for d, label in pairs if label}
+
+    async def document_texts(self, filters: RetrievalFilters, *, limit: int = TEXT_SAMPLE) -> dict[str, list[str]]:
+        ids = filters.document_ids
+        if not ids:
+            return {}
+        client = self.client()
+
+        async def texts_of(document_id: str) -> tuple[str, list[str]]:
+            flt = build_filter(RetrievalFilters(filters.project_id, (document_id,)))
+            points, _ = await client.scroll(
+                self.collection,
+                scroll_filter=flt,
+                limit=limit,
+                with_payload=["text", "heading_path"],
+                with_vectors=False,
+            )
+            out = []
+            for p in points:
+                payload = p.payload or {}
+                out.append("\n".join([*map(str, payload.get("heading_path") or []), str(payload.get("text") or "")]))
+            return document_id, out
+
+        try:
+            pairs = await asyncio.gather(*(texts_of(d) for d in ids))
+        except Exception as e:
+            if _not_found(e):
+                return {}
+            raise
+        return {d: texts for d, texts in pairs if texts}
 
     async def drop_collection(self) -> None:
         """Delete the whole collection (tests, re-index). Recreated on the next upsert."""

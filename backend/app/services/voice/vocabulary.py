@@ -30,6 +30,7 @@ import contextlib
 import logging
 import re
 import time
+import unicodedata
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -47,10 +48,15 @@ from ...providers.retrieval import RetrievalFilters, VectorStore
 from ...providers.speech import SpeechRecognizer
 from ...providers.storage import MetadataDB
 from ..documents import DocumentService
+from ..language import wordset
 
 log = logging.getLogger(__name__)
 
 PROMPT_TOKENS = 110  # per language; Whisper's own limit is 223
+# The Hindi prompt also carries the Hindi documents' own frequent words (last round, item 4: "आयु" was heard as "आयो" in
+# 3 of 3 clips, and the question answered as the income limit): up to this many tokens in all, still well under 223.
+HINDI_PROMPT_TOKENS = 170
+MAX_HINDI_CONTENT_WORDS = 12
 MAX_ACRONYMS = 4
 MIN_ACRONYM_TABLES = 2  # an acronym in one table only is a label ("CIN", "ISIN"), not the documents' vocabulary
 MAX_PHRASE_WORDS = 4
@@ -101,6 +107,7 @@ class DocumentWords:
     filename: str
     label: str = ""  # file name words and title (``providers.ingestion.document_label``), "" when unknown
     tables: Sequence[Mapping[str, Any]] = ()  # dicts with ``heading_path`` and ``cells`` (as ``DocumentTable``)
+    texts: Sequence[str] = ()  # a sample of its chunks' headings and text (``VectorStore.document_texts``)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,10 +118,12 @@ class Vocabulary:
     acronyms: tuple[str, ...] = ()  # "EBITDA"
     terms_hi: tuple[str, ...] = ()  # Devanagari: "सूर्योदय ग्रामीण कौशल एवं रोज़गार योजना", "कमलपुर", …
     keywords_hi: tuple[str, ...] = ()  # the keywords in Devanagari ("वाल्मोरा"), when known
+    words_hi: tuple[str, ...] = ()  # Hindi documents' concept words ("पात्रता", "आयु", "आय"), for the prompt
+    lexicon_hi: frozenset[str] = frozenset()  # every Devanagari word of the Hindi documents' texts
 
     @property
     def empty(self) -> bool:
-        return not (self.names or self.terms or self.acronyms or self.terms_hi)
+        return not (self.names or self.terms or self.acronyms or self.terms_hi or self.words_hi)
 
     def prompts(self, languages: Iterable[str] = ("en", "hi"), count: TokenCounter | None = None) -> dict[str, str]:
         """language → prompt; a language with nothing to say is left out. ``count``: the recognizer's tokenizer."""
@@ -144,6 +153,7 @@ class SpeechHints:
     prompts: Mapping[str, str] = field(default_factory=dict)
     lexicon: tuple[str, ...] = ()
     count: TokenCounter | None = None
+    lexicon_hi: frozenset[str] = frozenset()  # the Hindi documents' words (``hindi_lexicon``)
 
     def correct(self, text: str) -> str:
         """``text`` with near misses of the lexicon's words spelled as the documents do ("What was Vamora's revenue"
@@ -177,6 +187,27 @@ class SpeechHints:
             return best[0][1] + suffix
 
         return _LATIN_TOKEN.sub(fix, text)
+
+    def correct_hindi(self, text: str) -> str:
+        """``text`` with Devanagari words that differ from exactly one word of the Hindi documents only in a vowel sign
+        written as the documents write it ("आयो" → "आयु": Whisper wrote "आवेदक की आयो कितनी होनी चाहिए?" for every
+        synthetic clip of the age question, last round item 4). A word the documents have, a function word, or one
+        whose shape (its letters and where vowel signs fall) matches several of their words is left as it is."""
+        if not self.lexicon_hi or not text:
+            return text
+        by_shape: dict[tuple[tuple[str, bool], ...], set[str]] = {}
+        for w in self.lexicon_hi:
+            by_shape.setdefault(_hindi_shape(w), set()).add(w)
+
+        def fix(m: re.Match[str]) -> str:
+            word = m.group(0)
+            plain = word.replace("\u093c", "")
+            if plain in self.lexicon_hi or word in self.lexicon_hi or plain in _HINDI_STOP or len(plain) < 3:
+                return word
+            near = by_shape.get(_hindi_shape(plain), set())
+            return next(iter(near)) if len(near) == 1 else word
+
+        return _DEVANAGARI_RUN.sub(fix, text)
 
 
 LEXICON_MIN_LETTERS = 5
@@ -243,7 +274,11 @@ def hindi_prompt(v: Vocabulary, count: TokenCounter | None = None) -> str:
     latin = _fill([*v.keywords_hi, *v.keywords, *v.acronyms], PROMPT_TOKENS * 2 // 3, count)
     frame = f"{', '.join(latin)} के बारे में।" if latin else ""
     hindi = _fill(v.terms_hi, PROMPT_TOKENS - estimate_tokens(frame, count), count)
-    return " ".join([*([frame] if frame else []), *([", ".join(hindi) + "।"] if hindi else [])])
+    parts = [*([frame] if frame else []), *([", ".join(hindi) + "।"] if hindi else [])]
+    said = set(" ".join(parts).split())
+    left = HINDI_PROMPT_TOKENS - estimate_tokens(" ".join(parts), count) - 1
+    words = _fill([w for w in v.words_hi if w not in said], left, count) if left > 0 else []
+    return " ".join([*parts, *([", ".join(words) + "।"] if words else [])])
 
 
 # ------------------------------------------------------------------ extraction (pure)
@@ -363,13 +398,92 @@ def build_vocabulary(documents: Sequence[DocumentWords], count: TokenCounter | N
     top_acronyms = [a for a, n in acronyms.most_common() if n >= floor and a.casefold() not in keywords]
     top_acronyms = top_acronyms[:MAX_ACRONYMS]
     ranked_hindi = sorted(hindi, key=lambda t: (-hindi[t].tables, len(t.split()), hindi[t].order))
+    hindi_texts = [t for doc in documents for t in doc.texts]
+    words_hi = hindi_content_words(hindi_texts)
     return Vocabulary(
         names=tuple(names),
         keywords=tuple(k.capitalize() for k, _ in keywords.most_common()),
         terms=tuple(ranked),
         acronyms=tuple(top_acronyms),
         terms_hi=tuple(ranked_hindi),
+        words_hi=words_hi,
+        lexicon_hi=hindi_lexicon(hindi_texts),
     )
+
+
+# Words of a Hindi document that say nothing about its subject: postpositions, pronouns, auxiliaries, common verbs.
+_HINDI_STOP = wordset(
+    """
+    का की के को में से पर तक और या भी है हैं था थी थे हो होगा होगी होंगे होता होती होते होने होना हुआ हुई हुए जो जिस
+    जिन जिसे जिससे जिसका जिसकी जिसके यह वह ये वे इस उस इन उन इसका इसकी इसके उसका उसकी उसके इसमें उसमें इसे उसे लिए
+    द्वारा साथ बाद पहले अंदर बीच तथा एवं अथवा किसी कोई कुछ सभी सब हर अन्य अधिक कम नहीं न ही तो कि क्या कब कहाँ कैसे
+    कितना कितनी कितने करना करने करता करती करते करें किया किए की गई गए जाता जाती जाते जाएगा जाएगी जाएंगे दिया दी
+    दिए दिया जा सकता सकती सकते रहे रहा रही रहेगा वाला वाली वाले प्रति अपने अपनी अपना एक दो तीन चार पाँच
+    """
+)
+# The concepts a question about a scheme or policy asks for ("who is eligible", "the age limit", "income", "which
+# documents", "districts", "the benefits"): first among the document's words when it has them.
+_HINDI_CONCEPTS = [
+    "पात्रता",
+    "आयु",
+    "आय",
+    "दस्तावेज़",
+    "दस्तावेज",
+    "जिला",
+    "जिले",
+    "लाभ",
+    "सहायता",
+    "अनुदान",
+    "ऋण",
+    "वजीफ़ा",
+    "वजीफा",
+    "शुल्क",
+    "तिथि",
+    "सीमा",
+    "आरक्षण",
+    "प्रमाणपत्र",
+    "उम्र",
+]
+_DEVANAGARI_RUN = re.compile(r"[ऀ-ॣॱ-ॿ]+")
+
+
+def hindi_content_words(texts: Sequence[str], limit: int = MAX_HINDI_CONTENT_WORDS) -> tuple[str, ...]:
+    """A Hindi document's own words for the speech recognizer's prompt: the concepts its questions ask for that its
+    headings and text have ("पात्रता", "आयु", "आय", "दस्तावेज़", "जिला", "लाभ", …). Measured on synthetic clips, long
+    frequent words ("प्रशिक्षण") bled into others ("वार्षिक आय" → "वार्षिक्षण"), so only these."""
+    counts: Counter[str] = Counter()
+    for text in texts:
+        lines = text.splitlines()
+        for n, line in enumerate(lines):
+            weight = 3 if n < len(lines) - 1 else 1  # the last line is the chunk's text, the others its headings
+            for word in _DEVANAGARI_RUN.findall(line):
+                if len(word) >= 2 and word not in _HINDI_STOP:
+                    counts[word] += weight
+    concepts = [w for w in _HINDI_CONCEPTS if w in counts]
+    return tuple(concepts[:limit])
+
+
+_VOWEL_SIGNS = frozenset(chr(c) for c in range(0x093E, 0x094D)) | {"\u0962", "\u0963"}
+_MARKS = frozenset("\u0901\u0902\u0903\u093c")  # chandrabindu, anusvara, visarga, nukta
+
+
+def _hindi_shape(word: str) -> tuple[tuple[str, bool], ...]:
+    """A Devanagari word's letters (a consonant with its virama, or an independent vowel) and whether each carries a
+    vowel sign: "आयो" and "आयु" are (("आ", False), ("य", True)); "आय" is (("आ", False), ("य", False))."""
+    out: list[list[object]] = []
+    for ch in unicodedata.normalize("NFD", word):
+        if ch in _VOWEL_SIGNS and out:
+            out[-1][1] = True
+        elif ch == "\u094d" and out:
+            out[-1][0] = str(out[-1][0]) + ch
+        elif ch not in _MARKS:
+            out.append([ch, False])
+    return tuple((str(b), bool(v)) for b, v in out)
+
+
+def hindi_lexicon(texts: Sequence[str]) -> frozenset[str]:
+    """The Devanagari words of the Hindi documents' texts (nuktas dropped), for ``SpeechHints.correct_hindi``."""
+    return frozenset(w.replace("\u093c", "") for t in texts for w in _DEVANAGARI_RUN.findall(t) if len(w) >= 2)
 
 
 def _without_legal(phrase: str) -> str:
@@ -544,7 +658,10 @@ class SpeechVocabulary:
                 )
                 vocabulary = replace(vocabulary, keywords_hi=keywords_hi)
             hints = SpeechHints(
-                vocabulary.prompts(self.languages, self.count), vocabulary.lexicon(self.count), self.count
+                vocabulary.prompts(self.languages, self.count),
+                vocabulary.lexicon(self.count),
+                self.count,
+                vocabulary.lexicon_hi,
             )
             self._remember(chat.id, _Entry(key, hints, time.monotonic()))
             log.info(
@@ -567,9 +684,12 @@ class SpeechVocabulary:
 
     async def _words(self, project_id: str, ready: Mapping[str, str]) -> list[DocumentWords]:
         labels: dict[str, str] = {}
+        texts: dict[str, list[str]] = {}
         if self.store is not None and ready:
             with contextlib.suppress(Exception):  # no titles: the file names still give the names
                 labels = await self.store.document_labels(RetrievalFilters(project_id, tuple(ready)))
+            with contextlib.suppress(Exception):  # no texts: the tables still give the terms
+                texts = await self.store.document_texts(RetrievalFilters(project_id, tuple(ready)))
         out = []
         for doc_id, filename in ready.items():
             tables: list[dict[str, Any]] = []
@@ -577,5 +697,6 @@ class SpeechVocabulary:
                 tables = [t.model_dump(include={"heading_path", "cells"}) for t in await self.documents.tables(doc_id)]
             except Exception as e:  # deleted meanwhile, a database hiccup: its name still counts
                 log.info("speech vocabulary: the tables of %s are unavailable: %s", doc_id, e)
-            out.append(DocumentWords(filename, labels.get(doc_id, ""), tables))
+            hindi = [t for t in texts.get(doc_id, []) if len(_DEVANAGARI.findall(t)) * 2 > len(t.replace(" ", ""))]
+            out.append(DocumentWords(filename, labels.get(doc_id, ""), tables, hindi))
         return out

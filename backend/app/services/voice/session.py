@@ -620,7 +620,7 @@ class VoiceSession:
             if report:
                 await self._error("stt", f"transcription failed: {_describe(e)}")
             return None
-        if hints is not None and (text := hints.correct(transcript.text)) != transcript.text:
+        if hints is not None and (text := hints.correct_hindi(hints.correct(transcript.text))) != transcript.text:
             log.info("voice session %s: transcript names corrected: %r → %r", self.id, transcript.text, text)
             transcript = replace(transcript, text=text)
         return transcript

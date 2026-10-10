@@ -812,6 +812,8 @@ Findings → design changes:
 
 faster-whisper small (CPU int8): names 35% → 79% (English 44% → 95%). The answer side has a safety net for what still gets through (`subjects.misheard_names`); these numbers are the recognizer's alone.
 
+**Hindi words of the documents (last round, item 4).** Whisper heard "आयु" (age) as "आयो" in 3 of 3 of the last run's clips, and the question was answered as the income limit. The Hindi prompt now also carries the Hindi documents' concept words that their headings and text have (`vocabulary.hindi_content_words`, from a sample of 64 chunks a document, `VectorStore.document_texts`: "पात्रता, आयु, आय, दस्तावेज़, जिला, लाभ, सहायता, अनुदान, ऋण…"), within `HINDI_PROMPT_TOKENS` (170 of Whisper's 223; long frequent words such as "प्रशिक्षण" bled into others, "वार्षिक आय" → "वार्षिक्षण", so only concept words), and a Devanagari word that differs from exactly one of the documents' words only in a vowel sign is written as they write it (`SpeechHints.correct_hindi`: "आयो" → "आयु"; words the documents have, function words and slips that fit two of their words are left alone). 18 synthetic clips (9 notice questions, `say -v Lekha` at two rates, written to files, never played; mlx-whisper small): the question's key word heard right 2/18 with the old prompt → 6/18 with the concept words → 8/18 with the correction ("आयु" 0/4 → 4/4, "सहायता" 0/2 → 2/2, "दस्तावेज़" 0/2 → 2/2); the old prompt also made one clip a loop of the prompt's names ("कुई आप वाल्मोरा वाल्मोरा, …"), the new one doesn't. Still wrong: "आय" ("आएप"), "अनुदान" ("अनुधान"), "वजीफ़ा" ("वजीवा"), the answer side's misheard-word checks (§3.4) cover some.
+
 **TTS (Kokoro)** — offline from local files, EN `af_heart`, HI `hf_alpha`:
 
 | | CPU | MPS |
