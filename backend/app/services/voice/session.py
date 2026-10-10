@@ -252,6 +252,9 @@ class PendingBargeIn:
     deadline_passed: bool = False
     cap_passed: bool = False
     transcribing: int = 0  # transcriptions of the interrupting speech still running
+    # The interrupting utterance has ended and gone to the worker, whose final transcript decides if nothing has yet:
+    # its speech (the endpointer reads 0 once the utterance is closed) and no "resume" at the deadline or the cap.
+    ended_speech_ms: float | None = None
 
 
 @dataclass(eq=False)
@@ -644,6 +647,8 @@ class VoiceSession:
                 self._drop_speculative()
             case SpeechEnded(utterance=utterance):
                 speculative, self._speculative = self._speculative, None  # handed to the worker, still valid
+                if self._pending is not None:
+                    self._pending.ended_speech_ms = utterance.speech_ms
                 await self._send({"type": "user_speech", "phase": "end"})
                 if self._turn is None:
                     await self._set_state("thinking")
@@ -1444,7 +1449,7 @@ class VoiceSession:
         await asyncio.sleep(timeout * (ACKNOWLEDGEMENT_GRACE - 1))
         pending.cap_passed = True
         await self._evaluate(pending)
-        if self._pending is pending:  # always decided by the cap
+        if self._pending is pending and pending.ended_speech_ms is None:  # decided by the cap, or by the worker
             await self._decide(pending, "resume")
 
     async def _barge_in_check(self) -> None:
@@ -1495,6 +1500,16 @@ class VoiceSession:
 
     async def _evaluate(self, pending: PendingBargeIn) -> None:
         if self._pending is not pending:
+            return
+        if pending.ended_speech_ms is not None:
+            # The utterance is over and its final transcript is coming from the worker, which decides if nothing has:
+            # a partial transcript decides only when it is sure. A short "Stop." said and over before any transcript
+            # was in used to get "resume" here (its speech reads 0 once the utterance is closed), then "stop".
+            sure_stop = pending.backchannel is False and pending.real_words >= 2
+            if pending.transcript is not None and (pending.stop_words or sure_stop):
+                await self._decide(pending, "stop")
+            elif pending.transcript is not None and pending.backchannel:
+                await self._decide(pending, "resume")
             return
         ep = self._endpointer
         evidence = BargeInEvidence(

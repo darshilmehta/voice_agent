@@ -763,6 +763,13 @@ def _filename_labels(filenames: Sequence[str]) -> dict[str, str]:
     return {f: document_label(f, None) for f in filenames}
 
 
+def names_a_subject(text: str, filenames: Sequence[str]) -> bool:
+    """Names a document's subject ("Valmora", "सूर्योदय", misheard "Valmuraka": ``subjects.subject_names``). Spoken
+    Hindi often reaches the router without its question word ("सूर्योदय योजना में आवेदन की अन्तिम तिखिया है।" for
+    "…अंतिम तिथि क्या है?"), so it doesn't read as a question; naming the documents' subject is enough to check them."""
+    return bool(subject_names(text, _filename_labels(filenames)))
+
+
 def rewrite_loses(utterance: str, rewrites: Sequence[str | None], filenames: Sequence[str]) -> str | None:
     """What the utterance names that its rewrite doesn't, or None: a document's subject ("Valmora", also misheard or in
     Devanagari: ``subjects.subject_names``) or a fiscal period ("FY24"). The router writes its query from the

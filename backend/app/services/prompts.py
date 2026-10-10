@@ -508,6 +508,25 @@ def spoken_topic(topic: str | None, language: Language) -> str | None:
     return phrase
 
 
+# Words that say "a document" without saying which one ("back to the report", "back to the document").
+_GENERIC_DOCUMENT_WORDS = frozenset({"report", "reports", "document", "documents", "doc", "docs", "file", "files"})
+
+
+def named_document(text: str, ready: Mapping[str, str]) -> str | None:
+    """The one document (id) of ``ready`` (id → filename) that ``text`` names by a word of its file name that no
+    other document's file name has ("back to the annual report" → valmora_annual_report_fy24.pdf); None when it
+    names none, or several ("back to the policy", "back to the report": generic words name none)."""
+    words = {
+        d: set(re.findall(r"[a-z]{3,}", document_name(f).casefold())) - _GENERIC_DOCUMENT_WORDS
+        for d, f in ready.items()
+    }
+    said = set(re.findall(r"[a-z]{3,}", text.casefold()))
+    named = {
+        d for d, own in words.items() if said & {w for w in own if all(w not in o for e, o in words.items() if e != d)}
+    }
+    return next(iter(named)) if len(named) == 1 else None
+
+
 def resume_text(language: Language, topic: str | None, filenames: Sequence[str]) -> str:
     """Back to the documents without a new question: no model, nothing invented."""
     if len(filenames) == 1:

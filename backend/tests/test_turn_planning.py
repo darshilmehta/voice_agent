@@ -353,6 +353,25 @@ async def test_b1_a_question_about_the_company_the_documents_dont_answer_abstain
     assert p.decision.overrides[-1] == "general_qa→document_qa: asks about the documents' subject (best match 0.00)"
 
 
+async def test_b1_a_misheard_hindi_question_naming_the_documents_subject_is_searched(b1):
+    """Found in the final real-model run: "सूर्योदय योजना में आवेदन की अंतिम तिथि क्या है?" was heard "…की अन्तिम तिखिया
+    है।" (no question word left), routed general, and answered "…अंतिम तिथि 31 जून, 2024 है।" (the notice says 30 नवंबर
+    2024). It names the scheme the notice is about: the documents are searched, and abstain if they don't say."""
+    ready = {"doc1": "annual_report.pdf", "doc2": "suryodaya_yojana_soochna.docx"}
+    b1.reranker.scorer = lambda q, passage: 0.0
+    b1.llm.route = {"intent": "general_qa", "query": None}
+    misheard = "सूर्योदय योजना में आवेदन की अन्तिम तिखिया है।"
+    r = RouteRequest(misheard, "hi", [], ConversationState(chat_id="c"), list(ready.values()))
+    p = await plan(b1, r, ready=ready)
+    assert (p.intent, p.mode, p.needs_retrieval) == ("document_qa", "grounded", True)
+    assert p.decision.overrides[-1].startswith("general_qa→document_qa: asks about the documents' subject")
+    # Small talk that names nothing stays as it was
+    b1.llm.route = {"intent": "conversation", "query": None}
+    r = RouteRequest("आज मौसम बहुत अच्छा है।", "hi", [], ConversationState(chat_id="c"), list(ready.values()))
+    p = await plan(b1, r, ready=ready)
+    assert p.intent == "conversation" and p.decision.retrieval_wait_ms is None
+
+
 HOTEL = "What is the hotel limit per night for level 3 and level 4 employees in tier 1 cities?"
 
 

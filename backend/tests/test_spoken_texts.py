@@ -55,6 +55,49 @@ def test_ux1_the_resume_line_never_speaks_a_raw_label():
     )
 
 
+READY = {
+    "d_ar": "valmora_annual_report_fy24.pdf",
+    "d_deck": "zephyra_investor_deck_q4fy24.pptx",
+    "d_travel": "valmora_travel_expense_policy.docx",
+    "d_notice": "suryodaya_yojana_soochna.docx",
+    "d_health": "valmora_group_health_policy_scan.pdf",
+}
+
+
+@pytest.mark.parametrize(
+    ("said", "named"),
+    [
+        ("Let's go back to the annual report.", "d_ar"),
+        ("back to the investor deck", "d_deck"),
+        ("let's go back to the travel policy", "d_travel"),
+        ("Let's go back to the report.", None),  # "report" alone names no document
+        ("back to the policy", None),  # two policies
+        ("let's go back to the document", None),
+    ],
+)
+def test_final_check_the_document_a_resume_names(said, named):
+    from app.services.prompts import named_document
+
+    assert named_document(said, READY) == named
+
+
+def test_final_check_back_to_the_annual_report_after_another_document_names_that_report():
+    """Final real-model run, the demo's drift row: after Hindi questions about the Suryodaya notice and a general one,
+    "Let's go back to the annual report" got "Sure, back to the Suryodaya Yojana Soochna. We were talking about the
+    seats." (the last document topic), not the annual report the user named."""
+    state = ConversationState(chat_id="c", document_topic="seats total", active_document_ids=["d_notice"])
+    p = SimpleNamespace(state=state, ready=READY)
+    plan = SimpleNamespace(mode="resume", language="en", ack=None)
+    assert ChatTurnService._fixed_reply(plan, p, "Let's go back to the annual report.") == (
+        "Sure, back to the Valmora annual report. What would you like to know?"
+    )
+    # Naming the document of the topic, or no document: the topic is kept, as before
+    assert ChatTurnService._fixed_reply(plan, p, "back to the Suryodaya notice") == ChatTurnService._fixed_reply(
+        plan, p, "Let's go back to the report."
+    )
+    assert "seats" in ChatTurnService._fixed_reply(plan, p, "Let's go back to the report.")
+
+
 # ------------------------------------------------------------------ UX5
 
 

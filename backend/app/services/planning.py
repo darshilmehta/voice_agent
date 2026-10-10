@@ -72,6 +72,7 @@ from .router import (
     fallback_route,
     fast_route,
     leans_on_the_conversation,
+    names_a_subject,
     retrieval_route,
     standalone_question,
     validate,
@@ -371,12 +372,14 @@ class TurnPlanner:
             or route.intent not in ("general_qa", "conversation", "clarification")
             or (route.intent == "clarification" and leans_on_the_conversation(req.utterance))
             or speculation is None
-            or not asks_about_facts(req.utterance)
+            or not (asks_about_facts(req.utterance) or names_a_subject(req.utterance, req.documents))
             or req.live_cue(route.rewritten_query, proposal.query) is not None  # live data: the web search decides
         ):
             return decision, None
-        about = about_the_documents(req.utterance, req.documents) or (
-            route.rewritten_query is not None and about_the_documents(route.rewritten_query, req.documents)
+        about = (
+            about_the_documents(req.utterance, req.documents)
+            or names_a_subject(req.utterance, req.documents)
+            or (route.rewritten_query is not None and about_the_documents(route.rewritten_query, req.documents))
         )
         # An amount, a number, a limit, a rate or a date: the documents answer it or nothing does. A general answer
         # would give a figure from general knowledge that passes for theirs (last round, item 1: "तूलकेच के लिए कितनी
