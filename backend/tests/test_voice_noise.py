@@ -224,6 +224,9 @@ def evidence(text: str = "What was the revenue last year?", **over: object) -> S
         (evidence(user_dbfs=None, level_dbfs=-38.0), "answer"),  # first turn, quiet but clear: answered
         (evidence(user_dbfs=None, level_dbfs=-43.0), "drop"),  # first turn, below the assumed near field
         (evidence("Stop.", level_dbfs=-30.0), "answer"),  # a stop cue is never a fragment
+        (evidence("Thank you.", user_dbfs=None, avg_logprob=-0.9), "drop"),  # Whisper's word for café clatter
+        (evidence("Thank you.", avg_logprob=-0.9), "answer"),  # ... but said at the user's own level
+        (evidence("Thank you.", user_dbfs=None), "answer"),  # a clear "thank you" before any turn
         (evidence(level_dbfs=None), "answer"),  # no level: decided on the words alone
         (evidence("   "), "drop"),
     ],
@@ -271,7 +274,7 @@ def test_hold_to_talk_messages():
 def test_noise_settings(load_local):
     n = load_local().voice.noise
     assert (n.denoise, n.adaptive_gating, n.drop_background_speech) == ("rnnoise", True, True)
-    assert (n.far_field_db, n.far_field_hard_db, n.assumed_user_dbfs, n.assumed_margin_db) == (6, 10, -28, 4)
+    assert (n.far_field_db, n.far_field_hard_db, n.assumed_user_dbfs, n.assumed_margin_db) == (6, 10, -26, 2)
     assert load_local(VOICE__NOISE__DENOISE="off").voice.noise.denoise == "off"
     with pytest.raises(ConfigError, match=r"voice\.noise\.denoise"):
         load_local(VOICE__NOISE__DENOISE="speex")

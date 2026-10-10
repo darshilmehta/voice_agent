@@ -108,8 +108,8 @@ export const DEFAULT_VOICE_INPUT: PublicVoiceInput = {
   loud_floor_dbfs: -35,
   noisy_threshold: 0.8,
   noisy_min_speech_ms: 400,
-  assumed_user_dbfs: -28,
-  assumed_margin_db: 4,
+  assumed_user_dbfs: -26,
+  assumed_margin_db: 2,
   far_field_hard_db: 10,
 };
 

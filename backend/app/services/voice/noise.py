@@ -270,6 +270,7 @@ def addressed(e: SpeechEvidence, cfg: NoiseSettings) -> AddressDecision:
         below it by far_field_db, and unsure, a fragment, or weak vs floor        → drop
         weak against the floor (min_snr_db), not close to the user's level, and
         unsure or a fragment                                                      → drop (babble, the next table)
+        a fragment Whisper is unsure of, not close to the user's level            → drop ("Thank you." for clatter)
         garbled                                                                   → say again (near field only)
         otherwise                                                                 → answer
 
@@ -311,6 +312,8 @@ def addressed(e: SpeechEvidence, cfg: NoiseSettings) -> AddressDecision:
         return decision("drop", f"far field, {why}")
     if weak and not close and (unsure or fragment):
         return decision("drop", f"weak against the noise, {'unsure' if unsure else 'fragment'}")
+    if fragment and unsure and not close:
+        return decision("drop", "an unsure fragment")
     if e.garbled:
         return decision("say_again", "garbled near field")
     return decision("answer", "near field")
