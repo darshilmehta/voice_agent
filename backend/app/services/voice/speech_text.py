@@ -314,7 +314,8 @@ _HUM_HI = {"हम", "हम्म", "हम्मम", "ह्म", "ह्म�
 # Kokoro's "Mm-hmm." as Whisper writes it: "MAMMA.", "Mama.", "Mmm-ma", "M-ma" (last round, item 6: it stopped the
 # answer as an interruption). "mamma" and "mama" are hums only when the utterance is nothing but hums ("मामा", uncle,
 # is a word: "Mama ji kahan hain?" stays a question); "ma" only as part of "mm-ma". "Mamata", "mammal", "ma'am" never.
-_MAMMA = re.compile(r"m+a?m+a+h*")
+# The final run's Kokoro "Mm-hmm." also came back "Mom." and "Mum." (the first stopped the answer): the same rule.
+_MAMMA = re.compile(r"m+a?m+a+h*|m+[ou]m+a*h*")
 _MA = re.compile(r"m+a+h*")
 _PUNCT = re.compile(r"[^\w\s'\-ऀ-ॿ]|[।॥]")
 _REPEAT = re.compile(r"(.)\1{2,}")

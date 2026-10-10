@@ -152,6 +152,7 @@ from .prompts import (
     live_system_prompt,
     live_user_prefix,
     live_user_prompt,
+    named_document,
     names_note,
     on_screen_note,
     own_subject_note,
@@ -855,7 +856,7 @@ class ChatTurnService:
                 yield event
             return
         if plan.mode in ("resume", "ack"):
-            answer = self._fixed_reply(plan, p)
+            answer = self._fixed_reply(plan, p, turn.text)
             yield SourcesEvent([], None, abstained=False)
             p.parts.append(answer)
             yield DeltaEvent(answer)
@@ -1688,13 +1689,17 @@ class ChatTurnService:
         return len(p.ready) > 1 and bool(documents) and documents[0] not in active
 
     @staticmethod
-    def _fixed_reply(plan: TurnPlan, p: _Progress) -> str:
+    def _fixed_reply(plan: TurnPlan, p: _Progress, text: str) -> str:
         if plan.mode == "ack":
             return ack_text(plan.ack or "ack", plan.language)
         state = p.state
-        active = [p.ready[d] for d in (state.active_document_ids if state is not None else []) if d in p.ready]
+        active_ids = [d for d in (state.active_document_ids if state is not None else []) if d in p.ready]
+        named = named_document(text, p.ready) if len(p.ready) > 1 else None
+        if named is not None and named not in active_ids:
+            # "Back to the annual report" after a question about another document: that report, not the last topic
+            return resume_text(plan.language, None, [p.ready[named]])
         topic = state.document_topic if state is not None else None
-        return resume_text(plan.language, topic, active or list(p.ready.values()))
+        return resume_text(plan.language, topic, [p.ready[d] for d in active_ids] or list(p.ready.values()))
 
     async def _after_turn(self, turn: Turn) -> None:
         """After a turn, while its answer is spoken and nobody is asking yet (``ChatActivity``: cancelled the moment

@@ -166,6 +166,7 @@ def test_backchannels(text):
 HUMS = ["M M", "MM", "m-m", "Mm-hmm.", "Mhmm.", "hmm", "Hmmm?", "mhm", "uh huh", "Um.", "उम्म", "हम्म", "हूँ", "हूं"]
 HUMS += ["MMHUM", "mhum", "Mmhum."]  # Whisper's spelling of a voiced "mm-hmm"
 HUMS += ["MAMMA.", "Mama.", "Mmm-ma", "M-ma", "Mamma"]  # Kokoro's "Mm-hmm." as Whisper wrote it (last round, item 6)
+HUMS += ["Mom.", "Mum."]  # and in the final real-model run ("Mom." stopped the answer)
 
 
 @pytest.mark.parametrize("text", HUMS)
@@ -173,7 +174,9 @@ def test_hums_are_backchannels_and_fillers_with_no_real_words(text):
     assert is_backchannel(text, 2) and is_filler(text) and real_words(text) == 0
 
 
-@pytest.mark.parametrize("text", ["Mamata", "mammal", "ma'am", "MAMMA, stop.", "Mama ji kahan hain?"])
+@pytest.mark.parametrize(
+    "text", ["Mamata", "mammal", "ma'am", "MAMMA, stop.", "Mama ji kahan hain?", "Mom, what was the revenue?", "Mumbai"]
+)
 def test_words_like_the_mm_hmm_spellings_stay_words(text):
     assert not is_filler(text) and real_words(text) >= 1 and not is_backchannel(text, 2)
 

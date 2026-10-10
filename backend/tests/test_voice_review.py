@@ -624,3 +624,40 @@ def test_B3_a_long_acknowledgement_over_the_answer_doesnt_stop_it(voice):
         items = c.quiet(0.8)
     assert not of(items, "barge_in") and not of(items, "user_message")
     assert [r[0] for r in roles(voice)] == ["user", "agent"]
+
+
+# ------------------------------------------------------------------ final check: a short "Stop." over the answer
+
+
+def short_burst_over_the_answer(voice, said: str, *, stt_s: float) -> list:
+    """A short utterance over the answer that is over (end of turn) before any transcript of it is in."""
+    voice.fakes.llm.reply = LONG_REPLY
+    voice.fakes.stt.scripts[SAID] = said
+    with voice.connect() as ws:
+        c = VoiceClient(ws)
+        c.start()
+        c.say(QUESTION)
+        c.until("agent_message")
+        voice.fakes.stt.delay = stt_s  # under load (the answer still being written): transcripts come late
+        c.send("barge_in_start", turn_id=1, played_ms=300)
+        paced(c, speech_audio(400, SAID) + silence(900))
+        items = c.until("barge_in", timeout=5)
+        items += c.quiet(stt_s + 1.0)
+    return items
+
+
+def test_a_short_stop_over_before_its_transcript_never_gets_resume_first(voice):
+    """Found in the final real-model run: "Stop." (0.5 s) said over the answer, its transcription slow (the answer was
+    still being written): the utterance ended, the endpointer read its speech as 0 ms, the deadline answered `resume`
+    (the volume came back) and the final transcript stopped the answer 1.4 s later."""
+    items = short_burst_over_the_answer(voice, "Stop.", stt_s=1.2)
+    assert [m["decision"] for m in of(items, "barge_in")] == ["stop"]
+    stopped = of(items, "agent_message")[0]["message"]
+    assert stopped["route"]["interrupted"] == "barge_in"
+
+
+def test_a_short_acknowledgement_over_before_its_transcript_still_resumes(voice):
+    items = short_burst_over_the_answer(voice, "Okay.", stt_s=1.2)
+    assert [m["decision"] for m in of(items, "barge_in")] == ["resume"]
+    assert not of(items, "user_message")
+    assert [r[0] for r in roles(voice)] == ["user", "agent"]
