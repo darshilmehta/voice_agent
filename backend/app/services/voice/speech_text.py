@@ -311,20 +311,35 @@ NOISE_TRANSCRIPTS = {"you", "thanks for watching", "thank you for watching", "su
 # "mm-hmm"), "uh-huh", "um", "ah".
 _HUM = re.compile(r"[mh]*m[mh]*|m+h+u+m+|u+[hm]+|h+u+h+|a+h+|o+h+|e+r+m*")
 _HUM_HI = {"हम", "हम्म", "हम्मम", "ह्म", "ह्म्म", "हूँ", "हूं", "हुं", "हुँ", "उम", "उम्म", "उं", "उँ", "अं", "अँ", "ऊं", "ऊँ"}
+# Kokoro's "Mm-hmm." as Whisper writes it: "MAMMA.", "Mama.", "Mmm-ma", "M-ma" (last round, item 6: it stopped the
+# answer as an interruption). "mamma" and "mama" are hums only when the utterance is nothing but hums ("मामा", uncle,
+# is a word: "Mama ji kahan hain?" stays a question); "ma" only as part of "mm-ma". "Mamata", "mammal", "ma'am" never.
+_MAMMA = re.compile(r"m+a?m+a+h*")
+_MA = re.compile(r"m+a+h*")
 _PUNCT = re.compile(r"[^\w\s'\-ऀ-ॿ]|[।॥]")
 _REPEAT = re.compile(r"(.)\1{2,}")
 
 
 def normalize_utterance(text: str) -> str:
-    """Lower case, no punctuation, stretched letters squeezed ("Hmmmm." → "hmm"), Whisper's noise phrases → ""."""
+    """Lower case, no punctuation, stretched letters squeezed ("Hmmmm." → "hmm"), Whisper's noise phrases → "", and an
+    utterance of hums only with "mamma" or "mama" among them read as "mm-hmm" ("MAMMA." → "mm-hmm")."""
     words = [_REPEAT.sub(r"\1\1", w.strip("-'")) for w in _PUNCT.sub(" ", text.casefold()).split()]
-    phrase = " ".join(w for w in words if w)
+    words = [w for w in words if w]
+    if any(_MAMMA.fullmatch(w) for w in words) and all(_MAMMA.fullmatch(w) or _is_hum(w) for w in words):
+        words = ["mm-hmm" if _MAMMA.fullmatch(w) else w for w in words]
+    phrase = " ".join(words)
     return "" if phrase in NOISE_TRANSCRIPTS else phrase
 
 
 def _is_hum(token: str) -> bool:
     parts = [p for p in token.split("-") if p]
-    return bool(parts) and all(_HUM.fullmatch(p) or p in _HUM_HI for p in parts)
+
+    def hum(p: str) -> bool:
+        return bool(_HUM.fullmatch(p) or p in _HUM_HI)
+
+    if len(parts) > 1 and any(hum(p) for p in parts):  # "mm-ma", "m-ma"
+        return all(hum(p) or _MA.fullmatch(p) or _MAMMA.fullmatch(p) for p in parts)
+    return bool(parts) and all(hum(p) for p in parts)
 
 
 def real_words(text: str) -> int:
@@ -461,3 +476,18 @@ def transcript_garbled(transcript: object) -> bool:
     if confidence is not None and 0.0 <= confidence <= 1.0 and confidence < CONFIDENCE_MIN:
         return True
     return looks_garbled(str(getattr(transcript, "text", "") or ""))
+
+
+# Below this average log probability speech recognition isn't sure of the words, though they may read as a question
+# (measured on the synthetic clips, §9.3: clear questions -0.05 to -0.5, Hindi -0.2 to -0.6, misheard or wrong-language
+# transcripts -0.7 to -1.0): a question the documents don't answer is then asked again rather than declined.
+AVG_LOGPROB_UNSURE = -0.7
+
+
+def transcript_unsure(transcript: object) -> bool:
+    """Speech recognition wasn't sure of this transcript (``avg_logprob`` below ``AVG_LOGPROB_UNSURE``, or a 0-1
+    ``confidence`` below 0.6), when it reports it."""
+    logprob, confidence = getattr(transcript, "avg_logprob", None), getattr(transcript, "confidence", None)
+    if isinstance(logprob, int | float) and logprob < AVG_LOGPROB_UNSURE:
+        return True
+    return isinstance(confidence, int | float) and 0.0 <= confidence < 0.6

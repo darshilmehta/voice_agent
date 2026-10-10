@@ -18,13 +18,16 @@ from app.services.retrieval import (
 from app.services.subjects import (
     asked_names,
     compares_documents,
+    devanagari_sound_key,
     documents_by_name,
     label_words,
     mentions,
     misheard_names,
+    misheard_words,
     named_documents,
     respell,
     sound_key,
+    subject_names,
 )
 from app.settings import RetrievalSection
 
@@ -370,3 +373,56 @@ def test_respelling_keeps_the_rest_of_the_question():
 def test_a_question_that_puts_the_documents_side_by_side_without_naming_them(question, compares):
     assert compares_documents([question]) is compares
     assert compares_documents([None, question]) is compares  # (the English query may be missing)
+
+
+# ------------------------------------------------------------------ last round: the subject an utterance names (item 4)
+
+FILE_LABELS = {
+    f: document_label(f, None)
+    for f in ("valmora_annual_report_fy24.pdf", "suryodaya_yojana_soochna.docx", "zephyra_investor_deck_q4fy24.pptx")
+}
+
+
+@pytest.mark.parametrize(
+    ("said", "names"),
+    [
+        ("Valmuraka, FY24, Meerajesh", {"valmora"}),  # "वालमोरा का FY24 में राजस्व" as Whisper wrote it
+        ("वालमोरा का FY24 में राजस्व", {"valmora"}),
+        ("ज़ेफायरा का एबिटडा मार्जिन", {"zephyra"}),
+        ("सूर्योदय योजना में कितनी सीटें हैं?", {"suryodaya"}),
+        ("What was Valmora's revenue?", {"valmora"}),
+        ("and FY23?", set()),
+        ("आवेदक की आयु कितनी होनी चाहिए?", set()),
+    ],
+)
+def test_the_documents_subject_an_utterance_names_spelled_misheard_or_in_devanagari(said, names):
+    assert subject_names(said, FILE_LABELS) == names
+
+
+def test_a_hindi_possessive_glued_to_a_misheard_name():
+    assert misheard_names(["Valmuraka, FY24, Meerajesh"], FILE_LABELS) == {"Valmuraka": "Valmora"}
+    assert devanagari_sound_key("वालमोरा") == sound_key("Valmora") == "vlmr"
+    assert devanagari_sound_key("ज़ेफायरा") == sound_key("Zephyra") == "sfr"
+
+
+# ------------------------------------------------------------------ last round: misheard Hindi words (item 1)
+
+BENEFITS = [
+    "प्रशिक्षण सफलतापूर्वक पूरा करने पर ₹ 10,000 की टूलकिट सहायता मिलेगी।",
+    "स्वरोज़गार शुरू करने के लिए बैंक ऋण पर 35 प्रतिशत अनुदान दिया जाएगा, जो अधिकतम ₹ 1,75,000 होगा।",
+    "प्रशिक्षुओं को प्रति माह ₹ 3,500 का वजीफ़ा दिया जाएगा।",
+]
+
+
+@pytest.mark.parametrize(
+    ("heard", "misheard"),
+    [
+        ("तूलकेच के लिए कितनी सहायता मिलती है?", {"तूलकेच": "टूलकिट"}),  # the last real run
+        ("बेख रिन पर कितना अनुदान मिलता है?", {"बेख": "बैंक", "रिन": "ऋण"}),
+        ("टूलकिट के लिए कितनी सहायता मिलती है?", {}),  # heard right
+        ("वजीफा कितना मिलता है?", {}),  # the nukta is spelling, not mishearing
+        ("मुंबई की आबादी कितनी है?", {}),  # nothing like it in the passages
+    ],
+)
+def test_words_the_passages_spell_differently_but_that_sound_the_same(heard, misheard):
+    assert misheard_words(heard, BENEFITS) == misheard

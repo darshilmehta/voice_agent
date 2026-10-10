@@ -185,6 +185,7 @@ class BargeInEvidence:
     real_words: int = 0  # words of the transcript that are neither hums ("M M") nor Whisper noise
     cap_passed: bool = False  # the extended deadline (acknowledgements, or a transcription still running) has passed
     transcribing: bool = False  # a transcription of this speech is running (its result may come after the deadline)
+    stop_words: bool = False  # the transcript is a stop phrase ("Stop.", "बस", "ruko"): stop at once, partial or not
 
 
 Verdict = Literal["stop", "resume"]
@@ -194,6 +195,7 @@ def barge_in_verdict(evidence: BargeInEvidence, *, min_speech_ms: float, is_back
     """Duck, then decide (§3.3 c). ``is_backchannel`` is the transcript's classification (None without a transcript;
     hums, fillers, noise and empty transcripts are backchannels).
 
+    0. a transcript that is a stop phrase ("Stop.", "बस", "ruko")     → stop, at once, partial or not
     1. a transcript that isn't a backchannel                          → stop (as soon as it is known), except a
        partial of fewer than 2 real words of speech that has already stopped: Whisper often mishears a short
        snapshot ("M M" for "mm-hmm"), so that waits for the deadline or the final transcript
@@ -212,6 +214,8 @@ def barge_in_verdict(evidence: BargeInEvidence, *, min_speech_ms: float, is_back
                         far ("Yeah…" of "Yeah, right")                   transcribes again meanwhile), then resume:
                                                                          only real words stop the answer
     """
+    if evidence.transcript is not None and evidence.stop_words:
+        return "stop"  # "Stop." as a partial: never "resume" first (the volume came back for ~0.3 s, last round)
     sure = evidence.speaking or evidence.ended or evidence.real_words >= 2
     if evidence.transcript is not None and is_backchannel is False and sure:
         return "stop"

@@ -24,7 +24,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from ..providers.ingestion import Chunk
+from ..providers.ingestion import Chunk, compose_embed_text
 from ..providers.registry import Container
 from ..providers.retrieval import Embedder, Reranker, RetrievalFilters, SearchHit, VectorStore
 from ..settings import RetrievalSection
@@ -119,7 +119,7 @@ def confidence_of(
         return None
     top = ranked[0]
     runner_up = ranked[1].rerank_score if len(ranked) > 1 else 0.0
-    missing = missing_periods(queries, top.chunk.embed_text)
+    missing = period_veto(queries, top.chunk)
     return Confidence(
         top_score=top.rerank_score,
         gap=top.rerank_score - runner_up,
@@ -167,7 +167,7 @@ _DEVANAGARI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789
 # FY24, FY 24, FY'24, FY2024, FY 2024-25, FY24-25, Q4FY24 (the period is named by the year it ends in)
 _FISCAL_YEAR = re.compile(r"(?<![A-Za-z])FY\s?'?(\d{4}|\d{2})(?:\s?[-\u2013/]\s?(\d{4}|\d{2}))?\b", re.IGNORECASE)
 # 2023-24, 2024-2025, 2023/24 (Indian financial years, also inside Hindi text: वित्त वर्ष 2024-25)
-_YEAR_SPAN = re.compile(r"\b(?:19|20)\d{2}\s?[-\u2013/]\s?((?:19|20)?\d{2})\b")
+_YEAR_SPAN = re.compile(r"\b(?:19|20)\d{2}\s?[-\u2013/]\s?((?:19|20)?\d{2})\b(?![-/.]\d)")  # not "2024-03-31"
 _YEAR = re.compile(r"\b(?:19|20)(\d{2})\b")
 # A month before a year places a date in one financial year (April to March): "31 March 2024" is FY24, "June 2024" FY25.
 _JAN_MAR = r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|जनवरी|फ़रवरी|फरवरी|मार्च"
@@ -176,14 +176,46 @@ _APR_DEC = (
     r"|अप्रैल|मई|जून|जुलाई|अगस्त|सितंबर|सितम्बर|अक्टूबर|अक्तूबर|नवंबर|नवम्बर|दिसंबर|दिसम्बर"
 )
 _DATED_YEAR = re.compile(rf"(?:\b|(?<=\s))(?:({_JAN_MAR})|({_APR_DEC}))\.?,?\s+(?:19|20)(\d{{2}})\b", re.IGNORECASE)
+# The end of an Indian fiscal year (April to March): "31 March 2024", "March 31, 2024", "31st March, 2024", "March
+# 2024", "31.03.2024", "31/03/24", "2024-03-31", "31 मार्च 2024" all mean the end of FY24 (the final real run: "net debt
+# on 31 March 2024" was answered with FY23's ₹1,188 crore, from a passage about 31 March 2023, 3 of 3 times).
+_YEAR_END = re.compile(
+    r"(?<![A-Za-z])(?:31(?:st)?\s+)?(?:mar(?:ch)?|मार्च)\.?,?\s+(?:31(?:st)?,?\s+)?((?:19|20)\d{2})(?!\d)"
+    r"|(?<![\d.])31\s*([./-])\s*0?3\s*\2\s*((?:19|20)?\d{2})(?![\d.]\d)"
+    r"|(?<![\d.])((?:19|20)\d{2})\s*([./-])\s*03\s*\5\s*31(?!\d)",
+    re.IGNORECASE,
+)
 
 
-def asked_periods(text: str) -> set[int]:
-    """Fiscal years a question names explicitly, as the two-digit year they end in (FY24, FY 2023-24, 2023-24 → 24).
-    A bare calendar year ("in 2024") is not one: it is ambiguous and often part of a date."""
+def fiscal_year_ends(text: str) -> list[int]:
+    """The fiscal years whose last day ``text`` names (31 March, or March of a year), as the two-digit year they end
+    in, in order: "net debt on 31 March 2024" → [24]."""
+    out: list[int] = []
+    for m in _YEAR_END.finditer(text.translate(_DEVANAGARI_DIGITS)):
+        year = int((m.group(1) or m.group(3) or m.group(4))[-2:])
+        if year not in out:
+            out.append(year)
+    return out
+
+
+def with_fiscal_years(query: str) -> str:
+    """``query`` with the fiscal year of each year-end date it names and doesn't name as a fiscal year already: "What
+    was net debt on 31 March 2024?" → "What was net debt on 31 March 2024? (FY24)". Searched and reranked like that,
+    a passage about FY24 meets the question in its own words."""
+    named = asked_periods(query, dates=False)
+    extra = [y for y in fiscal_year_ends(query) if y not in named]
+    return f"{query} ({', '.join(f'FY{y:02d}' for y in extra)})" if extra else query
+
+
+def asked_periods(text: str, *, dates: bool = True) -> set[int]:
+    """Fiscal years a question names explicitly, as the two-digit year they end in (FY24, FY 2023-24, 2023-24 → 24),
+    and with ``dates`` the fiscal years whose end it names ("31 March 2024" → 24). A bare calendar year ("in 2024") is
+    not one: it is ambiguous and often part of a date."""
     text = text.translate(_DEVANAGARI_DIGITS)
     out = {int((end or start)[-2:]) for start, end in _FISCAL_YEAR.findall(text)}
     out.update(int(end[-2:]) for end in _YEAR_SPAN.findall(text))
+    if dates:
+        out.update(fiscal_year_ends(text))
     return out
 
 
@@ -205,14 +237,68 @@ def missing_periods(queries: Sequence[str | None], passage: str) -> tuple[int, .
     """The fiscal years the queries name that ``passage`` doesn't state, sorted (empty: nothing missing). A passage
     that states no year at all can't contradict the question ("EBITDA margin 18.2%" on a slide of an FY24 deck):
     nothing is missing then."""
-    asked: set[int] = set()
-    for q in queries:
-        if q:
-            asked |= asked_periods(q)
+    asked = _asked(queries)
     if not asked:
         return ()
     stated = stated_periods(passage)
     return tuple(sorted(asked - stated)) if stated else ()
+
+
+def _asked(queries: Sequence[str | None]) -> set[int]:
+    asked: set[int] = set()
+    for q in queries:
+        if q:
+            asked |= asked_periods(q)
+    return asked
+
+
+def passage_text(chunk: Chunk) -> str:
+    """What a passage itself says: its headings, overlap and text, without its document's label (every passage of
+    "valmora_annual_report_fy24.pdf" states FY24 through its label)."""
+    return compose_embed_text(chunk.heading_path, chunk.overlap_text, chunk.text)
+
+
+def dated_to_another_year(queries: Sequence[str | None], chunk: Chunk) -> tuple[int, ...]:
+    """The fiscal years the queries name, when the passage dates its figures to the end of another fiscal year only:
+    its own text names a year-end ("at 31 March 2023") and neither that nor any fiscal year it names explicitly is one
+    asked for (empty otherwise). The final real run answered "net debt on 31 March 2024" with "Recap of FY23 … Net
+    debt stood at ₹ 1,188 crore at 31 March 2023", 3 of 3: through its document's label ("… fy24", "2023-24") that
+    passage "stated" FY24. A passage that only compares with another year ("₹ 481 crore, up 45.8% on FY23") dates
+    nothing and is left to ``missing_periods``, as before."""
+    asked = _asked(queries)
+    if not asked:
+        return ()
+    own = passage_text(chunk)
+    ends = set(fiscal_year_ends(own))
+    if not ends or ends & asked or asked_periods(own) & asked:
+        return ()
+    return tuple(sorted(asked))
+
+
+def period_veto(queries: Sequence[str | None], chunk: Chunk) -> tuple[int, ...]:
+    """Why the gate can't answer from this passage: the asked fiscal years it misses (``missing_periods``, on the
+    passage with its label) or, when it dates its figures to another year-end, all of them; empty when none."""
+    return missing_periods(queries, chunk.embed_text) or dated_to_another_year(queries, chunk)
+
+
+PERIOD_PROMOTION = 0.5  # a passage of the asked year goes first if it scores at least this share of the best one
+
+
+def prefer_stated_periods(
+    ranked: Sequence[RankedChunk], queries: Sequence[str | None], *, min_score: float = 0.0
+) -> list[RankedChunk]:
+    """Reranked passages with those the period check accepts first, when the best one is dated to another year-end
+    (``dated_to_another_year``) and they are about as relevant (at least ``PERIOD_PROMOTION`` of its score, and
+    ``min_score``), each group in its order: the gate reads the best passage, and the answer the first ones ("net debt
+    on 31 March 2024": the FY24 passages before the recap of FY23). Otherwise unchanged: a best passage that misses the
+    asked year (an FY25 question over FY24 documents) is vetoed as before, without looking further."""
+    if not ranked or not dated_to_another_year(queries, ranked[0].chunk):
+        return list(ranked)
+    floor = max(min_score, ranked[0].rerank_score * PERIOD_PROMOTION)
+    fine = [r for r in ranked if r.rerank_score >= floor and not period_veto(queries, r.chunk)]
+    if not fine:
+        return list(ranked)
+    return [*fine, *(r for r in ranked if r not in fine)]
 
 
 # ------------------------------------------------------------------ service
@@ -343,9 +429,15 @@ class RetrievalService:
         documents is answered from those (``prefer_named_documents``). Without it passages are taken as they come."""
         t1 = time.perf_counter()
         rerank_query = (query_en or "").strip() or query
-        ranked = await self.rerank(rerank_query, hits, native_query=query if rerank_query != query else None)
+        # a year-end date is searched and reranked with its fiscal year: "… on 31 March 2024? (FY24)"
+        ranked = await self.rerank(
+            with_fiscal_years(rerank_query),
+            hits,
+            native_query=with_fiscal_years(query) if rerank_query != query else None,
+        )
         named = named_documents((query, query_en), await self.document_labels(scope)) if scope is not None else None
         ranked, missing_subjects = prefer_named_documents(ranked, named)
+        ranked = prefer_stated_periods(ranked, (query, query_en), min_score=self.config.min_rerank_score)
         t2 = time.perf_counter()
         return RetrievalResult(
             query=query,
@@ -489,8 +581,10 @@ def _ignore_failure(task: asyncio.Task[Any]) -> None:
 
 
 def _queries(query: str, query_en: str | None) -> list[str]:
+    """The texts searched: the query and its English form, each with the fiscal year of a year-end date it names."""
     q = query.strip()
     if not q:
         raise ValueError("empty query")
     en = (query_en or "").strip()
-    return [q, en] if en and en.casefold() != q.casefold() else [q]
+    texts = [q, en] if en and en.casefold() != q.casefold() else [q]
+    return [with_fiscal_years(t) for t in texts]

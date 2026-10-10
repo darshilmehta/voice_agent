@@ -438,6 +438,28 @@ def unsupported_figures(sentence: str, allowed: set[str]) -> list[str]:
     return out
 
 
+# ------------------------------------------------------------------ a general answer's own disclaimer (item 1)
+
+# What the model writes when it says the answer isn't from the documents, at its start, after the app has said so
+# itself ("Not from your documents, but …" / "यह आपके दस्तावेज़ों से नहीं है, लेकिन …").
+_DISCLAIMER = re.compile(
+    r"^\s*(?:(?:this|that|it)\s+(?:is\s+not|isn't|is\s+n't|does\s+not\s+come|doesn't\s+come)\s+|not\s+)"
+    r"(?:from|in)\s+(?:your|the)\s+(?:uploaded\s+)?documents?\b[\s,.;:\u2014-]*(?:but\b[\s,]*)?"
+    r"|^\s*(?:यह\s+)?(?:जानकारी\s+)?(?:आपके|आपकी|इन)\s+(?:दस्तावेज़ों|दस्तावेजों|दस्तावेज़|दस्तावेज|डॉक्यूमेंट्स?)\s+"
+    r"(?:से|में)\s+(?:नहीं|नही)\s*(?:है|हैं|मिली|मिलती)?[\s,।.;:\u2014-]*(?:(?:लेकिन|परंतु|पर|मगर)\b[\s,]*)?",
+    re.IGNORECASE,
+)
+
+
+def drop_disclaimer(text: str) -> str:
+    """``text`` without a "not from your documents" opening (one, at its start); the rest's first letter as it was."""
+    m = _DISCLAIMER.match(text)
+    if not m or not m.group(0).strip():
+        return text
+    rest = text[m.end() :]
+    return rest if rest.strip() else ""
+
+
 # ------------------------------------------------------------------ the guard
 
 _SENTENCE_PUNCT = ".!?\u0964\u0965"
@@ -503,17 +525,24 @@ class AnswerGuard:
 
     coverage: Coverage | None = None
     identifiers: Sequence[str] = ()
-    figures: set[str] | None = None  # allowed figures (sources and question): checks live-data answers
+    figures: set[str] | None = None  # allowed figures (sources and question): live-data and general answers
     live_line: str = ""  # replaces a sentence with a figure from nowhere
+    figure_check: str = "live_figure"  # its name in ``checks``: "live_figure", or "general_figure" (item 1)
+    # The answer follows the fixed "Not from your documents, but …": the model's own disclaimer at its start is dropped
+    # (the last real run spoke it twice, in Hindi).
+    after_disclaimer: bool = False
     renames: Mapping[str, str] = field(default_factory=dict)  # misheard name → the documents' spelling
     max_words: int | None = None
     max_sentences: int | None = None
     lower_first: bool = False  # the answer follows a fixed prefix: its first word in lower case when common
+    # A short reply (conversation, clarification): never released mid-word, and when the model's token cap cuts it,
+    # it ends at its last whole sentence (last round, item 5: Hindi clarifications ended "… किसी विशिष्ट विषय").
+    whole_sentences: bool = False
     checks: list[dict[str, Any]] = field(default_factory=list)
     attempt: int = 1
 
     def __post_init__(self) -> None:
-        self.sentence_hold = self.coverage is not None or self.figures is not None
+        self.sentence_hold = self.coverage is not None or self.figures is not None or self.after_disclaimer
         self.lag_release = self.coverage is not None and self.figures is None
         self.token_hold = bool(self.identifiers) or bool(self.renames)
         self._phrase_words = max((len(k.split()) for k in self.renames), default=1)
@@ -536,7 +565,13 @@ class AnswerGuard:
 
     @property
     def active(self) -> bool:
-        return self.sentence_hold or self.token_hold or self.max_words is not None or self.max_sentences is not None
+        return (
+            self.sentence_hold
+            or self.token_hold
+            or self.whole_sentences
+            or self.max_words is not None
+            or self.max_sentences is not None
+        )
 
     # -------------------------------------------------------------- streaming
 
@@ -559,13 +594,25 @@ class AnswerGuard:
         out.append(self._spaced(self._partial()))
         return Released("".join(out))
 
-    def finish(self) -> Released:
-        """The model's stream ended: the last sentence."""
+    def finish(self, *, truncated: bool = False) -> Released:
+        """The model's stream ended: the last sentence. ``truncated``: it ended because it reached its token cap, so a
+        last sentence without its end was cut: dropped when nothing of it is out yet and a sentence before it was;
+        else ended at its last whole word with "…" (a word may have been cut too)."""
         if self.done:
             return Released()
         rest, self.buffer = self.buffer, ""
         if not (self.current + rest).strip():
             return Released()
+        if truncated and sentence_end(self.current + rest + " ") is None:
+            if not self.current.strip() and self.sentences > 0:
+                self._record("length", "cut_sentence_dropped", rest)
+                return Released()
+            at = max(rest.rfind(" "), rest.rfind("\n"))  # before the last word, which the cap may have cut
+            kept = rest[:at].rstrip(" ,;:\u2014\u2013-") if at >= 0 else ""
+            if not (self.current + kept).strip():
+                return Released()
+            self._record("length", "cut_at_word", self.current + rest)
+            return Released(self._spaced(self._fix_tokens(kept) + "\u2026"))
         r = self._sentence(rest)
         return Released(self._spaced(r.text), r.verdict)
 
@@ -583,6 +630,13 @@ class AnswerGuard:
     def _sentence(self, unreleased: str) -> Released:
         full = self.current + unreleased
         self.current = ""
+        if self.after_disclaimer and not self.released and full == unreleased:
+            bare = drop_disclaimer(unreleased)
+            if bare != unreleased:
+                self._record("disclaimer", "dropped", unreleased[: len(unreleased) - len(bare)])
+                full = unreleased = bare
+                if not bare.strip():  # the disclaimer was the whole sentence
+                    return Released()
         out = self._fix_tokens(unreleased)
         replaced = False
         stop = False
@@ -595,10 +649,10 @@ class AnswerGuard:
         elif self.figures is not None and unsupported_figures(full, self.figures):
             replaced = True
             if self.live_said:
-                self._record("live_figure", "dropped", full)
+                self._record(self.figure_check, "dropped", full)
                 out = ""
             else:
-                self._record("live_figure", "replaced", full)
+                self._record(self.figure_check, "replaced", full)
                 self.live_said = True
                 out = " " + self.live_line
         out = self._first(out)
@@ -695,6 +749,13 @@ class AnswerGuard:
                 if len(words) <= hold:
                     return ""
                 cut = words[len(words) - hold - 1].end()
+        elif self.whole_sentences:
+            # whole words of the first sentence as they come; later sentences whole (they can be dropped if cut)
+            if self.sentences > 0:
+                return ""
+            cut = max(self.buffer.rfind(" "), self.buffer.rfind("\n")) + 1
+            if cut <= 0:
+                return ""
         else:
             cut = len(self.buffer)
         text, self.buffer = self.buffer[:cut], self.buffer[cut:]

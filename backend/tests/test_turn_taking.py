@@ -155,6 +155,24 @@ def test_short_partials_of_finished_speech_wait_for_more_evidence(kw, verdict):
     assert barge_in_verdict(evidence(**kw), min_speech_ms=250, is_backchannel=False) == verdict
 
 
+@pytest.mark.parametrize("deadline_passed", [False, True])
+def test_a_stop_word_stops_at_once_even_as_a_short_partial(deadline_passed):
+    """The last real run: "Stop." first got "resume" from its partial (one real word of speech that had stopped), so the
+    volume came back for ~0.3 s before the final transcript stopped the answer."""
+    kw = {
+        "speech_ms": 300,
+        "speaking": False,
+        "transcript": "Stop.",
+        "real_words": 1,
+        "deadline_passed": deadline_passed,
+    }
+    assert barge_in_verdict(evidence(**kw), min_speech_ms=250, is_backchannel=False) == (
+        "resume" if deadline_passed else None
+    )
+    stop = barge_in_verdict(evidence(**kw, stop_words=True), min_speech_ms=250, is_backchannel=False)
+    assert stop == "stop"
+
+
 @pytest.mark.parametrize(
     ("kw", "verdict"),
     [

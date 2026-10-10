@@ -67,6 +67,7 @@ from .router import (
     TurnRouter,
     about_the_documents,
     asks_about_facts,
+    asks_for_figure,
     asks_for_judgement,
     fallback_route,
     fast_route,
@@ -175,6 +176,19 @@ def _corrected_mode(history: Sequence[Message]) -> AnswerMode:
     return "grounded"
 
 
+def said_again(req: RouteRequest) -> bool:
+    """The previous reply was the "say it again" line and was heard in full: another garbled transcript gets nothing
+    (a TV keeps talking). Cut short, it is said again (last round, item 6: the reversed Hindi clip went on over it, so
+    the user heard none of it, and the next part got only a silent "Not understood")."""
+    last = req.last_answer
+    if last is None:
+        return False
+    route = last.route or {}
+    if route.get("answer") != "ack" or route.get("intent") != "clarification" or route.get("stopped"):
+        return False
+    return last.heard_text is None or last.heard_text.strip() == last.text.strip()
+
+
 _MODES: dict[Intent, tuple[AnswerMode, bool]] = {
     "document_qa": ("grounded", True),
     "mixed": ("mixed", True),
@@ -213,11 +227,7 @@ def policy(
     mode, search = _MODES[intent]
     ack: AckKind | None = None
     if decision.reply == "repeat":  # a garbled transcript: "Sorry, I didn't catch that…", once (then nothing)
-        last = (req.last_answer.route or {}) if req.last_answer is not None else {}
-        mode, ack = (
-            ("silent" if last.get("answer") == "ack" and last.get("intent") == "clarification" else "ack"),
-            "repeat",
-        )
+        mode, ack = ("silent" if said_again(req) else "ack"), "repeat"
     elif intent == "backchannel":
         last = req.last_answer
         if last is not None and (last.route or {}).get("answer") == "ack":
@@ -368,6 +378,11 @@ class TurnPlanner:
         about = about_the_documents(req.utterance, req.documents) or (
             route.rewritten_query is not None and about_the_documents(route.rewritten_query, req.documents)
         )
+        # An amount, a number, a limit, a rate or a date: the documents answer it or nothing does. A general answer
+        # would give a figure from general knowledge that passes for theirs (last round, item 1: "तूलकेच के लिए कितनी
+        # सहायता मिलती है?", misheard "टूलकिट…", got "₹ 1,500 प्रति माह"; the notice says ₹ 10,000).
+        figure = not about and any(asks_for_figure(t) for t in (req.utterance, route.rewritten_query, proposal.query))
+        about = about or figure
         searched = validate(proposal.model_copy(update={"intent": "document_qa"}), req, llm_ms=decision.llm_ms)
         query = searched.route.rewritten_query or req.utterance
         t0 = time.perf_counter()
@@ -390,7 +405,8 @@ class TurnPlanner:
         elif about:  # about the documents' subject: searched, and if they don't say, the answer abstains
             intent = "document_qa"
             found_part = f"best match {score}" if lookup.done() else "retrieval still running"
-            why = f"{was}→document_qa: asks about the documents' subject ({found_part})"
+            asks = "asks for a figure" if figure else "asks about the documents' subject"
+            why = f"{was}→document_qa: {asks} ({found_part})"
         else:
             lookup.cancel()
             kept = f"{was} kept: " + ("the documents don't match" if lookup.done() else "retrieval too slow")

@@ -58,6 +58,56 @@ def test_nor_the_same_tables_cut_down_to_fewer_quarters_than_the_draft_has():
     assert loses(fewer) == "the planner's chart shows fewer of the periods asked for"  # FY23 and FY24; only FY24 left
 
 
+REPRO = "Show me Valmora's quarterly revenue and EBITDA for FY23 and FY24"
+BOTH_YEARS = ["ds_q_fy23:revenue", "ds_q_fy24:revenue", "ds_q_fy23:ebitda", "ds_q_fy24:ebitda"]
+
+
+def test_the_final_runs_two_point_refinement_of_the_eight_quarter_draft_loses():
+    """The last real-model run (2 of 4): the 8-quarter draft was replaced ~6 s later by a grouped bar of Q4 FY23 and
+    Q4 FY24. "FY23 and FY24" over quarterly tables means all eight quarters; "Q4 FY23" doesn't show "FY23"."""
+    drafted = draft_visual(REPRO, "en", POOL_LIST)
+    assert drafted.spec is not None and drafted.spec.datasets == ["ds_q_fy23", "ds_q_fy24"]
+    q4_only = VisualSpec(
+        kind="grouped_bar", datasets=["ds_q_fy23", "ds_q_fy24"], series=BOTH_YEARS, periods=["Q4 FY23", "Q4 FY24"]
+    )
+    assert loses(q4_only, REPRO) == "the planner's chart shows fewer of the periods asked for"
+    # the same chart of all eight quarters, as bars, is fine
+    eight = VisualSpec(kind="grouped_bar", datasets=["ds_q_fy23", "ds_q_fy24"], series=BOTH_YEARS)
+    assert loses(eight, REPRO) is None
+
+
+def test_a_chart_of_fewer_quarters_loses_even_when_every_year_named_is_on_it():
+    one_year = "Show me quarterly revenue and EBITDA for FY24"
+    two = VisualSpec(
+        kind="grouped_bar", datasets=["ds_q_fy24"], series=["ds_q_fy24:revenue", "ds_q_fy24:ebitda"],
+        periods=["Q3 FY24", "Q4 FY24"],
+    )  # fmt: skip
+    assert loses(two, one_year) == "the planner's chart shows fewer of the periods asked for"
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Show me only Q4 revenue and EBITDA for FY23 and FY24",
+        "Just show the Q4 revenue and EBITDA of FY23 and FY24",
+        "Show me Q4 FY23 and Q4 FY24 revenue and EBITDA",
+    ],
+)
+def test_fewer_points_are_fine_when_the_question_asks_for_fewer(question):
+    q4_only = VisualSpec(
+        kind="grouped_bar", datasets=["ds_q_fy23", "ds_q_fy24"], series=BOTH_YEARS, periods=["Q4 FY23", "Q4 FY24"]
+    )
+    assert cues(question).narrow
+    assert loses(q4_only, question) is None
+
+
+def test_the_latest_quarter_asked_for_is_narrow_and_a_whole_year_is_not():
+    assert cues("What was revenue in the latest quarter?").narrow
+    assert cues("सिर्फ़ Q4 FY24 का राजस्व दिखाओ").narrow
+    assert not cues(REPRO).narrow
+    assert not cues("Show quarterly revenue").narrow
+
+
 def test_nor_a_chart_with_fewer_of_the_series_the_question_names():
     revenue_only = VisualSpec(
         kind="line", datasets=["ds_q_fy23", "ds_q_fy24"], series=["ds_q_fy23:revenue", "ds_q_fy24:revenue"]

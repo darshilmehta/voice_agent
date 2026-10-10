@@ -13,10 +13,13 @@ from app.services.retrieval import (
     RetrievalService,
     asked_periods,
     confidence_of,
+    fiscal_year_ends,
     fuse_hit_lists,
     missing_periods,
+    prefer_stated_periods,
     rank_by_scores,
     stated_periods,
+    with_fiscal_years,
 )
 from app.settings import RetrievalSection
 
@@ -127,6 +130,89 @@ def test_the_document_label_counts_as_stated():
     chunk = make_chunk(0, text="Net debt declined to ₹ 831 crore.", document_label="valmora annual report fy24")
     conf = confidence_of([RankedChunk(chunk, 0.9, 0.03, 0.7, 1)], 0.05, queries=["Net debt in FY24?"])
     assert conf.above_threshold is True
+
+
+# ------------------------------------------------------------------ the end of a fiscal year (last round, item 3)
+#
+# The final real run: "What was Valmora's net debt on 31 March 2024?" was answered ₹1,188 crore (FY23's, from p.16
+# "Recap of FY23 … at 31 March 2023") 3 of 3 times; the answer is ₹831 crore (p.17). The date named no fiscal year, and
+# every passage of "valmora annual report fy24" states FY24 through its document label.
+
+LABEL = "valmora annual report fy24: Valmora Industries Limited - Annual Report 2023-24"
+RECAP = make_chunk(
+    0,
+    heading_path=["Management discussion and analysis", "Recap of FY23, the comparative year"],
+    text="In FY23, revenue was ₹ 6,482 crore. Net debt stood at ₹ 1,188 crore at 31 March 2023, or 0.93x EBITDA.",
+    document_label=LABEL,
+)
+MDA = make_chunk(
+    1,
+    heading_path=["Management discussion and analysis: FY24 financial performance"],
+    text="Net debt declined to ₹ 831 crore from ₹ 1,188 crore, and ROCE rose to 19.6% from 17.9%.",
+    document_label=LABEL,
+)
+NET_DEBT = "What was Valmora's net debt on 31 March 2024?"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "What was Valmora's net debt on 31 March 2024?",
+        "What was Valmora's net debt on March 31, 2024?",
+        "net debt as at 31st March, 2024",
+        "net debt as at 31.03.2024",
+        "net debt on 31/03/24",
+        "net debt on 2024-03-31",
+        "net debt at the end of March 2024",
+        "वाल्मोरा का शुद्ध ऋण 31 मार्च 2024 को कितना था?",
+        "३१ मार्च २०२४ को शुद्ध ऋण",
+    ],
+)
+def test_the_last_day_of_march_names_the_fiscal_year_that_ends_on_it(text):
+    assert fiscal_year_ends(text) == [24]
+    assert asked_periods(text) == {24}
+    assert with_fiscal_years(text) == f"{text} (FY24)"
+
+
+def test_other_dates_and_years_name_no_fiscal_year_end():
+    for text in ("What happened in 2024?", "net debt on 30 June 2024", "summary 2024", "Q4 FY24 results"):
+        assert fiscal_year_ends(text) == []
+    assert with_fiscal_years("net debt on 31 March 2024 (FY24)") == "net debt on 31 March 2024 (FY24)"
+    assert asked_periods("2024-03-31") == {24}  # an ISO date is not the span "2024-03"
+
+
+def test_a_passage_about_another_year_is_vetoed_whatever_its_documents_label_says():
+    ranked = [RankedChunk(RECAP, 0.93, 0.03, 0.7, 1)]
+    conf = confidence_of(ranked, 0.02, queries=[NET_DEBT, None])
+    assert conf.missing_periods == (24,) and conf.above_threshold is False  # abstains rather than answer FY23's
+    # with the label, it "stated" FY24: that is what let the recap of FY23 answer
+    assert missing_periods([NET_DEBT], RECAP.embed_text) == ()
+
+
+def test_the_passage_that_states_the_year_asked_for_goes_first():
+    ranked = [RankedChunk(RECAP, 0.93, 0.03, 0.7, 1), RankedChunk(MDA, 0.81, 0.03, 0.7, 2)]
+    ordered = prefer_stated_periods(ranked, [NET_DEBT, None], min_score=0.02)
+    assert [r.chunk.chunk_index for r in ordered] == [1, 0]
+    conf = confidence_of(ordered, 0.02, queries=[NET_DEBT, None])
+    assert conf.above_threshold is True and conf.top_score == 0.81
+    # one that is much less relevant is not promoted: the gate abstains instead
+    weak = [RankedChunk(RECAP, 0.93, 0.03, 0.7, 1), RankedChunk(MDA, 0.2, 0.03, 0.7, 2)]
+    assert prefer_stated_periods(weak, [NET_DEBT, None], min_score=0.02) == weak
+    # a question that names no period, or whose best passage states it, keeps the reranker's order
+    assert prefer_stated_periods(ranked, ["What was Valmora's net debt?"]) == ranked
+    assert prefer_stated_periods(ranked, ["Net debt at 31 March 2023?"]) == ranked
+
+
+def test_a_year_end_date_is_searched_and_reranked_with_its_fiscal_year():
+    store = FakeStore(results=[[hit(RECAP), hit(MDA)], [hit(MDA)]])
+    svc, embedder, reranker = service(store, scorer=lambda q, p: 0.93 if "Recap" in p else 0.81)
+    hi = "वाल्मोरा का शुद्ध ऋण 31 मार्च 2024 को कितना था?"
+    res = asyncio.run(svc.retrieve(hi, project_id="proj1", document_ids=["doc1"], query_en=NET_DEBT))
+    assert embedder.calls == [[f"{hi} (FY24)", f"{NET_DEBT} (FY24)"]]
+    assert reranker.calls[0][0] == f"{NET_DEBT} (FY24)"
+    assert res.query == hi and res.rerank_query == NET_DEBT  # recorded as asked
+    assert [r.chunk.chunk_index for r in res.chunks] == [1, 0]  # the FY24 paragraph first
+    assert res.confidence.above_threshold is True
 
 
 # ------------------------------------------------------------------ service

@@ -220,6 +220,16 @@ class Cues:
     shapes: frozenset[Shape]
     periods: tuple[str, ...]  # canonical labels named ("FY24", "Q3 FY24"), in order of mention
     words: frozenset[str]  # words that may name a series
+    # The question asks for less than a table's whole run of periods: "only", "just", "the latest", or a quarter or
+    # half named ("Q4 FY24"): a chart with fewer points may answer it (``refinement_loses``).
+    narrow: bool = False
+
+
+# Words that ask for fewer points than the table has ("only FY24", "just the last quarter", "सिर्फ़ पिछली तिमाही").
+_NARROW = _pattern(
+    r"only|just|latest|most\s+recent|last\s+quarter|this\s+quarter|current\s+quarter|single|sirf|keval|"
+    r"केवल|सिर्फ़|सिर्फ|नवीनतम|ताज़ा|ताजा|आख़िरी|आखिरी|पिछली\s+तिमाही"
+)
 
 
 def cues(question: str, query_en: str | None = None, *, names: Collection[str] = ()) -> Cues:
@@ -244,7 +254,11 @@ def cues(question: str, query_en: str | None = None, *, names: Collection[str] =
                 periods.append(found_period[0].label)
     skip = {_canon(n) for n in names}
     words = frozenset(w for t in texts for w in _content_words(t) if w not in skip)
-    return Cues(kind, shapes, tuple(periods), words)
+    narrow = any(_NARROW.search(t.casefold()) for t in texts) or any(_PART_OF_YEAR.match(p) for p in periods)
+    return Cues(kind, shapes, tuple(periods), words, narrow)
+
+
+_PART_OF_YEAR = re.compile(r"(?:Q[1-4]|H[12]|9M)\s")  # "Q4 FY24", "H1 FY24": a part of a year, not a whole one
 
 
 def names_table(ds: TypedDataset, c: Cues) -> bool:
@@ -786,8 +800,12 @@ def refinement_loses(
     - from one document's tables, unless the question compares documents or companies (``TurnContext.compare``);
     - from a table that matches the question as well (``Draft.scores``, within ``TABLE_SLACK``: an unsure draft is one
       whose runner-up is that close);
-    - showing no fewer of the periods the question names, nor, when it names none, fewer points of a time series (a
-      quarterly question must not end in a two-point bar chart of a yearly table);
+    - showing no fewer points of the periods the question names (a fiscal year named over quarterly data means all of
+      its quarters: "FY23 and FY24" on a chart of Q4 FY23 and Q4 FY24 is two points of eight), nor fewer points of a
+      time series than the draft at all, unless the question asks for fewer ("only", "just", "the latest", a quarter
+      named: ``Cues.narrow``): a quarterly question must not end in a two-point bar chart (the final real run:
+      "Show me Valmora's quarterly revenue and EBITDA for FY23 and FY24", 8 quarters → Q4 FY23 and Q4 FY24, 2 of 4
+      runs);
     - showing no fewer of the series and categories the question names."""
     if draft.spec is None:
         return None
@@ -820,11 +838,13 @@ def refinement_loses(
     got = max((score[d.id] for d in chosen if d.id in score), default=None)
     if have is not None and got is not None and got < have - TABLE_SLACK + 1e-6:
         return f"the draft's table matches the question better ({have:.1f} against {got:.1f})"
-    if c.periods and _periods_shown(c, after) < _periods_shown(c, before):
+    # Asked for fewer ("only Q4 of FY23 and FY24"), each period named counts once; otherwise every point of it does.
+    shown = _periods_shown if c.narrow else _period_points
+    if c.periods and shown(c, after) < shown(c, before):
         return "the planner's chart shows fewer of the periods asked for"
     periodic = {"period", "date"}
     if (
-        not c.periods
+        not c.narrow
         and before.x_type in periodic
         and after.x_type in periodic
         and len(after.x_items) < len(before.x_items)
@@ -835,9 +855,16 @@ def refinement_loses(
     return None
 
 
+def _period_points(c: Cues, r: Resolved) -> int:
+    """How many of the chart's x items are periods the question names: the period itself, or a quarter or half of a
+    fiscal year named (a question for "FY23 and FY24" over quarterly tables asks for all eight quarters, so Q1 FY24
+    to Q4 FY24 are four points of "FY24", and a chart of Q4 FY23 and Q4 FY24 shows two)."""
+    return sum(1 for i in r.x_items if any(i.label == p or i.label.endswith(f" {p}") for p in c.periods))
+
+
 def _periods_shown(c: Cues, r: Resolved) -> int:
-    """How many of the periods the question names are on the chart: the period itself, or a quarter or half of the
-    fiscal year named ("FY24" on a chart of Q1 FY24 to Q4 FY24)."""
+    """How many of the periods the question names are on the chart at all (a quarter or half of a fiscal year named
+    counts for it): what a question that asks for fewer points needs."""
     labels = [i.label for i in r.x_items]
     return sum(1 for p in c.periods if any(x == p or x.endswith(f" {p}") for x in labels))
 
