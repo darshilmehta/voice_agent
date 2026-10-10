@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -35,7 +36,22 @@ from .fakes import (
     keyword_scorer,
 )
 
-LOCAL_CONFIG = PROJECT_ROOT / "config/local.config.json"
+REPO_LOCAL_CONFIG = PROJECT_ROOT / "config/local.config.json"
+
+
+def _offline_copy(source: Path) -> Path:
+    """The local config as tests see it: the repo's file with live web search switched off. The repo file turns it
+    on for running the app (start.py starts SearXNG); tests stay offline by default and the web search tests switch
+    it on themselves (``write_config(LOCAL_CONFIG, strict_offline_exceptions=["web_search"])`` + env)."""
+    raw = json.loads(source.read_text())
+    raw["strict_offline_exceptions"] = [e for e in raw.get("strict_offline_exceptions", []) if e != "web_search"]
+    raw["tools"]["web_search"]["enabled"] = False
+    out = Path(tempfile.mkdtemp(prefix="gibberlink-tests-")) / "local.config.json"
+    out.write_text(json.dumps(raw))
+    return out
+
+
+LOCAL_CONFIG = _offline_copy(REPO_LOCAL_CONFIG)
 CLOUD_CONFIG = PROJECT_ROOT / "config/cloud.config.json"
 DOCKER_CONFIG = PROJECT_ROOT / "config/docker.config.json"
 

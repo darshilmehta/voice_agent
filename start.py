@@ -8,14 +8,16 @@
 Steps (each one is skipped when it is already done):
   1. Ollama: start it if needed, with its prompt cache capped (LLAMA_ARG_CACHE_RAM, docs/DESIGN.md §8) so a 16 GB
      Mac doesn't swap; pull the chat model if it is missing.
-  2. Docker Desktop, then the Qdrant container (`docker compose ... up -d qdrant`).
+  2. Docker Desktop, then the Qdrant container (`docker compose ... up -d qdrant`), and SearXNG when the config turns
+     live web search on (tools.web_search.enabled with the local searxng provider).
   3. Model weights: offers to run scripts/setup/download_models.sh when some are missing.
   4. Backend: `uv sync --group ml`, `uv run python -m app`, waits until /health says preload: ready.
   5. Frontend: `npm install` when package-lock.json changed, `npm run dev`.
   6. Opens http://localhost:3000 in Chrome.
 
 The backend and frontend run as children of this script: their output is shown here (and written to data/logs/),
-and Ctrl+C stops both. Qdrant and Ollama keep running (`python3 start.py stop` stops Qdrant). Standard library only.
+and Ctrl+C stops both. Qdrant, SearXNG and Ollama keep running (`python3 start.py stop` stops Qdrant and SearXNG).
+The config read is the backend's: $APP_CONFIG_FILE, else config/local.config.json. Standard library only.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -136,12 +139,30 @@ def ask(question: str, assume_yes: bool) -> bool:
 # ---------------------------------------------------------------- Ollama
 
 
-def chat_model() -> str:
+def load_config() -> dict:
+    """The config file the backend will load (same rule as backend/app/settings.py)."""
+    path = Path(os.environ.get("APP_CONFIG_FILE") or "config/local.config.json").expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
     try:
-        cfg = json.loads((ROOT / "config" / "local.config.json").read_text())
-        return cfg["llm"]["chat_model"]
-    except (OSError, ValueError, KeyError):
-        return "qwen3:4b-instruct"
+        cfg = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        fail(f"can't read the config {path}: {e}")
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def chat_model(cfg: dict) -> str:
+    return (cfg.get("llm") or {}).get("chat_model") or "qwen3:4b-instruct"
+
+
+def searxng_url(cfg: dict) -> str | None:
+    """The local SearXNG URL when the config turns live web search on with the self-hosted provider, else None."""
+    ws = (cfg.get("tools") or {}).get("web_search") or {}
+    if not ws.get("enabled") or ws.get("provider") != "searxng":
+        return None
+    url = (ws.get("url") or "http://127.0.0.1:8888").rstrip("/")
+    host = urllib.parse.urlparse(url).hostname or ""
+    return url if host in ("127.0.0.1", "localhost", "::1") else None  # a remote SearXNG isn't ours to start
 
 
 def brew_ollama_service() -> bool:
@@ -173,7 +194,7 @@ def cache_cap_set() -> bool:
     return False
 
 
-def start_ollama(args) -> subprocess.Popen | None:
+def start_ollama(args, cfg: dict) -> subprocess.Popen | None:
     """Ensure Ollama is up with a capped prompt cache. Returns a child process only when this script had to run
     `ollama serve` itself (no brew service)."""
     step("Ollama")
@@ -211,7 +232,7 @@ def start_ollama(args) -> subprocess.Popen | None:
     if not wait_for(lambda: http_up(f"{OLLAMA_URL}/api/tags"), "Ollama", 60):
         fail("Ollama didn't start (see `brew services info ollama` or data/logs/ollama.log)")
 
-    model = chat_model()
+    model = chat_model(cfg)
     tags = http_json(f"{OLLAMA_URL}/api/tags") or {}
     names = {m.get("name") for m in tags.get("models", [])} if isinstance(tags, dict) else set()
     if model not in names and f"{model}:latest" not in names:
@@ -240,10 +261,32 @@ def start_qdrant() -> None:
     ok("Qdrant ready on 127.0.0.1:6333")
 
 
+def start_searxng(cfg: dict) -> None:
+    """Live web search (docs/DESIGN.md §3.7): start the self-hosted SearXNG when the config turns it on."""
+    ws = (cfg.get("tools") or {}).get("web_search") or {}
+    url = searxng_url(cfg)
+    if not ws.get("enabled"):
+        ok("live web search is off in the config; SearXNG not needed")
+        return
+    if cfg.get("strict_offline", True) and "web_search" not in (cfg.get("strict_offline_exceptions") or []):
+        fail(
+            'tools.web_search.enabled is true but "web_search" is not in strict_offline_exceptions: the backend '
+            "refuses to start like that. Add it to the config, or set enabled to false."
+        )
+    if url is None:
+        ok(f"live web search uses {ws.get('provider')} at {ws.get('url')}; nothing to start here")
+        return
+    run([*COMPOSE, "--profile", "websearch", "up", "-d", "searxng"])
+    if wait_for(lambda: http_up(f"{url}/healthz"), "SearXNG", 60):
+        ok(f"SearXNG ready on {url} (live web search on: only search queries leave this machine)")
+    else:
+        warn("SearXNG didn't become ready (docker logs gibberlink-searxng); answers needing live data will say so")
+
+
 def stop_qdrant() -> None:
-    step("Stopping Qdrant")
+    step("Stopping Qdrant and SearXNG")
     # `stop`, never `down`: down acts on the whole compose project (infra/docker-compose.yml header).
-    run([*COMPOSE, "stop", "qdrant"], check=False)
+    run([*COMPOSE, "--profile", "websearch", "stop", "qdrant", "searxng"], check=False)
 
 
 # ---------------------------------------------------------------- model weights
@@ -322,9 +365,10 @@ def backend_health() -> dict:
     return h if isinstance(h, dict) else {}
 
 
-def start_backend(children: list[Child]) -> None:
+def start_backend(children: list[Child], cfg: dict) -> None:
     step("Backend (127.0.0.1:8000)")
-    if backend_health().get("version"):
+    reused = bool(backend_health().get("version"))
+    if reused:
         ok("already running; reusing it")
     else:
         if http_up(BACKEND_URL):
@@ -351,6 +395,12 @@ def start_backend(children: list[Child]) -> None:
             warn(f"{p.get('capability')}: {p.get('status')} — {p.get('detail')}")
     for w in h.get("warnings", []):
         warn(f"{w.get('message')} Fix: {w.get('fix')}")
+    search = next((p for p in h.get("providers", []) if p.get("capability") == "web_search"), {})
+    if reused and searxng_url(cfg) and search.get("status") == "disabled":
+        warn(
+            "the config turns live web search on, but the running backend started with it off: restart the backend "
+            "(Ctrl+C in the terminal that started it, then run start.py again)"
+        )
 
 
 def start_frontend(children: list[Child]) -> None:
@@ -386,6 +436,11 @@ def cmd_status() -> int:
 
     line("Ollama", http_up(f"{OLLAMA_URL}/api/tags"), f"prompt cache cap: {'set' if cache_cap_set() else 'NOT set'}")
     line("Qdrant", http_up(f"{QDRANT_URL}/readyz"), QDRANT_URL)
+    url = searxng_url(load_config())
+    if url:
+        line("SearXNG", http_up(f"{url}/healthz"), f"{url} (live web search on in the config)")
+    else:
+        print(f"  {_c('2', 'off ')} SearXNG   live web search off in the config")
     h = backend_health()
     line("Backend", bool(h), f"preload: {(h.get('preload') or {}).get('state', '-')}" if h else BACKEND_URL)
     line("Frontend", http_up(FRONTEND_URL), APP_URL)
@@ -407,17 +462,19 @@ def cmd_start(args) -> int:
             os.killpg(ollama_child.pid, signal.SIGTERM)
         if args.stop_qdrant:
             stop_qdrant()
-        kept = "Ollama keeps" if args.stop_qdrant else "Qdrant and Ollama keep"
-        print(f"    stopped. {kept} running (python3 start.py stop stops Qdrant).", flush=True)
+        kept = "Ollama keeps" if args.stop_qdrant else "Qdrant, SearXNG and Ollama keep"
+        print(f"    stopped. {kept} running (python3 start.py stop stops Qdrant and SearXNG).", flush=True)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    ollama_child = start_ollama(args)
+    cfg = load_config()
+    ollama_child = start_ollama(args, cfg)
     start_qdrant()
+    start_searxng(cfg)
     check_weights(args)
-    start_backend(children)
+    start_backend(children, cfg)
     start_frontend(children)
 
     step(f"Ready: {APP_URL}")
@@ -446,7 +503,7 @@ def main() -> int:
         action="store_true",
         help=f"don't set {CACHE_RAM_VAR} / restart Ollama (not recommended on 16 GB)",
     )
-    p.add_argument("--stop-qdrant", action="store_true", help="also stop Qdrant on Ctrl+C")
+    p.add_argument("--stop-qdrant", action="store_true", help="also stop Qdrant and SearXNG on Ctrl+C")
     args = p.parse_args()
     if args.command == "status":
         return cmd_status()

@@ -282,7 +282,7 @@ class WebSearch(Protocol):            # searxng (local) | search_api (production
 
 Production additions: fallback chain (search API → SearXNG if deployed → document-only answer), Redis result cache, per-user rate limits, outbound-query audit log, query scrubbing (names/emails/numbers where possible; never document text), vendor terms review before go-live.
 
-Local status (phase 8 built): config has `provider: searxng`, `enabled: false` by default; enabling it needs the Compose profile `websearch`, `enabled: true` and `strict_offline_exceptions: ["web_search"]` (config/README.md). In the fully offline smoke run (test 12) web search is expected to be unavailable and must degrade to a document-only answer.
+Local status (phase 8 built): config has `provider: searxng`; `local.config.json` turns it on (`enabled: true`, `strict_offline_exceptions: ["web_search"]`, user decision 2026-10-10) and `start.py` starts the Compose profile `websearch` (SearXNG) whenever the config enables it; the Docker config keeps it off (config/README.md). Tests load an offline copy of the local config (web search off) and switch it on per test. In the fully offline smoke run (test 12) web search is expected to be unavailable and must degrade to a document-only answer.
 
 ### 3.8 Voice presence UI (the "breathing" particle field)
 
