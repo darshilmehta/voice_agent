@@ -9,6 +9,13 @@ Endpointing follows Silero's own streaming logic (``VADIterator``), on audio tim
     end of turn     after end_of_turn_ms of silence (or MAX_UTTERANCE_MS of audio); utterances with less than
                     min_speech_ms of speech are discarded
 
+With a ``NoiseGate`` (voice.noise.adaptive_gating, §3.10 "Noisy rooms") the room's noise floor takes part: speech
+starts only on a frame that is also start_snr_db above the floor, at a VAD threshold and a minimum speech length that
+rise with the floor, and a frame within end_snr_db of the floor is silence whatever the VAD says (babble alone can't
+hold a turn open); a turn is announced only once it has min_speech_ms of speech near the user's level (the gate's
+``near_field``), so far-off talk never reaches the client at all. Every utterance carries its speech level and the
+floor when it began, for ``noise.addressed``.
+
 Everything here is synchronous and pure, so it is tested without audio or models.
 """
 
@@ -19,6 +26,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
+
+from .noise import NoiseGate, frame_dbfs, utterance_level
 
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 512
@@ -32,6 +41,8 @@ class Utterance:
     audio: np.ndarray  # float32, 16 kHz: pre-roll + speech + trailing silence
     speech_ms: float  # from the detected start to the start of the trailing silence
     silence_ms: float  # trailing silence included at the end
+    level_dbfs: float | None = None  # its speech level: the median level of its speech frames
+    floor_dbfs: float | None = None  # the room's noise floor when it began (None without a NoiseGate)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,15 +70,24 @@ class SpeechEnded:
 
 @dataclass(frozen=True, slots=True)
 class SpeechDiscarded:
-    """The utterance ended with less than min_speech_ms of speech (a click, a cough): ignored."""
+    """The utterance ended with less than min_speech_ms of speech (a click, a cough), or (with the noise gate) never
+    sounded near enough to be the user's: ignored. ``announced``: its SpeechStarted was sent (only then does the client
+    need a ``user_speech end``)."""
 
     speech_ms: float
+    announced: bool = True
 
 
 VADEvent = SpeechStarted | SpeechPaused | SpeechResumed | SpeechEnded | SpeechDiscarded
 
 
 class Endpointer:
+    """Utterances from VAD probabilities (module docstring). With an adaptive ``NoiseGate`` an utterance opens on a
+    frame above the room's floor but is only *announced* (SpeechStarted) once it has min_speech of speech at a level
+    near the user's (``NoiseGate.near_field``): until then it is held quietly, and if it never gets there it ends as an
+    unannounced SpeechDiscarded (the TV, babble, a cough: the client never hears about it). Without the gate every
+    utterance is announced at its first frame, as before."""
+
     def __init__(
         self,
         *,
@@ -77,7 +97,9 @@ class Endpointer:
         sample_rate: int = SAMPLE_RATE,
         pre_roll_ms: float = PRE_ROLL_MS,
         max_utterance_ms: float = MAX_UTTERANCE_MS,
+        gate: NoiseGate | None = None,
     ) -> None:
+        self.gate = gate  # the noise floor (always tracked when given) and, if adaptive, the gate on it
         self.on = threshold
         self.off = max(threshold - OFF_MARGIN, 0.01)
         self.min_speech_ms = min_speech_ms
@@ -89,64 +111,127 @@ class Endpointer:
         self._pre: deque[np.ndarray] = deque()
         self._pre_samples = 0
         self._frames: list[np.ndarray] | None = None  # None: no utterance open
+        self._confirmed = False  # the open utterance was announced
         self._samples = 0  # samples since the detected start
         self._silence = 0  # samples of trailing silence
         self._paused = False
+        self._levels: list[float] = []  # levels of the open utterance's speech frames
+        self._floor_at_start: float | None = None
+        self.last_level: float | None = None  # the last closed utterance's speech level and floor
+        self.last_floor: float | None = None
 
     # -------------------------------------------------------------- state
 
     @property
     def in_utterance(self) -> bool:
-        return self._frames is not None
+        """An announced utterance is open (one still held by the gate doesn't count)."""
+        return self._frames is not None and self._confirmed
 
     @property
     def speaking(self) -> bool:
-        """Inside an utterance and not in its trailing silence."""
-        return self._frames is not None and self._silence == 0
+        """Inside an announced utterance and not in its trailing silence."""
+        return self.in_utterance and self._silence == 0
 
     @property
     def speech_ms(self) -> float:
-        """Speech so far in the open utterance (0 when none is open)."""
+        """Speech so far in the announced utterance (0 when none is open)."""
+        return self._speech_ms() if self.in_utterance else 0.0
+
+    def _speech_ms(self) -> float:
         return self._ms(self._samples - self._silence) if self._frames is not None else 0.0
 
     def snapshot(self) -> np.ndarray:
         """The open utterance's audio so far (empty when none is open)."""
         return np.concatenate(self._frames) if self._frames else np.zeros(0, dtype=np.float32)
 
+    @property
+    def level_dbfs(self) -> float | None:
+        """The open utterance's speech level so far (None when none is open or it has no speech frames yet)."""
+        return utterance_level(self._levels) if self._frames is not None else None
+
+    @property
+    def floor_at_start(self) -> float | None:
+        """The noise floor when the open utterance began."""
+        return self._floor_at_start if self._frames is not None else None
+
+    @property
+    def floor_dbfs(self) -> float | None:
+        return self.gate.floor_dbfs if self.gate is not None else None
+
+    @property
+    def gating(self) -> bool:
+        return self.gate is not None and self.gate.cfg.adaptive_gating
+
+    @property
+    def min_speech(self) -> float:
+        """The speech an utterance needs (min_speech_ms, raised in a noisy room by the gate)."""
+        return max(self.min_speech_ms, self.gate.min_speech_ms) if self.gating and self.gate else self.min_speech_ms
+
     def _ms(self, samples: int) -> float:
         return samples * 1000 / self.sample_rate
 
     # -------------------------------------------------------------- frames
 
+    def observe(self, frame: np.ndarray) -> None:
+        """A frame that isn't listened to for speech (hold-to-talk mode): only the floor and the pre-roll follow it."""
+        if self.gate is not None:
+            self.gate.observe(frame_dbfs(frame))
+        if self._frames is None:
+            self._remember(frame)
+
     def push(self, frame: np.ndarray, probability: float) -> list[VADEvent]:
         n = len(frame)
+        gate = self.gate
+        dbfs = frame_dbfs(frame) if gate is not None else 0.0
+        if gate is not None:
+            gate.observe(dbfs)
+        gating = self.gating and gate is not None
         if self._frames is None:
-            if probability >= self.on:
+            starts = gate.opens(probability, dbfs) if gating and gate is not None else probability >= self.on
+            if starts:
                 self._frames = [*self._pre, frame]
                 self._pre.clear()
                 self._pre_samples = 0
                 self._samples, self._silence, self._paused = n, 0, False
-                return [SpeechStarted()]
+                self._levels = [dbfs] if gate is not None else []
+                self._floor_at_start = gate.floor_dbfs if gate is not None else None
+                self._confirmed = not gating
+                return [SpeechStarted()] if self._confirmed else self._confirm()
             self._remember(frame)
             return []
 
         self._frames.append(frame)
         self._samples += n
         events: list[VADEvent] = []
-        if probability >= self.on:
+        audible = gate.audible(dbfs) and gate.holds(dbfs) if gating and gate is not None else True
+        if probability >= self.on and audible:
             if self._silence and self._paused:
                 events.append(SpeechResumed())
             self._silence, self._paused = 0, False
-        elif probability < self.off or self._silence:
+            if gate is not None:
+                self._levels.append(dbfs)
+        elif probability < self.off or self._silence or not audible:
             self._silence += n
+        if not self._confirmed:
+            events += self._confirm()
 
         silence_ms = self._ms(self._silence)
         if silence_ms >= self.end_of_turn_ms or self._ms(self._samples) >= self.max_utterance_ms:
             events.append(self._close())
-        elif not self._paused and silence_ms >= self.pause_ms and self.speech_ms >= self.min_speech_ms:
+        elif self._confirmed and not self._paused and silence_ms >= self.pause_ms and self.speech_ms >= self.min_speech:
             self._paused = True
             events.append(SpeechPaused(self.snapshot(), self.speech_ms))
         return events
+
+    def _confirm(self) -> list[VADEvent]:
+        """Announce the held utterance once it has min_speech of speech near the user's level."""
+        gate = self.gate
+        if gate is None or self._speech_ms() < self.min_speech or self._silence:
+            return []
+        if not gate.near_field(self.level_dbfs):
+            return []
+        self._confirmed = True
+        return [SpeechStarted()]
 
     def _remember(self, frame: np.ndarray) -> None:
         self._pre.append(frame)
@@ -156,18 +241,27 @@ class Endpointer:
 
     def _close(self) -> SpeechEnded | SpeechDiscarded:
         frames = self._frames or []
-        speech_ms, silence_ms = self.speech_ms, self._ms(self._silence)
+        speech_ms, silence_ms = self._speech_ms(), self._ms(self._silence)
+        level, floor = self.level_dbfs, self._floor_at_start
+        self.last_level, self.last_floor = level, floor
+        min_speech, announced = self.min_speech, self._confirmed
         self._frames, self._samples, self._silence, self._paused = None, 0, 0, False
+        self._levels, self._floor_at_start, self._confirmed = [], None, False
         for frame in frames[-max(1, round(self._pre_roll_ms * self.sample_rate / 1000 / FRAME_SAMPLES)) :]:
             self._remember(frame)  # the trailing silence is the next utterance's pre-roll
-        if speech_ms < self.min_speech_ms:
-            return SpeechDiscarded(speech_ms)
-        return SpeechEnded(Utterance(np.concatenate(frames), speech_ms, silence_ms))
+        if not announced or speech_ms < min_speech:
+            return SpeechDiscarded(speech_ms, announced)
+        return SpeechEnded(Utterance(np.concatenate(frames), speech_ms, silence_ms, level, floor))
+
+    def pre_roll(self) -> list[np.ndarray]:
+        """The audio kept from before now (PRE_ROLL_MS), for an utterance that starts without the VAD (hold-to-talk)."""
+        return list(self._pre)
 
     def reset(self) -> None:
         self._pre.clear()
         self._pre_samples = 0
         self._frames, self._samples, self._silence, self._paused = None, 0, 0, False
+        self._levels, self._floor_at_start, self._confirmed = [], None, False
 
 
 # ------------------------------------------------------------------ barge-in

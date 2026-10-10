@@ -15,16 +15,23 @@
  * (`filler: true`): `turn.web` holds the search (`searchingNow` says whether it is running: the label and the presence
  * follow it, since the server stays in `speaking` through the silent search) and every web result that arrived.
  *
+ * Noisy rooms (docs/DESIGN.md §3.10): RNNoise cleans the microphone before the uplink, the VAD and the presence field
+ * (lib/voice/denoise.ts, at 48 kHz), and the VAD only ducks the agent for speech above the room's noise floor
+ * (lib/voice/noise.ts). Hold-to-talk (`inputMode: "ptt"`): the VAD never ducks or interrupts; `pttDown()` stops the
+ * answer at once and starts the user's turn, `pttUp()` ends it (`ptt` messages).
+ *
  * Failure handling: an unexpected socket close reconnects with backoff (the microphone and VAD keep running); close
  * 4404 (no such chat) and 4409 (replaced by another session on this chat) end the session with an explanation;
  * `error` messages are shown and the session keeps listening.
  */
 
-import type { Language, Message, SourcesPayload } from "../api";
+import type { Language, Message, PublicVoiceInput, SourcesPayload } from "../api";
 import { publishRawCanvasEvent } from "../canvas/events";
 import { withVisual, withoutVisual } from "../route";
 import { applyTool, endSearch, NO_WEB, parseTool, type WebSearchState, type WebTurn } from "../web-search";
 import { MIC_ERROR_TEXT, MicError, openMic, voiceSupport, type MicCapture, type MicErrorKind } from "./capture";
+import { DENOISE_SAMPLE_RATE } from "./denoise";
+import { DEFAULT_VOICE_INPUT } from "./noise";
 import { AgentPlayer } from "./playback";
 import {
   CLOSE_ORIGIN_NOT_ALLOWED,
@@ -37,6 +44,7 @@ import {
   voiceSocketUrl,
   type AgentState,
   type ClientMessage,
+  type InputMode,
   type ServerMessage,
 } from "./protocol";
 import { startBargeInVad, type BargeInVad } from "./vad";
@@ -106,6 +114,12 @@ export interface VoiceSnapshot {
   /** What the web search of each saved answer was (by message id), for the transcript's note of what was searched. */
   searches: Record<string, WebSearchState>;
   vad: "off" | "loading" | "on" | "unavailable";
+  /** RNNoise on the microphone: "unavailable" when it was asked for and couldn't run (§3.10). */
+  denoise: "off" | "on" | "unavailable";
+  /** "vad": speaking opens a turn; "ptt": hold-to-talk. */
+  inputMode: InputMode;
+  /** The talk button (or Space) is held. */
+  pttDown: boolean;
   attempt: number;
   /**
    * Counts the times the socket dropped and came back as a new server session. Whatever the server saved for the
@@ -132,6 +146,9 @@ const INITIAL: VoiceSnapshot = {
   messages: [],
   searches: {},
   vad: "off",
+  denoise: "off",
+  inputMode: "vad",
+  pttDown: false,
   attempt: 0,
   resyncs: 0,
 };
@@ -143,6 +160,8 @@ export interface VoiceOptions {
   language: Language | null;
   /** `features.web_search`: false keeps the search's badge, label and note off (web results still resolve their markers). */
   webSearch?: boolean;
+  /** `voice_input` from /api/config/public: the denoiser and the noise-floor gate (§3.10). */
+  voiceInput?: PublicVoiceInput;
 }
 
 /**
@@ -322,7 +341,14 @@ export class VoiceSession {
     };
 
     try {
-      const context = new AudioContext({ latencyHint: "interactive" });
+      const denoise = (this.opts.voiceInput ?? DEFAULT_VOICE_INPUT).denoise === "rnnoise";
+      let context: AudioContext;
+      try {
+        // RNNoise runs at 48 kHz: the browser resamples the microphone (and the agent's 24 kHz voice) to it.
+        context = new AudioContext(denoise ? { latencyHint: "interactive", sampleRate: DENOISE_SAMPLE_RATE } : { latencyHint: "interactive" });
+      } catch {
+        context = new AudioContext({ latencyHint: "interactive" });
+      }
       ctx = context;
       this.ctx = context; // published at once so that stop() can close it while we wait
       const running = () => context.state === "running";
@@ -347,10 +373,12 @@ export class VoiceSession {
         () => {
           if (this.ctx === context && current()) void this.fail("The microphone was disconnected or its access was taken away.");
         },
+        { denoise },
       );
       if (!current()) return void (await discard());
 
       this.mic = mic;
+      this.set({ denoise: !denoise ? "off" : mic.denoised ? "on" : "unavailable" });
       this._player = new AgentPlayer(context, {
         onAudible: (audible) => this.onAudible(audible),
         onTurnPlayed: (turnId) => this.onTurnPlayed(turnId),
@@ -427,6 +455,7 @@ export class VoiceSession {
     this.discardedUtterance = false;
     this.vadSpeaking = false;
     this.maxTurnId = -1;
+    if (this.snap.pttDown) this.set({ pttDown: false });
     this.cutTurns.clear();
 
     const { ws, vad, mic, ctx } = this;
@@ -482,7 +511,7 @@ export class VoiceSession {
       // Connected (or connecting) but never said "ready": try again.
       if (this.ws === ws && !this.ready) ws.close();
     }, CONNECT_TIMEOUT_MS);
-    ws.onopen = () => this.send({ type: "start", language: this.opts.language });
+    ws.onopen = () => this.send({ type: "start", language: this.opts.language, input_mode: this.snap.inputMode });
     ws.onmessage = (e: MessageEvent) => {
       if (this.ws !== ws) return;
       if (typeof e.data === "string") {
@@ -697,6 +726,9 @@ export class VoiceSession {
         this.set({ userText: msg.text, userFinal: false, caption: "user" });
         break;
       case "user_message": {
+        // The user's voice: what near field sounds like here (the browser VAD's level check, §3.10). Not for a
+        // hold-to-talk turn, which the VAD didn't segment.
+        if (this.snap.inputMode === "vad" && msg.message.modality === "voice") this.vad?.noteUserTurn();
         // A new turn begins. If `turn` already arrived (it may come with the message) and nothing has been said
         // for it, keep its id; otherwise start fresh and wait for `turn`.
         const cur = this.snap.turn;
@@ -878,6 +910,7 @@ export class VoiceSession {
   private beginBargeIn(): void {
     const player = this._player;
     if (!player || this.bargePending || this.snap.phase !== "live") return;
+    if (this.snap.inputMode === "ptt") return; // hold-to-talk: only a press interrupts
     const turnId = this.currentTurnId();
     if (turnId === null || this.snap.turn?.cut) return;
     if (!player.isAudible && this.snap.serverState !== "speaking") return;
@@ -958,6 +991,39 @@ export class VoiceSession {
     this.send({ type: "stop" });
   }
 
+  // ------------------------------------------------------------------ hold-to-talk (§3.10)
+
+  /** Speaking opens a turn ("vad") or only holding the talk button does ("ptt"). Takes effect at once, also live. */
+  setInputMode(mode: InputMode): void {
+    if (mode === this.snap.inputMode) return;
+    if (mode === "vad" && this.snap.pttDown) this.pttUp();
+    if (mode === "ptt" && this.bargePending) this.resumeVolume(); // the VAD's duck no longer applies
+    this.set({ inputMode: mode });
+    if (this.ready) this.send({ type: "input_mode", mode });
+  }
+
+  /** The talk button went down: the agent stops talking now (locally, and the server cuts the answer), the turn starts. */
+  pttDown(): void {
+    if (this.snap.phase !== "live" || this.snap.pttDown) return;
+    if (this.snap.inputMode !== "ptt") this.setInputMode("ptt");
+    const cur = this.snap.turn;
+    this.clearBarge();
+    if (cur && cur.id !== null && !cur.cut && (!cur.message || this._player?.isAudible)) {
+      this.cutTurns.add(cur.id);
+      this._player?.stopTurn(cur.id);
+      this.set({ ducked: false, turn: { ...cur, cut: true, web: endSearch(cur.web) } });
+    }
+    this.set({ pttDown: true });
+    this.send({ type: "ptt", state: "down" });
+  }
+
+  /** The talk button came up: what was said is the turn. */
+  pttUp(): void {
+    if (!this.snap.pttDown) return;
+    this.set({ pttDown: false });
+    this.send({ type: "ptt", state: "up" });
+  }
+
   dismissNotice(): void {
     if (this.snap.notice) this.set({ notice: null });
   }
@@ -970,7 +1036,7 @@ export class VoiceSession {
     if (!ctx || !mic) return;
     this.set({ vad: "loading" });
     try {
-      const vad = await startBargeInVad(ctx, mic.stream, {
+      const vad = await startBargeInVad(ctx, mic.vadStream, {
         onSpeechStart: () => {
           this.vadSpeaking = true;
           this.beginBargeIn();
@@ -984,7 +1050,7 @@ export class VoiceSession {
         onSpeechEnd: () => {
           this.vadSpeaking = false;
         },
-      });
+      }, this.opts.voiceInput ?? DEFAULT_VOICE_INPUT);
       if (run !== this.run) {
         await vad.destroy();
         return;

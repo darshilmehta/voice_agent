@@ -429,8 +429,9 @@ def test_B_a_too_short_burst_restores_the_state_and_resolves_a_pending_barge_in(
         c.until("agent_message")
         c.send("barge_in_start", turn_id=1, played_ms=300)
         c.say(QUESTION, ms=150)  # under min_speech_ms
-        items = c.until(is_state("speaking"))
-    assert kinds(items) == ["user_speech", "user_speech", "barge_in", "state"]
+        # The noise gate (§3.10) never announces it (no user_speech): the pending decision resolves at its deadline
+        items = c.until("barge_in")
+    assert kinds(items) == ["barge_in"]
     assert one(items, "barge_in")["decision"] == "resume"
 
 

@@ -24,8 +24,14 @@ export type ErrorStage = "stt" | "retrieval" | "llm" | "tts" | "storage" | "audi
 
 // ------------------------------------------------------------------ client → server
 
+/** "vad": the server's VAD opens turns; "ptt": hold-to-talk, a turn is the audio between `ptt` down and up (§3.10). */
+export type InputMode = "vad" | "ptt";
+
 export type ClientMessage =
-  | { type: "start"; language: Language | null }
+  | { type: "start"; language: Language | null; input_mode?: InputMode }
+  | { type: "input_mode"; mode: InputMode }
+  /** Hold-to-talk: "down" starts the user's turn (and stops an answer at once), "up" ends it. */
+  | { type: "ptt"; state: "down" | "up" }
   | { type: "barge_in_start"; turn_id: number; played_ms: number }
   | { type: "playback"; turn_id: number; played_ms: number }
   | { type: "playback_done"; turn_id: number }

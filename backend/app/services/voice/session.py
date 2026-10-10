@@ -29,6 +29,11 @@
 - An utterance that is ignored (too short, a backchannel, hums, noise, failed STT) still leaves the client in a known
   state: ``user_speech end``, ``barge_in resume`` if a decision was pending, and the current ``state`` again.
 - Failures are reported as ``error {stage}`` and the session goes on; repeated input errors at most every few seconds.
+- Noisy rooms (§3.10): the endpointer gates turns on the room's noise floor (``noise.NoiseGate``), and every utterance
+  is checked for whether it was said to the agent at all (``noise.addressed``): background speech (the TV, the next
+  table) is dropped silently, before it can start a turn or cut an answer; only near-field speech that was garbled is
+  asked again. In hold-to-talk mode (``input_mode: "ptt"``) the VAD opens no turn: a turn is the audio between
+  ``ptt down`` and ``ptt up``, and "down" while the agent answers stops it at once.
 - Live data (§3.7): the turn's ``tool`` events go to the client as ``tool`` messages (the "searching the web"
   badge). On ``tool start`` the pre-synthesized filler ("Let me look that up.", ``voice/fillers.py``) is sent at
   once, with its frames, as the turn's first ``audio_chunk`` (``filler: true``), before the turn's next message;
@@ -87,6 +92,7 @@ from ..language import script_language
 from ..messages import MessageService
 from ..router import STOP_PHRASES, normalize
 from .fillers import VISUAL_TAILS, filler_audio
+from .noise import AddressDecision, NoiseGate, SpeechEvidence, UserLevel, addressed, frame_dbfs, utterance_level
 from .protocol import (
     CLOSE_CHAT_NOT_FOUND,
     CLOSE_GOING_AWAY,
@@ -99,9 +105,12 @@ from .protocol import (
     BargeInStart,
     End,
     ErrorStage,
+    InputMode,
     Playback,
     PlaybackDone,
     ProtocolError,
+    Ptt,
+    SetInputMode,
     Start,
     Stop,
     audio_frames,
@@ -121,6 +130,8 @@ from .speech_text import (
 )
 from .turn_taking import (
     FRAME_SAMPLES,
+    MAX_UTTERANCE_MS,
+    SAMPLE_RATE,
     BargeInEvidence,
     Endpointer,
     SpeechDiscarded,
@@ -258,11 +269,30 @@ class _EndedUtterance:
     utterance: Utterance
     speculative: asyncio.Task[Transcript | None] | None
     ended_at: float  # perf_counter at the end of turn
+    ptt: bool = False  # held to talk: said to the agent by definition (no background check)
 
     @property
     def started_at(self) -> float:
         """When the speech began (audio arrives in real time, so audio time is wall time)."""
         return self.ended_at - (self.utterance.speech_ms + self.utterance.silence_ms) / 1000
+
+
+@dataclass(eq=False)
+class _PttCapture:
+    """The audio of one hold-to-talk press, from the pre-roll before "down" until "up"."""
+
+    frames: list[np.ndarray]
+    floor_dbfs: float | None
+    samples: int = 0
+    speech_samples: int = 0  # in frames the VAD calls speech
+    levels: list[float] = field(default_factory=list)  # their levels
+
+    def add(self, frame: np.ndarray, speech: bool) -> None:
+        self.frames.append(frame)
+        self.samples += len(frame)
+        if speech:
+            self.speech_samples += len(frame)
+            self.levels.append(frame_dbfs(frame))
 
 
 class VoiceSession:
@@ -290,11 +320,22 @@ class VoiceSession:
         self.vad_settings = settings.vad
         self.barge_in = settings.voice.barge_in
         self._vad_stream = vad.open_stream()
+        self.noise = settings.voice.noise
+        self._user_level = UserLevel()  # the user's own speech level, from turns known to be theirs
+        self._gate = NoiseGate(
+            self.noise,
+            threshold=settings.vad.threshold,
+            min_speech_ms=settings.vad.min_speech_ms,
+            user=self._user_level,
+        )
         self._endpointer = Endpointer(
             threshold=settings.vad.threshold,
             min_speech_ms=settings.vad.min_speech_ms,
             end_of_turn_ms=settings.vad.end_of_turn_ms,
+            gate=self._gate,
         )
+        self._input_mode: InputMode = "vad"
+        self._ptt: _PttCapture | None = None  # the talk button is down
         self._language: Language | None = None
         self._started = False
         self._rest = np.zeros(0, dtype=np.float32)
@@ -503,10 +544,13 @@ class VoiceSession:
                 return
             await self._on_control(message)
 
-    async def _on_control(self, message: Start | BargeInStart | Playback | PlaybackDone | Stop) -> None:
+    async def _on_control(
+        self, message: Start | BargeInStart | Playback | PlaybackDone | Stop | SetInputMode | Ptt
+    ) -> None:
         match message:
-            case Start(language=language):
+            case Start(language=language, input_mode=mode):
                 self._language, self._started = language, True
+                await self._set_input_mode(mode)
                 await self._send(
                     {
                         "type": "ready",
@@ -541,6 +585,12 @@ class VoiceSession:
                     await self._interrupt(self._turn, "stop", None)
                 elif self._processing or not self._utterances.empty():
                     await self._set_state("interrupted")
+            case SetInputMode(mode=mode):
+                await self._set_input_mode(mode)
+            case Ptt(state="down"):
+                await self._ptt_down()
+            case Ptt(state="up"):
+                await self._ptt_up()
 
     def _languages(self) -> list[Language]:
         return [self._language] if self._language else list(self.settings.stt.languages)
@@ -574,9 +624,13 @@ class VoiceSession:
             await self._error("audio", f"voice activity detection failed: {_describe(e)}", repeat_key="vad")
             return
         for frame, probability in zip(frames, probabilities, strict=True):
+            if self._input_mode == "ptt":
+                await self._ptt_audio(frame, probability)
+                continue
             for event in self._endpointer.push(frame, probability):
                 await self._on_vad_event(event)
-        await self._barge_in_check()
+        if self._input_mode == "vad":
+            await self._barge_in_check()
 
     async def _on_vad_event(self, event: VADEvent) -> None:
         match event:
@@ -594,10 +648,11 @@ class VoiceSession:
                 if self._turn is None:
                     await self._set_state("thinking")
                 self._utterances.put_nowait(_EndedUtterance(utterance, speculative, time.perf_counter()))
-            case SpeechDiscarded():
+            case SpeechDiscarded(announced=announced):
                 self._drop_speculative()
-                await self._send({"type": "user_speech", "phase": "end"})
-                await self._ignored_utterance()
+                if announced:  # one the gate never announced (far off, or too short) ends as quietly as it began
+                    await self._send({"type": "user_speech", "phase": "end"})
+                    await self._ignored_utterance()
 
     def _drop_speculative(self) -> None:
         """Speech resumed (or a new pause): the speculative transcript is stale. Cancelling it also takes a job that
@@ -643,12 +698,95 @@ class VoiceSession:
         """Transcribe the utterance during the end-of-turn silence (§9.4); also evidence for a pending barge-in."""
         transcript = await self._transcribe(audio, report=False)
         if transcript is not None and transcript.text:
-            await self._send({"type": "transcript_partial", "text": transcript.text})
+            if not self._background(transcript):  # the TV's words never show as the user's
+                await self._send({"type": "transcript_partial", "text": transcript.text})
             pending = self._pending
             if pending is not None:  # a fuller transcript than the barge-in snapshot
-                self._note_transcript(pending, transcript.text)
+                self._note_transcript(pending, transcript)
                 await self._evaluate(pending)
         return transcript
+
+    # -------------------------------------------------------------- noisy rooms (§3.10)
+
+    def _addressed(self, transcript: Transcript, level: float | None, floor: float | None) -> AddressDecision:
+        evidence = SpeechEvidence(
+            transcript.text,
+            level,
+            floor,
+            self._user_level.dbfs,
+            garbled=transcript_garbled(transcript),
+            avg_logprob=transcript.avg_logprob,
+            no_speech_prob=transcript.no_speech_prob,
+        )
+        return addressed(evidence, self.noise)
+
+    def _background(self, transcript: Transcript) -> bool:
+        """The speech being transcribed now (the open utterance, or the one that just ended) wasn't said to the agent:
+        it neither shows as a partial transcript nor counts as an interruption."""
+        ep = self._endpointer
+        level, floor = (ep.level_dbfs, ep.floor_at_start) if ep.in_utterance else (ep.last_level, ep.last_floor)
+        return self._addressed(transcript, level, floor).verdict == "drop"
+
+    async def _set_input_mode(self, mode: InputMode) -> None:
+        """VAD turns or hold-to-talk. Whatever was being heard in the other mode is dropped (as an ignored
+        utterance), so every ``user_speech start`` still gets its ``end``."""
+        if mode == self._input_mode:
+            return
+        self._input_mode = mode
+        self._drop_speculative()
+        self._watch = None
+        if mode == "ptt":
+            if self._pending is not None:
+                await self._decide(self._pending, "resume")  # only a press interrupts now
+            was_open = self._endpointer.in_utterance
+            self._endpointer.reset()
+            if was_open:
+                await self._send({"type": "user_speech", "phase": "end"})
+                await self._ignored_utterance()
+        else:
+            capture, self._ptt = self._ptt, None
+            self._endpointer.reset()
+            if capture is not None:
+                await self._send({"type": "user_speech", "phase": "end"})
+                await self._ignored_utterance()
+        log.info("voice session %s: input mode %s", self.id, mode)
+
+    async def _ptt_down(self) -> None:
+        """The talk button went down: a turn starts now (pre-roll included), and an answer in progress stops."""
+        if self._input_mode != "ptt":
+            await self._set_input_mode("ptt")
+        if self._ptt is not None:
+            return  # a repeated "down"
+        self._ptt = _PttCapture(self._endpointer.pre_roll(), self._gate.floor_dbfs)
+        await self._send({"type": "user_speech", "phase": "start"})
+        agent = self._turn
+        if agent is not None and not agent.interrupted:
+            await self._interrupt(agent, "barge_in", None, decision=True)  # pressing to talk interrupts at once
+
+    async def _ptt_audio(self, frame: np.ndarray, probability: float) -> None:
+        self._endpointer.observe(frame)  # the floor and the pre-roll follow the room
+        capture = self._ptt
+        if capture is None:
+            return
+        capture.add(frame, probability >= self.vad_settings.threshold)
+        if capture.samples * 1000 / SAMPLE_RATE >= MAX_UTTERANCE_MS:
+            await self._ptt_up()  # held past Whisper's window: this much is a turn; the rest needs a new press
+
+    async def _ptt_up(self) -> None:
+        """The talk button came up: what was said is the user's turn (less than min_speech_ms of speech: ignored)."""
+        capture, self._ptt = self._ptt, None
+        if capture is None:
+            return
+        await self._send({"type": "user_speech", "phase": "end"})
+        speech_ms = capture.speech_samples * 1000 / SAMPLE_RATE
+        if speech_ms < self.vad_settings.min_speech_ms:  # a tap, or nothing said
+            await self._ignored_utterance()
+            return
+        level = utterance_level(capture.levels)
+        utterance = Utterance(np.concatenate(capture.frames), speech_ms, 0.0, level, capture.floor_dbfs)
+        if self._turn is None:
+            await self._set_state("thinking")
+        self._utterances.put_nowait(_EndedUtterance(utterance, None, time.perf_counter(), ptt=True))
 
     # -------------------------------------------------------------- utterances → turns
 
@@ -694,10 +832,27 @@ class VoiceSession:
             return
 
         text = transcript.text.strip()
+        utterance = ended.utterance
+        decision = None if ended.ptt else self._addressed(transcript, utterance.level_dbfs, utterance.floor_dbfs)
+        if decision is not None and decision.verdict == "drop":
+            # Not said to the agent (the TV, the next table): no turn, no "say again", and an answer goes on (§3.10).
+            log.info(
+                "voice session %s: dropped background speech (%s; level %s dBFS, floor %s, user %s): %r",
+                self.id,
+                decision.reason,
+                _db(utterance.level_dbfs),
+                _db(utterance.floor_dbfs),
+                _db(self._user_level.dbfs),
+                text,
+            )
+            await self._ignored_utterance(done_processing=True)
+            return
+        if ended.ptt or (decision is not None and decision.verdict == "answer" and not is_filler(text)):
+            self._user_level.update(utterance.level_dbfs)  # the user's own voice: what near field sounds like
         agent = self._turn
         if agent is not None and not agent.interrupted:
             # The agent is answering: is this an interruption?
-            if is_backchannel(text, self.barge_in.backchannel_max_words):
+            if not ended.ptt and is_backchannel(text, self.barge_in.backchannel_max_words):
                 await self._ignored_utterance(done_processing=True)  # "mm-hmm", "okay", "M M": the agent goes on
                 return
             pending = self._pending if self._pending is not None and self._pending.agent is agent else None
@@ -1264,7 +1419,7 @@ class VoiceSession:
 
     async def _on_barge_in_start(self, message: BargeInStart) -> None:
         agent = self._turn
-        if agent is None or agent.id != message.turn_id or agent.interrupted:
+        if agent is None or agent.id != message.turn_id or agent.interrupted or self._input_mode == "ptt":
             await self._send({"type": "barge_in", "turn_id": message.turn_id, "decision": "resume"})
             return
         if self._pending is not None:
@@ -1299,7 +1454,7 @@ class VoiceSession:
             await self._watch_speech()
             return
         ep = self._endpointer
-        if pending.stt is None and ep.in_utterance and ep.speech_ms >= self.vad_settings.min_speech_ms:
+        if pending.stt is None and ep.in_utterance and ep.speech_ms >= ep.min_speech:
             pending.stt = self._transcribe_for(pending)
         await self._evaluate(pending)
 
@@ -1320,16 +1475,20 @@ class VoiceSession:
         if self._pending is not pending:
             return
         if transcript is not None:
-            if transcript.text:
+            if transcript.text and not self._background(transcript):
                 await self._send({"type": "transcript_partial", "text": transcript.text})
-            self._note_transcript(pending, transcript.text)
+            self._note_transcript(pending, transcript)
         await self._evaluate(pending)
         ep = self._endpointer
         if self._pending is pending and pending.deadline_passed and ep.speaking and not pending.transcribing:
             self._transcribe_for(pending)  # still talking past the deadline: a fuller transcript
 
-    def _note_transcript(self, pending: PendingBargeIn, text: str) -> None:
+    def _note_transcript(self, pending: PendingBargeIn, transcript: Transcript) -> None:
+        text = transcript.text
         pending.transcript = text
+        if self._background(transcript):  # the TV over the answer: noise, however many words
+            pending.backchannel, pending.real_words, pending.stop_words = True, 0, False
+            return
         pending.backchannel = is_backchannel(text, self.barge_in.backchannel_max_words)
         pending.real_words = real_words(text)
         pending.stop_words = is_stop_phrase(text)
@@ -1349,9 +1508,7 @@ class VoiceSession:
             transcribing=pending.transcribing > 0,
             stop_words=pending.stop_words,
         )
-        verdict = barge_in_verdict(
-            evidence, min_speech_ms=self.vad_settings.min_speech_ms, is_backchannel=pending.backchannel
-        )
+        verdict = barge_in_verdict(evidence, min_speech_ms=ep.min_speech, is_backchannel=pending.backchannel)
         if verdict is not None:
             await self._decide(pending, verdict)
 
@@ -1402,10 +1559,12 @@ class VoiceSession:
         pending = self._pending
         if pending is not None:  # the client asked meanwhile: this is evidence for its decision
             if pending.agent is agent:
-                self._note_transcript(pending, transcript.text)
+                self._note_transcript(pending, transcript)
                 await self._evaluate(pending)
             return
         text = transcript.text
+        if self._background(transcript):  # background speech over the answer: not an interruption (§3.10)
+            return
         stop = is_stop_phrase(text)  # "Stop." over the answer: stopped now, not when the utterance ends
         if not stop and (is_backchannel(text, self.barge_in.backchannel_max_words) or real_words(text) < 2):
             return
@@ -1448,6 +1607,10 @@ class VoiceSession:
                 at("first_audio"),
                 gap,
             )
+
+
+def _db(value: float | None) -> str:
+    return "-" if value is None else f"{value:.1f}"
 
 
 def _said_the_chart(agent: AgentTurn) -> bool:

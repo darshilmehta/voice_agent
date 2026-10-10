@@ -4,6 +4,7 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 
 import type { Language } from "../api";
 import { useBackend } from "../backend-context";
+import { loadInputMode } from "./input-mode";
 import { VoiceSession, type VoiceSnapshot } from "./session";
 
 /**
@@ -14,12 +15,18 @@ export function useVoiceSession(chatId: string, language: Language | null): { se
   const { backendUrl, config } = useBackend();
   // `features.web_search`: with it off the web search's badge, label and note stay off (docs/DESIGN.md §3.7).
   const webSearch = config?.features.web_search === true;
-  const [session] = useState(() => new VoiceSession({ chatId, backendUrl, language, webSearch }));
+  // The denoiser and the noise-floor gate (§3.10); a backend without them leaves the microphone as it was.
+  const voiceInput = config?.voice_input;
+  const [session] = useState(() => new VoiceSession({ chatId, backendUrl, language, webSearch, voiceInput }));
   const snapshot = useSyncExternalStore(session.subscribe, session.getSnapshot, session.getSnapshot);
 
   useEffect(() => {
-    session.setOptions({ language, backendUrl, webSearch });
-  }, [session, language, backendUrl, webSearch]);
+    session.setOptions({ language, backendUrl, webSearch, voiceInput });
+  }, [session, language, backendUrl, webSearch, voiceInput]);
+
+  useEffect(() => {
+    session.setInputMode(loadInputMode()); // this viewer's choice of hold-to-talk, remembered in the browser
+  }, [session]);
 
   useEffect(() => {
     // Development aid: window.__voice is the live session (counters, snapshot) for debugging and browser tests.

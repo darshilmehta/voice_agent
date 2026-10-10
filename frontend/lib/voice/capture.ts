@@ -4,6 +4,7 @@
  * with the user's voice (after the browser's echo cancellation, so the agent's own voice doesn't drive the user's waves).
  */
 
+import { createDenoiser, type Denoiser } from "./denoise";
 import { INPUT_SAMPLE_RATE, UPLINK_FRAME_SAMPLES } from "./protocol";
 
 /**
@@ -170,21 +171,32 @@ export async function micPermission(): Promise<"granted" | "denied" | "prompt"> 
 }
 
 export interface MicCapture {
+  /** The microphone itself. */
   stream: MediaStream;
+  /** What the browser VAD listens to: the microphone after the denoiser (the microphone itself without one). */
+  vadStream: MediaStream;
   /** The user's voice, for the presence field. */
   analyser: AnalyserNode;
+  /** RNNoise is running on the microphone (docs/DESIGN.md §3.10). */
+  denoised: boolean;
   stop: () => void;
 }
 
 /**
  * Opens the microphone and streams PCM16 16 kHz frames to `onFrame` until `stop()`. Throws MicError. The frame
- * callback gets an ArrayBuffer it owns.
+ * callback gets an ArrayBuffer it owns. With `denoise`, RNNoise (lib/voice/denoise.ts) cleans the audio before the
+ * uplink, the analyser and the VAD's stream; if it can't run, the microphone is used as it is.
+ *
+ *   mic ─► [RNNoise] ─┬─► AudioWorklet (16 kHz PCM16) ─► onFrame
+ *                     ├─► AnalyserNode (presence field)
+ *                     └─► MediaStreamDestination (the browser VAD's stream)
  */
 export async function openMic(
   ctx: AudioContext,
   onFrame: (pcm: ArrayBuffer) => void,
   /** The device went away or access was revoked while open (not called by `stop()`). */
   onEnded?: () => void,
+  opts: { denoise?: boolean } = {},
 ): Promise<MicCapture> {
   let stream: MediaStream;
   try {
@@ -194,6 +206,7 @@ export async function openMic(
   } catch (err) {
     throw classify(err);
   }
+  let denoiser: Denoiser | null = null;
   try {
     const url = URL.createObjectURL(new Blob([WORKLET_SOURCE], { type: "text/javascript" }));
     try {
@@ -201,7 +214,12 @@ export async function openMic(
     } finally {
       URL.revokeObjectURL(url);
     }
-    const source = ctx.createMediaStreamSource(stream);
+    if (opts.denoise) denoiser = await createDenoiser(ctx);
+    const mic = ctx.createMediaStreamSource(stream);
+    if (denoiser) mic.connect(denoiser.node);
+    const source: AudioNode = denoiser ? denoiser.node : mic;
+    const toVad = denoiser ? ctx.createMediaStreamDestination() : null;
+    if (toVad) source.connect(toVad);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 1024;
     analyser.smoothingTimeConstant = 0.3;
@@ -222,21 +240,26 @@ export async function openMic(
     sink.connect(ctx.destination);
     return {
       stream,
+      vadStream: toVad ? toVad.stream : stream,
       analyser,
+      denoised: denoiser !== null,
       stop: () => {
         node.port.onmessage = null;
         for (const t of stream.getTracks()) t.stop();
         try {
-          source.disconnect();
+          mic.disconnect();
           node.disconnect();
           sink.disconnect();
           analyser.disconnect();
+          toVad?.disconnect();
         } catch {
           // already disconnected
         }
+        denoiser?.destroy();
       },
     };
   } catch (err) {
+    denoiser?.destroy();
     for (const t of stream.getTracks()) t.stop();
     throw err instanceof MicError ? err : new MicError("failed", MIC_ERROR_TEXT.failed);
   }

@@ -212,9 +212,44 @@ class BargeInSection(Section):
     decision_timeout_ms: int = Field(gt=0)
 
 
+class NoiseSection(Section):
+    """Noisy rooms (docs/DESIGN.md §3.10 "Noisy rooms"): the browser's denoiser, the noise-floor gate on both VADs, and
+    dropping speech that wasn't said to the agent. Levels in dBFS (10·log10 mean square), as in voice/noise.py."""
+
+    denoise: Literal["rnnoise", "off"]  # the browser's denoiser, before its VAD and the uplink
+    adaptive_gating: bool
+    floor_window_ms: int = Field(gt=0)
+    floor_percentile: float = Field(gt=0, lt=100)
+    start_snr_db: float = Field(ge=0)  # a turn opens only this far above the floor
+    end_snr_db: float = Field(ge=0)  # within this of the floor is silence
+    quiet_floor_dbfs: float
+    loud_floor_dbfs: float
+    noisy_threshold: float = Field(gt=0, lt=1)  # VAD threshold at loud_floor_dbfs (vad.threshold at quiet_floor_dbfs)
+    noisy_min_speech_ms: int = Field(ge=0)  # likewise for vad.min_speech_ms
+    drop_background_speech: bool
+    assumed_user_dbfs: float  # the user's level before their first answered turn
+    assumed_margin_db: float = Field(ge=0)  # extra room for the far-field distances while the level is assumed
+    far_field_db: float = Field(gt=0)
+    far_field_hard_db: float = Field(gt=0)
+    close_db: float = Field(ge=0)
+    min_snr_db: float
+    unsure_avg_logprob: float = Field(le=0)
+    unsure_no_speech_prob: float = Field(ge=0, le=1)
+    short_fragment_words: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> NoiseSection:
+        if self.loud_floor_dbfs <= self.quiet_floor_dbfs:
+            raise ValueError("loud_floor_dbfs must be above quiet_floor_dbfs")
+        if self.far_field_hard_db < self.far_field_db:
+            raise ValueError("far_field_hard_db must be at least far_field_db")
+        return self
+
+
 class VoiceSection(Section):
     max_spoken_sentences: int = Field(gt=0)
     barge_in: BargeInSection
+    noise: NoiseSection
 
 
 class IceServer(Section):
