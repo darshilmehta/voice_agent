@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""Start everything poc_gibberlink needs on a Mac, in order, with one command.
+
+    python3 start.py            # start (or reuse) Ollama, Docker + Qdrant, backend, frontend; open Chrome
+    python3 start.py status     # what is running
+    python3 start.py stop       # stop Qdrant (the backend and frontend stop with Ctrl+C in the start terminal)
+
+Steps (each one is skipped when it is already done):
+  1. Ollama: start it if needed, with its prompt cache capped (LLAMA_ARG_CACHE_RAM, docs/DESIGN.md §8) so a 16 GB
+     Mac doesn't swap; pull the chat model if it is missing.
+  2. Docker Desktop, then the Qdrant container (`docker compose ... up -d qdrant`).
+  3. Model weights: offers to run scripts/setup/download_models.sh when some are missing.
+  4. Backend: `uv sync --group ml`, `uv run python -m app`, waits until /health says preload: ready.
+  5. Frontend: `npm install` when package-lock.json changed, `npm run dev`.
+  6. Opens http://localhost:3000 in Chrome.
+
+The backend and frontend run as children of this script: their output is shown here (and written to data/logs/),
+and Ctrl+C stops both. Qdrant and Ollama keep running (`python3 start.py stop` stops Qdrant). Standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import plistlib
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+BACKEND_DIR = ROOT / "backend"
+FRONTEND_DIR = ROOT / "frontend"
+COMPOSE = ["docker", "compose", "-f", str(ROOT / "infra" / "docker-compose.yml")]
+LOG_DIR = ROOT / "data" / "logs"
+
+OLLAMA_URL = "http://127.0.0.1:11434"
+QDRANT_URL = "http://127.0.0.1:6333"
+BACKEND_URL = "http://127.0.0.1:8000"
+FRONTEND_URL = "http://127.0.0.1:3000"
+APP_URL = "http://localhost:3000"  # the backend's CORS list allows localhost:3000
+
+CACHE_RAM_VAR = "LLAMA_ARG_CACHE_RAM"
+CACHE_RAM_MB = "1024"
+HF_HUB = ROOT / "data" / "models" / "huggingface" / "hub"
+REQUIRED_WEIGHTS = [  # what the local config loads (config/local.config.json)
+    "models--BAAI--bge-m3",
+    "models--BAAI--bge-reranker-v2-m3",
+    "models--mlx-community--whisper-small-mlx",
+    "models--hexgrad--Kokoro-82M",
+]
+DOCLING_DIR = ROOT / "data" / "models" / "docling"
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR else text
+
+
+def step(text: str) -> None:
+    print(_c("1;36", f"==> {text}"), flush=True)
+
+
+def ok(text: str) -> None:
+    print(_c("32", f"    ✓ {text}"), flush=True)
+
+
+def warn(text: str) -> None:
+    print(_c("33", f"    ! {text}"), flush=True)
+
+
+def fail(text: str) -> None:
+    print(_c("31", f"    ✗ {text}"), flush=True)
+    sys.exit(1)
+
+
+def run(
+    cmd: list[str], cwd: Path | None = None, check: bool = True, quiet: bool = False
+) -> subprocess.CompletedProcess:
+    if not quiet:
+        print(_c("2", f"    $ {' '.join(cmd)}"), flush=True)
+    return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=quiet)
+
+
+def http_json(url: str, timeout: float = 2.0) -> dict | list | None:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read().decode() or "null")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def http_up(url: str, timeout: float = 2.0) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout):
+            return True
+    except urllib.error.HTTPError:
+        return True  # it answered
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def wait_for(check, what: str, timeout_s: float, interval_s: float = 1.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(interval_s)
+    warn(f"timed out after {timeout_s:.0f} s waiting for {what}")
+    return False
+
+
+def need(tool: str, hint: str) -> str:
+    path = shutil.which(tool)
+    if path is None:
+        fail(f"`{tool}` not found. {hint}")
+    return path
+
+
+def ask(question: str, assume_yes: bool) -> bool:
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    return input(f"    ? {question} [Y/n] ").strip().lower() in ("", "y", "yes")
+
+
+# ---------------------------------------------------------------- Ollama
+
+
+def chat_model() -> str:
+    try:
+        cfg = json.loads((ROOT / "config" / "local.config.json").read_text())
+        return cfg["llm"]["chat_model"]
+    except (OSError, ValueError, KeyError):
+        return "qwen3:4b-instruct"
+
+
+def brew_ollama_service() -> bool:
+    """True when `brew services` manages Ollama (the README's setup)."""
+    if shutil.which("brew") is None:
+        return False
+    done = run(["brew", "services", "list"], check=False, quiet=True)
+    return any(line.split()[:1] == ["ollama"] for line in done.stdout.splitlines())
+
+
+def launchctl_getenv(name: str) -> str:
+    if shutil.which("launchctl") is None:
+        return ""
+    return run(["launchctl", "getenv", name], check=False, quiet=True).stdout.strip()
+
+
+def cache_cap_set() -> bool:
+    """The cap is set for this login (`launchctl setenv`) or permanently in Ollama's launch agent."""
+    if launchctl_getenv(CACHE_RAM_VAR) or os.environ.get(CACHE_RAM_VAR):
+        return True
+    for plist in (Path.home() / "Library" / "LaunchAgents").glob("*ollama*.plist"):
+        try:
+            with plist.open("rb") as f:
+                env = plistlib.load(f).get("EnvironmentVariables") or {}
+        except (OSError, ValueError, plistlib.InvalidFileException, AttributeError):
+            continue
+        if env.get(CACHE_RAM_VAR):
+            return True
+    return False
+
+
+def start_ollama(args) -> subprocess.Popen | None:
+    """Ensure Ollama is up with a capped prompt cache. Returns a child process only when this script had to run
+    `ollama serve` itself (no brew service)."""
+    step("Ollama")
+    need("ollama", "Install it: brew install ollama")
+    running = http_up(f"{OLLAMA_URL}/api/tags")
+    capped = cache_cap_set()
+    child = None
+
+    if brew_ollama_service():
+        if not capped and not args.no_ollama_cap:
+            # Lasts until reboot; Ollama started by launchd after this inherits it (docs/DESIGN.md §8).
+            run(["launchctl", "setenv", CACHE_RAM_VAR, CACHE_RAM_MB])
+            run(["brew", "services", "restart", "ollama"])
+            ok(f"prompt cache capped at {CACHE_RAM_MB} MB (Ollama restarted)")
+        elif not running:
+            run(["brew", "services", "start", "ollama"])
+        elif not capped:
+            warn("prompt cache uncapped (--no-ollama-cap): expect swap on a 16 GB Mac")
+    elif not running:
+        env = dict(os.environ)
+        if not args.no_ollama_cap:
+            env.setdefault(CACHE_RAM_VAR, CACHE_RAM_MB)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log = open(LOG_DIR / "ollama.log", "a")  # noqa: SIM115 - lives as long as the child
+        print(_c("2", "    $ ollama serve   (output: data/logs/ollama.log)"), flush=True)
+        child = subprocess.Popen(
+            ["ollama", "serve"], env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+        )
+    elif not capped:
+        warn(
+            "Ollama is running outside brew services; restart it with "
+            f"{CACHE_RAM_VAR}={CACHE_RAM_MB} in its environment to cap its prompt cache"
+        )
+
+    if not wait_for(lambda: http_up(f"{OLLAMA_URL}/api/tags"), "Ollama", 60):
+        fail("Ollama didn't start (see `brew services info ollama` or data/logs/ollama.log)")
+
+    model = chat_model()
+    tags = http_json(f"{OLLAMA_URL}/api/tags") or {}
+    names = {m.get("name") for m in tags.get("models", [])} if isinstance(tags, dict) else set()
+    if model not in names and f"{model}:latest" not in names:
+        if not ask(f"Model {model} is missing (~2.5 GB). Pull it now?", args.yes):
+            fail(f"Run: ollama pull {model}")
+        run(["ollama", "pull", model])
+    ok(f"Ollama ready with {model}")
+    return child
+
+
+# ---------------------------------------------------------------- Docker + Qdrant
+
+
+def start_qdrant() -> None:
+    step("Docker + Qdrant")
+    need("docker", "Install Docker Desktop: https://www.docker.com/products/docker-desktop/")
+    if run(["docker", "info"], check=False, quiet=True).returncode != 0:
+        if sys.platform == "darwin":
+            print(_c("2", "    $ open -a Docker   (Docker Desktop takes ~20-60 s to start)"), flush=True)
+            subprocess.run(["open", "-a", "Docker"], check=False)
+        if not wait_for(lambda: run(["docker", "info"], check=False, quiet=True).returncode == 0, "Docker", 180, 3):
+            fail("Docker isn't running. Start Docker Desktop and run this again.")
+    run([*COMPOSE, "up", "-d", "qdrant"])
+    if not wait_for(lambda: http_up(f"{QDRANT_URL}/readyz"), "Qdrant", 60):
+        fail("Qdrant didn't become ready: docker logs gibberlink-qdrant")
+    ok("Qdrant ready on 127.0.0.1:6333")
+
+
+def stop_qdrant() -> None:
+    step("Stopping Qdrant")
+    # `stop`, never `down`: down acts on the whole compose project (infra/docker-compose.yml header).
+    run([*COMPOSE, "stop", "qdrant"], check=False)
+
+
+# ---------------------------------------------------------------- model weights
+
+
+def check_weights(args) -> None:
+    step("Model weights")
+    missing = [w for w in REQUIRED_WEIGHTS if not (HF_HUB / w).is_dir()]
+    docling_ok = DOCLING_DIR.is_dir() and any(DOCLING_DIR.iterdir())
+    if not missing and docling_ok:
+        ok("all present in data/models")
+        return
+    names = [w.removeprefix("models--").replace("--", "/") for w in missing] + ([] if docling_ok else ["docling"])
+    warn("missing: " + ", ".join(names))
+    if not ask("Download them now (several GB, one time)?", args.yes):
+        fail("Run: scripts/setup/download_models.sh all")
+    need("uvx", "Install uv: brew install uv")
+    run([str(ROOT / "scripts" / "setup" / "download_models.sh"), "all"])
+
+
+# ---------------------------------------------------------------- backend + frontend
+
+
+class Child:
+    """A long-running child whose output is shown with a prefix and appended to data/logs/<name>.log."""
+
+    def __init__(self, name: str, color: str, cmd: list[str], cwd: Path, env: dict | None = None):
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        self.name = name
+        self.prefix = _c(color, f"[{name}]")
+        self.log = open(LOG_DIR / f"{name}.log", "a", encoding="utf-8")  # noqa: SIM115 - closed in stop()
+        self.log.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(cmd)}\n")
+        print(_c("2", f"    $ {' '.join(cmd)}   (output: data/logs/{name}.log)"), flush=True)
+        self.proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env={**os.environ, **(env or {})},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,  # own process group: Ctrl+C reaches this script only
+        )
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self) -> None:
+        assert self.proc.stdout is not None
+        for line in self.proc.stdout:
+            self.log.write(line)
+            self.log.flush()
+            print(f"{self.prefix} {line}", end="", flush=True)
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def stop(self) -> None:
+        if self.alive():
+            try:
+                os.killpg(self.proc.pid, signal.SIGINT)
+                self.proc.wait(timeout=10)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(self.proc.pid, signal.SIGKILL)
+        self.log.close()
+
+
+def port_owner(port: int) -> str:
+    if shutil.which("lsof") is None:
+        return "another process"
+    out = run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"], check=False, quiet=True).stdout.splitlines()
+    return " ".join(out[1].split()[:2]) if len(out) > 1 else "another process"
+
+
+def backend_health() -> dict:
+    h = http_json(f"{BACKEND_URL}/health", timeout=3)
+    return h if isinstance(h, dict) else {}
+
+
+def start_backend(children: list[Child]) -> None:
+    step("Backend (127.0.0.1:8000)")
+    if backend_health().get("version"):
+        ok("already running; reusing it")
+    else:
+        if http_up(BACKEND_URL):
+            fail(f"port 8000 is taken by {port_owner(8000)}; stop it and run this again")
+        need("uv", "Install it: brew install uv")
+        run(["uv", "sync", "--group", "ml", "--quiet"], cwd=BACKEND_DIR)
+        children.append(
+            Child("backend", "35", ["uv", "run", "python", "-m", "app"], BACKEND_DIR, {"PYTHONUNBUFFERED": "1"})
+        )
+    print("    waiting for the models to load (~40-70 s)…", flush=True)
+
+    def ready() -> bool:
+        if children and children[-1].name == "backend" and not children[-1].alive():
+            fail("the backend exited; see the [backend] lines above or data/logs/backend.log")
+        state = (backend_health().get("preload") or {}).get("state")
+        return state in ("ready", "degraded", "off")
+
+    wait_for(ready, "the backend's models", 300, 2)
+    h = backend_health()
+    state = (h.get("preload") or {}).get("state", "unknown")
+    (ok if state == "ready" else warn)(f"backend preload: {state}")
+    for p in h.get("providers", []):
+        if p.get("status") not in ("ok", "disabled"):
+            warn(f"{p.get('capability')}: {p.get('status')} — {p.get('detail')}")
+    for w in h.get("warnings", []):
+        warn(f"{w.get('message')} Fix: {w.get('fix')}")
+
+
+def start_frontend(children: list[Child]) -> None:
+    step("Frontend (127.0.0.1:3000)")
+    if http_up(FRONTEND_URL):
+        ok("something already answers on port 3000; reusing it")
+        return
+    need("npm", "Install Node 24: brew install node@24")
+    lock, stamp = FRONTEND_DIR / "package-lock.json", FRONTEND_DIR / "node_modules" / ".package-lock.json"
+    if not stamp.exists() or lock.stat().st_mtime > stamp.stat().st_mtime:
+        run(["npm", "install", "--no-audit", "--no-fund"], cwd=FRONTEND_DIR)
+    children.append(Child("frontend", "34", ["npm", "run", "dev"], FRONTEND_DIR))
+    if not wait_for(lambda: http_up(FRONTEND_URL, timeout=5), "the frontend", 120, 1):
+        fail("the frontend didn't start; see data/logs/frontend.log")
+    ok("frontend ready")
+
+
+def open_browser() -> None:
+    if sys.platform != "darwin":
+        return
+    chrome = Path("/Applications/Google Chrome.app")
+    cmd = ["open", "-a", "Google Chrome", APP_URL] if chrome.exists() else ["open", APP_URL]
+    subprocess.run(cmd, check=False)
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_status() -> int:
+    def line(name: str, up: bool, detail: str = "") -> None:
+        mark = _c("32", "up  ") if up else _c("31", "down")
+        print(f"  {mark} {name:<9} {detail}")
+
+    line("Ollama", http_up(f"{OLLAMA_URL}/api/tags"), f"prompt cache cap: {'set' if cache_cap_set() else 'NOT set'}")
+    line("Qdrant", http_up(f"{QDRANT_URL}/readyz"), QDRANT_URL)
+    h = backend_health()
+    line("Backend", bool(h), f"preload: {(h.get('preload') or {}).get('state', '-')}" if h else BACKEND_URL)
+    line("Frontend", http_up(FRONTEND_URL), APP_URL)
+    return 0
+
+
+def cmd_start(args) -> int:
+    if sys.platform != "darwin":
+        warn("this script is written for macOS (Apple Silicon); on other systems see README.md")
+    os.chdir(ROOT)
+    children: list[Child] = []
+    ollama_child = None
+
+    def shutdown(*_):
+        print(_c("1;36", "\n==> Stopping backend and frontend…"), flush=True)
+        for c in reversed(children):
+            c.stop()
+        if ollama_child is not None and ollama_child.poll() is None:
+            os.killpg(ollama_child.pid, signal.SIGTERM)
+        if args.stop_qdrant:
+            stop_qdrant()
+        kept = "Ollama keeps" if args.stop_qdrant else "Qdrant and Ollama keep"
+        print(f"    stopped. {kept} running (python3 start.py stop stops Qdrant).", flush=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    ollama_child = start_ollama(args)
+    start_qdrant()
+    check_weights(args)
+    start_backend(children)
+    start_frontend(children)
+
+    step(f"Ready: {APP_URL}")
+    print("    Open it in Chrome and allow the microphone. Demo script: docs/DEMO.md.", flush=True)
+    print("    Ctrl+C here stops the backend and frontend.", flush=True)
+    if not args.no_browser:
+        open_browser()
+
+    if not children:  # everything was already running
+        return 0
+    while all(c.alive() for c in children):
+        time.sleep(1)
+    dead = next(c for c in children if not c.alive())
+    warn(f"the {dead.name} exited (code {dead.proc.returncode}); see data/logs/{dead.name}.log")
+    shutdown()
+    return 1
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Start poc_gibberlink and everything it needs (macOS).")
+    p.add_argument("command", nargs="?", default="start", choices=["start", "status", "stop"])
+    p.add_argument("-y", "--yes", action="store_true", help="answer yes to downloads (model weights, Ollama model)")
+    p.add_argument("--no-browser", action="store_true", help="don't open Chrome")
+    p.add_argument(
+        "--no-ollama-cap",
+        action="store_true",
+        help=f"don't set {CACHE_RAM_VAR} / restart Ollama (not recommended on 16 GB)",
+    )
+    p.add_argument("--stop-qdrant", action="store_true", help="also stop Qdrant on Ctrl+C")
+    args = p.parse_args()
+    if args.command == "status":
+        return cmd_status()
+    if args.command == "stop":
+        stop_qdrant()
+        return 0
+    return cmd_start(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

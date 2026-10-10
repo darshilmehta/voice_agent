@@ -46,6 +46,34 @@ scripts/setup/download_models.sh all
 
 Docker Desktop, Python 3.12, Node 24 and ffmpeg are also expected.
 
+## Quick start (one command)
+
+After the prerequisites are installed, from the repo root:
+
+```bash
+python3 start.py
+```
+
+It starts what is missing, in order, and skips what is already running:
+- **Ollama:** started with its prompt cache capped (`LLAMA_ARG_CACHE_RAM`, DESIGN §8). If the cap is unset, it is set and Ollama is restarted. The chat model is pulled if missing.
+- **Qdrant:** Docker Desktop and the Qdrant container are started.
+- **Model weights:** you are offered the download if any are missing.
+- **Backend:** waits until `preload: ready`.
+- **Frontend:** started next.
+- **Browser:** Chrome opens at http://localhost:3000.
+
+The backend's and frontend's output is shown in that terminal and saved in `data/logs/`. **Ctrl+C** stops both, while Qdrant and Ollama keep running. The other commands:
+
+```bash
+python3 start.py status
+```
+
+```bash
+python3 start.py stop
+```
+
+`stop` stops Qdrant. The start options are `--stop-qdrant` (Ctrl+C also stops Qdrant), `--no-browser`, `-y` (accept downloads) and `--no-ollama-cap`. The steps below do the same by hand.
+
 ## Run (natively, recommended on a Mac)
 
 Backend on `127.0.0.1:8000` ([`backend/README.md`](backend/README.md)):
@@ -130,6 +158,7 @@ cd frontend && npm run build && npm run typecheck
 ## Layout
 
 ```text
+start.py        one-command start of everything (Quick start)
 backend/        FastAPI app: config, offline guard, providers, API, tests
 frontend/       Next.js app shell
 config/         local.config.json (default), docker.config.json, cloud.config.json (template)
