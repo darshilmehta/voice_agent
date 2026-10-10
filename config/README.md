@@ -65,9 +65,9 @@ Frontend: set one variable, `BACKEND_URL` (e.g. `https://api.gibberlink.example.
 
 ## Live web search (optional)
 
-Questions that need current data ("how is the stock doing today?") can be answered from the documents plus a web search (docs/DESIGN.md §3.7). It is **off** in every local config: it is the one feature that sends something off the machine, namely the short English search query (never document text or the transcript; see `backend/README.md`, "Live data"). Locally it goes through a self-hosted SearXNG, which forwards the query to public search engines (they see the query and this machine's IP, no cookies or account).
+Questions that need current data ("how is the stock doing today?") can be answered from the documents plus a web search (docs/DESIGN.md §3.7). It is **on** in `local.config.json` (`python3 start.py` starts SearXNG when it is) and off in the Docker config: it is the one feature that sends something off the machine, namely the short English search query (never document text or the transcript; see `backend/README.md`, "Live data"). Locally it goes through a self-hosted SearXNG, which forwards the query to public search engines (they see the query and this machine's IP, no cookies or account).
 
-To turn it on:
+To turn it on by hand (what `start.py` does), or in another config:
 
 1. Start SearXNG (Compose profile `websearch`; pinned image, `127.0.0.1:8888` only, 256 MB):
 
@@ -155,6 +155,6 @@ What the POC builds vs. what stays a placeholder. (No application code exists ye
 | auth | `none` | `oidc` |
 | job_queue / session_store / event_bus | `in_process` / `in_memory` | `redis` |
 | observability | `none` | `prometheus`, `otlp` |
-| tools.web_search | `searxng` (local; off by default, see "Live web search") | `search_api` (production) |
+| tools.web_search | `searxng` (local; on in local.config.json, see "Live web search") | `search_api` (production) |
 
 So `cloud.config.json` as written would start only once the placeholder providers it names are implemented. The self-hosted pieces (Qdrant, BGE-M3, reranker, faster-whisper, Kokoro, Docling on a CUDA server) already work with config changes alone.

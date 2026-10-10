@@ -180,7 +180,7 @@
 
   "tools": {
     "web_search": {
-      "enabled": false,
+      "enabled": true,
       "provider": "searxng",
       "url": "http://127.0.0.1:8888",
       "api_key": null,
@@ -194,7 +194,7 @@
       "fetch_pages": 1
     }
   },
-  "strict_offline_exceptions": [],
+  "strict_offline_exceptions": ["web_search"],
   "strict_offline_local_hosts": [],
 
   "canvas": {

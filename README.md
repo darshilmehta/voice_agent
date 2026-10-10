@@ -57,6 +57,7 @@ python3 start.py
 It starts what is missing, in order, and skips what is already running:
 - **Ollama:** started with its prompt cache capped (`LLAMA_ARG_CACHE_RAM`, DESIGN §8). If the cap is unset, it is set and Ollama is restarted. The chat model is pulled if missing.
 - **Qdrant:** Docker Desktop and the Qdrant container are started.
+- **SearXNG:** started too when the config turns live web search on (it is on in `config/local.config.json`).
 - **Model weights:** you are offered the download if any are missing.
 - **Backend:** waits until `preload: ready`.
 - **Frontend:** started next.
@@ -72,7 +73,7 @@ python3 start.py status
 python3 start.py stop
 ```
 
-`stop` stops Qdrant. The start options are `--stop-qdrant` (Ctrl+C also stops Qdrant), `--no-browser`, `-y` (accept downloads) and `--no-ollama-cap`. The steps below do the same by hand.
+`stop` stops Qdrant and SearXNG. The start options are `--stop-qdrant` (Ctrl+C also stops Qdrant and SearXNG), `--no-browser`, `-y` (accept downloads) and `--no-ollama-cap`. The steps below do the same by hand.
 
 ## Run (natively, recommended on a Mac)
 

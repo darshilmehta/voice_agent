@@ -86,9 +86,9 @@ In a café or with a TV on, the microphone is cleaned (RNNoise) and only speech 
 
 When the room is louder than that (a TV or a talker about as loud as you), switch on **Hold to talk** under the microphone (remembered in this browser): only what you say while holding **Space** (outside a text field) or the talk button is heard, and pressing it while the agent answers stops the answer at once. If voices sound distorted in steady hiss (a fan, an air conditioner), set `voice.noise.denoise: "off"` in `config/local.config.json` and restart the backend.
 
-## 7. Live web search (optional, off by default)
+## 7. Live web search
 
-Only the cleaned search query leaves the machine. Enable: start SearXNG (`docker compose -f infra/docker-compose.yml --profile websearch up -d searxng`), set `tools.web_search.enabled: true` and add `"web_search"` to `strict_offline_exceptions` in `config/local.config.json`, restart the backend. Ask "What's the weather in Mumbai today?" → "Let me look that up." (~1.5–2 s), a "Searching the web…" badge with the query, then an answer citing web chips (W1…, with links). Public engines rate-limit automated traffic, so results vary (a rate question may come back "I couldn't find the current rate in the web results" — it never invents one). Stop SearXNG with `docker compose -f infra/docker-compose.yml --profile websearch rm -sf searxng` (never `down`: it also removes Qdrant).
+On in `config/local.config.json`; `python3 start.py` starts SearXNG with it. Only the cleaned search query leaves the machine. To turn it off, set `tools.web_search.enabled: false` and restart; then live questions get the honest line in section 3. Ask "What's the weather in Mumbai today?" → "Let me look that up." (~1.5–2 s), a "Searching the web…" badge with the query, then an answer citing web chips (W1…, with links). Public engines rate-limit automated traffic, so results vary (a rate question may come back "I couldn't find the current rate in the web results" — it never invents one). Stop SearXNG with `docker compose -f infra/docker-compose.yml --profile websearch rm -sf searxng` (never `down`: it also removes Qdrant).
 
 ## Known limits
 
