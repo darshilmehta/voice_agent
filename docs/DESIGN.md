@@ -2,7 +2,7 @@
 
 > **Product name:** Docent, tagline "Talk to your documents" (Hindi: "अपने दस्तावेज़ों से बात करें"), decided 2026-10-10. The repo (`voice_agent`), the folder (`poc_gibberlink`), package, container, collection and config-key names are internal identifiers and keep their old names. The assistant introduces itself as Docent (`backend/app/branding.py`, `frontend/lib/brand.ts`).
 
-> **Status:** Phase −1 **complete** (smoke tests incl. network-off run) · Phase 0 **complete** (skeleton, health, frontend shell, Docker, CI) · Phase 1 **in progress** (2026-10-08).
+> **Status:** Phases −1, 0, 1, 2, 3, 4–6, 7, 10 and noisy rooms **complete** (§10); the MVP is built and working: a voice conversation with your documents in English and Hindi with interruptions, citations with page chips, the live visual canvas with charts, OCR on scanned PDFs, summaries and export, noise handling with hold-to-talk, and optional live web search (walkthrough in `docs/DEMO.md`; last checked 2026-10-10).
 > **Last updated:** 2026-10-10 (polish round before the retest: one panel per chart §12.1, corrupted numbers and misheard words §3.4, Hindi heard wrong in noise §3.4, the first question of a new chat §3.10, the prompt-cache warning §8)
 > **Origin:** derived from [`blueprint.md`](blueprint.md). This document records what we actually decided; where the two disagree, this one wins.
 

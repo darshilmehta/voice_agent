@@ -6,7 +6,7 @@ Talk to your documents: a fully local, ChatGPT voice-mode–style assistant for 
 
 Everything runs on this machine: local LLM (Ollama), local vector search (Qdrant), local speech recognition and synthesis. The code is structured so each piece can later be swapped for a hosted service through configuration.
 
-> **Status:** Phase 0 complete: config, provider registry with health checks, backend API, frontend shell, Docker images, CI. Phase 1 (projects, document ingestion, text chat with citations) is in progress.
+> **Status:** The MVP is built and working: a voice conversation with your documents in English and Hindi with interruptions, answers with citations and page chips, a live visual canvas with charts, OCR on scanned PDFs, summaries and export, noise handling with hold-to-talk, and optional live web search. [docs/DEMO.md](docs/DEMO.md) is the walkthrough; last checked on the real stack on 2026-10-10.
 
 ## Docs
 
